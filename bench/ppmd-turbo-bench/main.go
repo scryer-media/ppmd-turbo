@@ -238,17 +238,16 @@ func cmdToolchain(ctx context.Context, args []string) int {
 	data, _ := json.MarshalIndent(struct {
 		Machine   host.Machine        `json:"machine"`
 		Toolchain toolchain.Toolchain `json:"toolchain"`
-	}{host.Collect(ctx, env("PPMD_BENCH_MACHINE", hostname())), chain}, "", "  ")
+	}{host.Collect(ctx, env("PPMD_BENCH_MACHINE", defaultLabel())), chain}, "", "  ")
 	fmt.Println(string(data))
 	return exitOK
 }
 
-func hostname() string {
-	name, err := os.Hostname()
-	if err != nil {
-		return runtime.GOOS + "-" + runtime.GOARCH
-	}
-	return strings.TrimSuffix(name, ".local")
+// defaultLabel names the host generically, by OS and architecture. A report
+// never carries the machine's own hostname; pass -machine or
+// PPMD_BENCH_MACHINE for a more specific label such as an instance type.
+func defaultLabel() string {
+	return runtime.GOOS + "-" + runtime.GOARCH
 }
 
 func filterScenarios(scenarios []suite.Scenario, only string) []suite.Scenario {
@@ -276,7 +275,7 @@ func cmdRun(ctx context.Context, args []string) int {
 	tools := addToolFlags(set)
 	profileName := set.String("profile", suite.ProfileFull, "run profile: quick (the quick corpus, 1 repeat), full (the full corpus, 5 repeats + 1 warmup) or fleet (the full corpus, 3 repeats + 1 warmup)")
 	list := set.Bool("list", false, "print the planned scenarios, their row and process counts and the projected duration, then exit")
-	machine := set.String("machine", env("PPMD_BENCH_MACHINE", hostname()), "host label in the report and the default results directory (e.g. c7i.4xlarge-us-east-1)")
+	machine := set.String("machine", env("PPMD_BENCH_MACHINE", defaultLabel()), "host label in the report and the default results directory (e.g. c7i.4xlarge-us-east-1)")
 	out := set.String("out", "", "results directory (default <repo>/bench/results/<machine>-<profile>)")
 	dir := set.String("dir", "", "corpus directory (default <repo>/bench/fixtures/<the profile's corpus>, or $PPMD_BENCH_FIXTURES)")
 	rarCorpus := set.String("rar-corpus", env("PPMD_BENCH_RAR_CORPUS", ""), "directory holding rarpar's RARLAB-written PPMd archives (rar4_ppm_*.rar); RAR rows are skipped without it")
