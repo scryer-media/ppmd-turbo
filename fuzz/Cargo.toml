@@ -7,13 +7,59 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+[lib]
+# The shared harness: input layouts, payload generators, the ppmd-rust
+# reference, the API shim and the seed-corpus generator. Its unit tests run on
+# stable (`cargo test --locked --manifest-path fuzz/Cargo.toml`).
+path = "src/lib.rs"
+doctest = false
+
 [dependencies]
+arbitrary = { version = "1.5.0", features = ["derive"] }
 libfuzzer-sys = "0.4"
 ppmd-turbo = { path = ".." }
+# The in-process reference for the differential and round-trip targets. A
+# dependency of this harness only: it must never reach the crate's graph.
+ppmd-rust = "=1.5.0"
 
 [[bin]]
 name = "decode_7z"
 path = "fuzz_targets/decode_7z.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_rar"
+path = "fuzz_targets/decode_rar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_differential_7z"
+path = "fuzz_targets/decode_differential_7z.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_7z"
+path = "fuzz_targets/roundtrip_7z.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_carryless"
+path = "fuzz_targets/roundtrip_carryless.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "structure_7z"
+path = "fuzz_targets/structure_7z.rs"
 test = false
 doc = false
 bench = false
