@@ -1,13 +1,16 @@
-//! The committed seed corpora (`fuzz/seeds/<target>/`) and the hostile-test
-//! fixtures (`tests/hostile_fixtures/`), generated deterministically from
-//! invented payloads and ppmd-rust's encoders.
+//! The seed corpora (`fuzz/seeds/<target>/`), the minimised fuzz
+//! regressions (`fuzz/regressions/<target>/`) and the hostile-test fixtures
+//! (`tests/hostile_fixtures/`), generated deterministically from invented
+//! payloads, ppmd-rust's encoders and the byte literals in [`REGRESSIONS`].
 //!
-//! `cargo test --locked --manifest-path fuzz/Cargo.toml` checks that the
-//! committed files are exactly what this module generates. To regenerate
-//! after changing it:
+//! None of these files is committed. The repository's one entry point,
+//! `cargo run --locked -p ppmd-corpus -- fixtures`, writes them through
+//! [`write_all`] (by running this crate's `regenerate_seeds` example) and
+//! checks every file against `tools/ppmd-corpus/fixtures.sha256`. To write
+//! only these files:
 //!
 //! ```text
-//! cargo test --locked --manifest-path fuzz/Cargo.toml -- --ignored regenerate_seeds
+//! cargo run --locked --manifest-path fuzz/Cargo.toml --example regenerate_seeds
 //! ```
 
 use std::collections::BTreeMap;
@@ -19,6 +22,7 @@ use crate::ops;
 use crate::paths;
 use crate::payload::{Kind, generate};
 use crate::reference::{encode_7z, encode_carryless};
+use crate::synth;
 
 /// Every fuzz target, in the order CI lists them.
 pub const TARGETS: [&str; 9] = [
@@ -33,15 +37,48 @@ pub const TARGETS: [&str; 9] = [
     "model_ops",
 ];
 
-/// The directories this module owns, relative to the fuzz crate, and every
-/// file it writes into them.
+/// Every file this module writes, keyed by its path relative to the
+/// repository root.
 pub type Files = BTreeMap<PathBuf, Vec<u8>>;
 
-/// The hostile fixtures directory, relative to the fuzz crate.
-pub const HOSTILE_DIR: &str = "../tests/hostile_fixtures";
+/// The hostile fixtures directory, relative to the repository root.
+pub const HOSTILE_DIR: &str = "tests/hostile_fixtures";
+
+/// The fuzz regressions directory, relative to the repository root.
+pub const REGRESSIONS_DIR: &str = "fuzz/regressions";
 
 fn seed_dir(target: &str) -> PathBuf {
-    Path::new("seeds").join(target)
+    Path::new("fuzz/seeds").join(target)
+}
+
+/// Minimised inputs from past fuzz findings, replayed by both fuzz workflows
+/// on every run: `(target, name, input)`. A new finding is added here as a
+/// byte literal, never committed as a file.
+pub const REGRESSIONS: &[(&str, &str, &[u8])] = &[
+    // A RAR block without a model and nothing to decode: corrupt on both
+    // sides of checked_vs_unchecked before the coder reads its four bytes.
+    (
+        "checked_vs_unchecked",
+        "rar-no-model-nothing-to-decode",
+        &[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x02, 0x03,
+        ],
+    ),
+    // The same with too few coder bytes for the range decoder to start.
+    (
+        "checked_vs_unchecked",
+        "rar-no-model-short-coder-data",
+        &[0x7E, 0x40, 0x04, 0x05, 0x02, 0x00, 0x01, 0x00, 0x28],
+    ),
+];
+
+fn regressions(files: &mut Files) {
+    for (target, name, input) in REGRESSIONS {
+        files.insert(
+            Path::new(REGRESSIONS_DIR).join(target).join(name),
+            input.to_vec(),
+        );
+    }
 }
 
 fn name(kind: Kind, order: u32, mem: u32, marker: bool, known: bool) -> String {
@@ -351,147 +388,20 @@ fn model_ops_seeds(files: &mut Files) {
     put("op-storm-garbage", &storm, &rng.bytes(2048));
 }
 
-/// One hostile fixture: a raw stream, its parameters and its payload.
-#[derive(Debug, Clone)]
-pub struct Fixture {
-    /// File stem.
-    pub name: &'static str,
-    /// `7z` or `carryless`.
-    pub coder: &'static str,
-    /// Model order.
-    pub order: u32,
-    /// Arena size in bytes (a whole number of MiB for `carryless`).
-    pub mem: u32,
-    /// Encoded with an end marker.
-    pub end_marker: bool,
-    /// Payload generator.
-    pub kind: Kind,
-    /// Payload length.
-    pub len: usize,
-}
-
-/// The hostile fixtures. `tests/hostile_decode.rs` reads them through
-/// `tests/hostile_fixtures/index.txt`.
-pub const FIXTURES: [Fixture; 10] = [
-    Fixture {
-        name: "z7-text-o6-m64k",
-        coder: "7z",
-        order: 6,
-        mem: 1 << 16,
-        end_marker: false,
-        kind: Kind::Text,
-        len: 3000,
-    },
-    Fixture {
-        name: "z7-text-o6-m64k-eos",
-        coder: "7z",
-        order: 6,
-        mem: 1 << 16,
-        end_marker: true,
-        kind: Kind::Text,
-        len: 3000,
-    },
-    Fixture {
-        name: "z7-records-o2-m2k",
-        coder: "7z",
-        order: 2,
-        mem: 2048,
-        end_marker: false,
-        kind: Kind::Records,
-        len: 2000,
-    },
-    Fixture {
-        name: "z7-ramp-o16-m1m-eos",
-        coder: "7z",
-        order: 16,
-        mem: 1 << 20,
-        end_marker: true,
-        kind: Kind::Ramp,
-        len: 1024,
-    },
-    Fixture {
-        name: "z7-empty-o6-m64k",
-        coder: "7z",
-        order: 6,
-        mem: 1 << 16,
-        end_marker: false,
-        kind: Kind::Text,
-        len: 0,
-    },
-    Fixture {
-        name: "z7-empty-o6-m64k-eos",
-        coder: "7z",
-        order: 6,
-        mem: 1 << 16,
-        end_marker: true,
-        kind: Kind::Text,
-        len: 0,
-    },
-    Fixture {
-        name: "z7-long-o64-m2k",
-        coder: "7z",
-        order: 64,
-        mem: 2048,
-        end_marker: false,
-        kind: Kind::Text,
-        len: 16 << 10,
-    },
-    Fixture {
-        name: "cl-text-o6-m1-eos",
-        coder: "carryless",
-        order: 6,
-        mem: 1 << 20,
-        end_marker: true,
-        kind: Kind::Text,
-        len: 3000,
-    },
-    Fixture {
-        name: "cl-records-o16-m1",
-        coder: "carryless",
-        order: 16,
-        mem: 1 << 20,
-        end_marker: false,
-        kind: Kind::Records,
-        len: 2000,
-    },
-    Fixture {
-        name: "cl-random-o4-m1-eos",
-        coder: "carryless",
-        order: 4,
-        mem: 1 << 20,
-        end_marker: true,
-        kind: Kind::Random,
-        len: 1500,
-    },
-];
-
+/// The hostile fixtures, built by [`synth::hostile_fixtures`] (which the
+/// root crate's hostile suites call in memory), with their `index.txt`.
 fn hostile_fixtures(files: &mut Files) {
     let dir = Path::new(HOSTILE_DIR);
-    let mut index = String::from(
-        "# Generated by fuzz/src/seeds.rs; do not edit. Columns: name coder order mem end_marker payload_len\n",
-    );
-    for (i, f) in FIXTURES.iter().enumerate() {
-        let payload = generate(f.kind, 400 + i as u64, f.len);
-        let stream = match f.coder {
-            "7z" => encode_7z(&payload, f.order, f.mem, f.end_marker),
-            _ => encode_carryless(&payload, f.order, f.mem, f.end_marker),
-        };
-        index.push_str(&format!(
-            "{} {} {} {} {} {}\n",
-            f.name,
-            f.coder,
-            f.order,
-            f.mem,
-            u8::from(f.end_marker),
-            payload.len()
-        ));
-        files.insert(dir.join(format!("{}.stream", f.name)), stream);
-        files.insert(dir.join(format!("{}.payload", f.name)), payload);
+    let mut index = String::from(synth::HOSTILE_INDEX_HEADER);
+    for f in synth::hostile_fixtures() {
+        index.push_str(&f.index_line());
+        files.insert(dir.join(format!("{}.stream", f.recipe.name)), f.stream);
+        files.insert(dir.join(format!("{}.payload", f.recipe.name)), f.payload);
     }
     files.insert(dir.join("index.txt"), index.into_bytes());
 }
 
-/// Every generated file, keyed by its path relative to the fuzz crate.
+/// Every generated file, keyed by its path relative to the repository root.
 pub fn all() -> Files {
     let mut files = Files::new();
     decode_7z_seeds(&mut files);
@@ -501,6 +411,7 @@ pub fn all() -> Files {
     range_coder_seeds(&mut files);
     checked_vs_unchecked_seeds(&mut files);
     model_ops_seeds(&mut files);
+    regressions(&mut files);
     hostile_fixtures(&mut files);
     files
 }
@@ -508,31 +419,48 @@ pub fn all() -> Files {
 /// The directories [`all`] owns: anything else in them is stale.
 pub fn owned_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = TARGETS.iter().map(|t| seed_dir(t)).collect();
+    for (target, _, _) in REGRESSIONS {
+        let dir = Path::new(REGRESSIONS_DIR).join(target);
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
     dirs.push(PathBuf::from(HOSTILE_DIR));
     dirs
 }
 
+/// Writes [`all`] under the repository root `root`, removing any other file
+/// in the directories this module owns, and returns what it wrote.
+pub fn write_all(root: &Path) -> std::io::Result<Files> {
+    let files = all();
+    for dir in owned_dirs() {
+        let dir = root.join(dir);
+        std::fs::create_dir_all(&dir)?;
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            if path.is_file() && !files.contains_key(rel) {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    for (path, data) in &files {
+        std::fs::write(root.join(path), data)?;
+    }
+    Ok(files)
+}
+
+/// The repository root, from this crate's manifest directory.
+pub fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the fuzz crate sits inside the repository")
+        .to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
-
-    fn root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    }
-
-    fn listed(dir: &Path) -> Vec<PathBuf> {
-        let mut v: Vec<PathBuf> = fs::read_dir(root().join(dir))
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .map(|e| dir.join(e.file_name()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        v.sort();
-        v
-    }
 
     #[test]
     fn every_target_has_seeds() {
@@ -544,42 +472,36 @@ mod tests {
     }
 
     #[test]
-    fn seeds_are_current() {
-        let files = all();
-        for (path, data) in &files {
-            let on_disk = fs::read(root().join(path))
-                .unwrap_or_else(|e| panic!("{}: {e}; run regenerate_seeds", path.display()));
+    fn generation_is_deterministic() {
+        assert_eq!(all(), all());
+    }
+
+    #[test]
+    fn every_file_is_in_an_owned_dir() {
+        let dirs = owned_dirs();
+        for path in all().keys() {
             assert!(
-                on_disk == *data,
-                "{} is stale; run regenerate_seeds",
+                dirs.iter().any(|d| path.parent() == Some(d.as_path())),
+                "{} is outside the owned directories",
                 path.display()
             );
         }
-        for dir in owned_dirs() {
-            for path in listed(&dir) {
-                assert!(
-                    files.contains_key(&path),
-                    "{} is not generated",
-                    path.display()
-                );
-            }
+    }
+
+    /// The regressions' bytes are the minimised inputs the first campaign
+    /// found; `paths.rs` pins their root cause.
+    #[test]
+    fn regressions_are_kept() {
+        let files = all();
+        for (target, name, input) in REGRESSIONS {
+            let path = Path::new(REGRESSIONS_DIR).join(target).join(name);
+            assert_eq!(files.get(&path).map(Vec::as_slice), Some(*input));
         }
     }
 
     #[test]
-    #[ignore = "writes the committed seeds and fixtures; run by hand"]
+    #[ignore = "writes the generated seeds and fixtures; run by hand"]
     fn regenerate_seeds() {
-        let files = all();
-        for dir in owned_dirs() {
-            fs::create_dir_all(root().join(&dir)).unwrap();
-            for path in listed(&dir) {
-                if !files.contains_key(&path) {
-                    fs::remove_file(root().join(&path)).unwrap();
-                }
-            }
-        }
-        for (path, data) in &files {
-            fs::write(root().join(path), data).unwrap();
-        }
+        write_all(&repo_root()).unwrap();
     }
 }
