@@ -261,6 +261,9 @@ Every item below lists the same fields:
   inconsistent model. 4 MiB, cycles: binary order 6 3925M to 3841M (7z
   4017M to 3761M), mixed order 6 4251M to 3890M, mixed order 32 1.08x;
   7% fewer instructions; text unchanged.
+  The selection pass then counts down from the threshold (one compare,
+  no spilled mask base): 7z binary order 6 3787M to 3696M cycles,
+  carry-less mixed order 6 4000M to 3847M, 3% fewer instructions.
 
 ### D9. Wide loads for context heads and successors
 

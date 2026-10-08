@@ -71,3 +71,5 @@ is a released version.
 - Decode: the escape decode sums the unmasked frequencies in a first pass
   and walks the states again only to select or mask, 4-9% fewer cycles on
   binary and mixed input and unchanged on text.
+- Decode: the escape decode's selection counts down from the threshold
+  and reuses the gather's borrows, 2-4% fewer cycles.

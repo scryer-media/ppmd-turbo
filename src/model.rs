@@ -1032,18 +1032,16 @@ impl Model {
             // selection: the unmasked frequencies sum to `hi_cnt`.
             let mut selected = None;
             if consistent {
-                let mut cum = 0u32;
+                let mut rest = count;
                 for state_index in 0..ns as usize {
-                    let head = self
-                        .alloc
-                        .span_read_u16(states_span, state_index * STATE_SIZE);
-                    let unmasked = self.char_mask[head as u8 as usize] != esc_count;
+                    let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
+                    let unmasked = char_mask[head as u8 as usize] != esc_count;
                     let freq = u32::from(head >> 8) & 0u32.wrapping_sub(u32::from(unmasked));
-                    cum += freq;
-                    if cum > count {
-                        selected = Some((state_index, (head >> 8) as u8, cum - freq));
+                    if rest < freq {
+                        selected = Some((state_index, (head >> 8) as u8, count - rest));
                         break;
                     }
+                    rest -= freq;
                 }
             } else {
                 let mut cum = 0u32;
