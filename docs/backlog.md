@@ -403,7 +403,9 @@ RAR 2.9 to 4.x PPM blocks and the `.pmd` format carry). Both encoders derive
 from Shkarin's public-domain PPMd and 7-Zip's `Ppmd7Enc.c`; nothing derives
 from unrar, which has no encoder. The carry-less encoder is a raw PPMd stream
 encoder only: the RAR block framing around it stays out of this crate, so no
-RAR archive is produced here.
+RAR archive is produced here. It is a correctness deliverable, not a
+performance one: the bench harness never measures it, and nothing below
+applies to it beyond staying bit-exact.
 
 ### E1. Owned output buffer
 
