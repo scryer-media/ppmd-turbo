@@ -314,6 +314,12 @@ impl<O: RangeOutput> CarrylessRangeEncoder<O> {
         &self.out
     }
 
+    /// The output, mutably. Writing to it directly corrupts the stream;
+    /// it is for flushing what the coder has already settled.
+    pub fn output_mut(&mut self) -> &mut O {
+        &mut self.out
+    }
+
     /// Writes the four bytes of `low`, most significant first, then flushes
     /// the output and returns it.
     ///

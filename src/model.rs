@@ -6,8 +6,10 @@
 //! estimation for masked contexts, model update (`UpdateModel`,
 //! `CreateSuccessors`, `Rescale`) and restart when the arena fills.
 //!
-//! The model decodes through any [`RangeDecoder`]; it never normalizes the
-//! coder itself (see the trait's contract).
+//! The model decodes through any [`RangeDecoder`] and encodes through any
+//! [`RangeEncoder`](crate::rc::RangeEncoder) (`encode.rs`, after 7-Zip's
+//! `Ppmd7Enc.c`); it never normalizes the coder itself (see the traits'
+//! contracts).
 //!
 //! Every arena pointer the model follows comes from the stream's own history
 //! and so is untrusted: each one is checked against the arena and the text
@@ -23,6 +25,8 @@ use crate::rc::RangeDecoder;
 use crate::rc::RarRangeDecoder;
 use crate::see::SeeTable;
 use crate::{PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER};
+
+mod encode;
 
 // --- Constants ---
 
@@ -642,6 +646,19 @@ impl Model {
         let Some(found_span) = found_span else {
             return self.fail_model();
         };
+        self.next_context(found_span, active_context_span, active_context_head)
+    }
+
+    /// `NextContext` / `UpdateModel` after a symbol was coded in the
+    /// context `active_context_span`: returns the symbol, or -1 on a model
+    /// fault. Shared by the decoder and the encoder.
+    #[inline(always)]
+    fn next_context(
+        &mut self,
+        found_span: ValidatedArenaSpan,
+        active_context_span: ValidatedArenaSpan,
+        active_context_head: u64,
+    ) -> i32 {
         let symbol = self.span_state_sym(found_span, 0);
 
         if self.order_fall == 0 {
@@ -715,25 +732,46 @@ impl Model {
         debug_assert_eq!(context_span.offset(), ctx as usize);
         let symbol = (context_head >> 48) as u8;
         let freq = (context_head >> 56) as u8;
+        let Some((idx0, idx1)) = self.bin_summ_index(context_head) else {
+            return false;
+        };
+        let bs = self.bin_summ[idx0][idx1];
+
+        if rc.decode_bit(u32::from(bs)) == 0 {
+            self.update_bin_hit(ctx, context_span, freq, (idx0, idx1), found_span);
+            true
+        } else {
+            self.update_bin_escape(symbol, (idx0, idx1), found_span)
+        }
+    }
+
+    /// `Ppmd7_GetBinSumm`: the `BinSumm` cell a binary context codes against,
+    /// setting `HiBitsFlag` from the previous symbol on the way. `None` for
+    /// an inconsistent model (`model_fault` set) or an out-of-range
+    /// probability. Shared by the decoder and the encoder.
+    #[inline(always)]
+    fn bin_summ_index(&mut self, context_head: u64) -> Option<(usize, usize)> {
+        let symbol = (context_head >> 48) as u8;
+        let freq = (context_head >> 56) as u8;
 
         if self.found_state == 0 {
             self.model_fault = true;
-            return false;
+            return None;
         }
         self.hi_bits_flag = self.hb2_flag[self.prev_sym as usize];
         let suffix = context_head as u32;
         if freq == 0 || freq > 128 || suffix == 0 {
             self.model_fault = true;
-            return false;
+            return None;
         }
         let Some(suffix_span) = self.validated_context(suffix) else {
             self.model_fault = true;
-            return false;
+            return None;
         };
         let suffix_ns = (self.span_context_head(suffix_span) >> 32) as u16;
         if suffix_ns == 0 || suffix_ns > 256 {
             self.model_fault = true;
-            return false;
+            return None;
         }
         let idx1 = self.prev_success as usize
             + self.ns2_bs_indx[suffix_ns as usize - 1] as usize
@@ -742,46 +780,66 @@ impl Model {
             + ((self.run_length >> 26) as usize & 0x20);
         let idx0 = freq as usize - 1;
         debug_assert!(idx1 < 64);
+        if self.bin_summ[idx0][idx1] as u32 > BIN_SCALE {
+            return None;
+        }
+        Some((idx0, idx1))
+    }
+
+    /// A binary context's symbol was coded (`UpdateBin` with the `BinSumm`
+    /// raise). Shared by the decoder and the encoder.
+    #[inline(always)]
+    fn update_bin_hit(
+        &mut self,
+        ctx: u32,
+        context_span: ValidatedArenaSpan,
+        freq: u8,
+        (idx0, idx1): (usize, usize),
+        found_span: &mut Option<ValidatedArenaSpan>,
+    ) {
         let bs = self.bin_summ[idx0][idx1];
+        self.found_state = ctx + CTX_ONE_SYM as u32;
+        *found_span = Some(context_span.subspan(CTX_ONE_SYM, STATE_SIZE));
+        let new_freq = if freq < 128 { freq + 1 } else { freq };
+        self.span_set_one_freq(context_span, new_freq);
 
-        if bs as u32 > BIN_SCALE {
+        // Update BinSumm: increase probability.
+        let mean = ((bs as u32 + 32) >> 7) as u16;
+        self.bin_summ[idx0][idx1] = bs.wrapping_add(INTERVAL).wrapping_sub(mean);
+
+        self.prev_success = 1;
+        // `RunLength` is only ever compared or shifted (see the `>> 26`
+        // index in `decode_bin_symbol`), so the reference's C `int` overflow
+        // is benign there but trips Rust's overflow checks. A corrupt stream
+        // can hold a binary context for billions of symbols, so saturate
+        // instead of wrapping: a wrap would flip the sign bit and silently
+        // change the `>> 26` bucket.
+        self.run_length = self.run_length.saturating_add(1);
+    }
+
+    /// A binary context escaped: lower `BinSumm`, take `InitEsc` and mask
+    /// the context's symbol. Shared by the decoder and the encoder.
+    #[inline(always)]
+    fn update_bin_escape(
+        &mut self,
+        symbol: u8,
+        (idx0, idx1): (usize, usize),
+        found_span: &mut Option<ValidatedArenaSpan>,
+    ) -> bool {
+        let bs = self.bin_summ[idx0][idx1];
+        let mean = ((bs as u32 + 32) >> 7) as u16;
+        let new_bs = bs.wrapping_sub(mean);
+        let Some(&init_esc) = EXP_ESCAPE.get((new_bs >> 10) as usize) else {
             return false;
-        }
-        if rc.decode_bit(u32::from(bs)) == 0 {
-            // Symbol found.
-            self.found_state = ctx + CTX_ONE_SYM as u32;
-            *found_span = Some(context_span.subspan(CTX_ONE_SYM, STATE_SIZE));
-            let new_freq = if freq < 128 { freq + 1 } else { freq };
-            self.span_set_one_freq(context_span, new_freq);
+        };
+        self.bin_summ[idx0][idx1] = new_bs;
 
-            // Update BinSumm: increase probability.
-            let mean = ((bs as u32 + 32) >> 7) as u16;
-            self.bin_summ[idx0][idx1] = bs.wrapping_add(INTERVAL).wrapping_sub(mean);
-
-            self.prev_success = 1;
-            // `RunLength` is only ever compared or shifted (see the `>> 26`
-            // index above), so the reference's C `int` overflow is benign
-            // there but trips Rust's overflow checks. A corrupt stream can
-            // hold a binary context for billions of symbols, so saturate
-            // instead of wrapping: a wrap would flip the sign bit and silently
-            // change the `>> 26` bucket.
-            self.run_length = self.run_length.saturating_add(1);
-        } else {
-            // Escape.
-            let mean = ((bs as u32 + 32) >> 7) as u16;
-            let new_bs = bs.wrapping_sub(mean);
-            let Some(&init_esc) = EXP_ESCAPE.get((new_bs >> 10) as usize) else {
-                return false;
-            };
-            self.bin_summ[idx0][idx1] = new_bs;
-
-            self.init_esc = init_esc;
-            self.num_masked = 1;
-            self.char_mask[symbol as usize] = self.esc_count;
-            self.prev_success = 0;
-            self.found_state = 0;
-            *found_span = None;
-        }
+        self.init_esc = init_esc;
+        self.num_masked = 1;
+        self.char_mask[symbol as usize] = self.esc_count;
+        self.prev_success = 0;
+        self.found_state = 0;
+        *found_span = None;
         true
     }
 
@@ -818,25 +876,14 @@ impl Model {
         let p0_freq = self.span_state_freq(states_span, 0) as u32;
         if count < p0_freq {
             // First symbol matched.
-            self.prev_success = if 2 * p0_freq > sum_freq { 1 } else { 0 };
-            // Same saturation rationale as `decode_bin_symbol`; see there.
-            self.run_length = self.run_length.saturating_add(self.prev_success as i32);
-            self.found_state = stats;
-            *found_span = Some(states_span.subspan(0, STATE_SIZE));
-
-            // unrar's model.cpp:420-423 stores the wrapped byte into `Freq` but keeps
-            // comparing the un-truncated `int HiCnt` against MAX_FREQ, so a
-            // corrupt state with `Freq >= 252` still rescales.
-            let raised_freq = p0_freq + 4;
-            let new_freq = raised_freq as u8;
-            let needs_rescale = raised_freq > MAX_FREQ as u32;
-            self.span_set_state_freq(states_span, 0, new_freq);
-            self.span_set_ctx_summ_freq(context_span, (sum_freq + 4) as u16);
-
-            let model_valid = !needs_rescale || self.rescale(ctx);
-            if needs_rescale {
-                *found_span = self.validated_state(self.found_state);
-            }
+            let model_valid = self.update1_0(
+                ctx,
+                context_span,
+                states_span,
+                p0_freq,
+                sum_freq,
+                found_span,
+            );
             rc.decode(0, p0_freq);
             return model_valid;
         }
@@ -884,6 +931,40 @@ impl Model {
             }
             state_index += 1;
         }
+    }
+
+    /// `Update1_0`: the first state of a multi-symbol context was coded.
+    /// Shared by the decoder and the encoder.
+    #[inline(always)]
+    fn update1_0(
+        &mut self,
+        ctx: u32,
+        context_span: ValidatedArenaSpan,
+        states_span: ValidatedArenaSpan,
+        p0_freq: u32,
+        sum_freq: u32,
+        found_span: &mut Option<ValidatedArenaSpan>,
+    ) -> bool {
+        self.prev_success = if 2 * p0_freq > sum_freq { 1 } else { 0 };
+        // Same saturation rationale as `decode_bin_symbol`; see there.
+        self.run_length = self.run_length.saturating_add(self.prev_success as i32);
+        self.found_state = states_span.offset() as u32;
+        *found_span = Some(states_span.subspan(0, STATE_SIZE));
+
+        // unrar's model.cpp:420-423 stores the wrapped byte into `Freq` but keeps
+        // comparing the un-truncated `int HiCnt` against MAX_FREQ, so a
+        // corrupt state with `Freq >= 252` still rescales.
+        let raised_freq = p0_freq + 4;
+        let new_freq = raised_freq as u8;
+        let needs_rescale = raised_freq > MAX_FREQ as u32;
+        self.span_set_state_freq(states_span, 0, new_freq);
+        self.span_set_ctx_summ_freq(context_span, (sum_freq + 4) as u16);
+
+        let model_valid = !needs_rescale || self.rescale(ctx);
+        if needs_rescale {
+            *found_span = self.validated_state(self.found_state);
+        }
+        model_valid
     }
 
     /// update1: increase freq, maintain sorted order, rescale if needed.

@@ -13,14 +13,17 @@
 //! unrar produces.
 //!
 //! The crate is pre-release and the API is unstable until 1.0. RAR decoding
-//! ([`rar`]: RAR 2.9 through 4.x; RAR5 has no PPMd) is implemented; the 7z
-//! framing ([`ppmd7`]) and both encoders are still to come.
+//! ([`rar`]: RAR 2.9 through 4.x; RAR5 has no PPMd) and the 7z encoder
+//! ([`ppmd7::Ppmd7Encoder`]) are implemented. [`carryless`] writes raw
+//! carry-less streams for round-trip testing only; it never writes RAR
+//! blocks or archives.
 //!
 //! `unsafe` is permitted where it pays for itself, and only with a
 //! `// SAFETY:` proof on every block, Miri coverage where Miri can run, and a
 //! fuzz target over every decoder and encoder entry point.
 
 pub(crate) mod alloc;
+pub mod carryless;
 pub mod error;
 pub mod model;
 pub mod ppmd7;
