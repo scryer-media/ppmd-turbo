@@ -1,35 +1,27 @@
 //! Differential tests of the range coders against ppmd-rust 1.5.0.
 //!
-//! ppmd-rust's coders are `pub(crate)`, so they can only be reached through
-//! its full `Ppmd7Encoder` / `Ppmd7aEncoder`, and those need a context model
-//! on this side too. Until the model lands every test here is
-//! `#[ignore = "awaiting model"]`; the coders are proven on their own by the
-//! hand-computed vectors, round trips, reference-coder comparisons and
-//! truncation tests in `src/rc/`.
-//!
-//! The functions in [`api`] mirror the corpus harness's shim
-//! (`tests/common/api.rs`): a raw 7z `PPMD` stream with its order and memory
-//! size, decoded to `unpacked_len` bytes. When the model lands, fill in the
-//! intended bodies (or switch to `common::api`) and drop the `ignore`s.
+//! ppmd-rust's coders are `pub(crate)`, so they are reached through its full
+//! `Ppmd7Encoder` / `Ppmd7aEncoder`: ppmd-rust writes a stream, and the
+//! crate's model over the matching coder must decode it. The encoder
+//! comparisons wait for the crate's encoders and stay
+//! `#[ignore = "awaiting encoder"]`.
 
 use std::io::Write;
 
 mod api {
-    use ppmd_turbo::Result;
+    use ppmd_turbo::model::Model;
+    use ppmd_turbo::rc::CarrylessRangeDecoder;
+    use ppmd_turbo::{Error, Result};
 
     /// Decodes a raw 7z `PPMD` stream (7z coder): exactly `unpacked_len`
     /// bytes when given, otherwise up to the end marker.
-    ///
-    /// Intended body: as `tests/common/api.rs::decode_7z`, through
-    /// `ppmd_turbo::ppmd7::Ppmd7Decoder::new(stream, order, mem_size)`.
     pub fn decode_7z(
         stream: &[u8],
         order: u32,
         mem_size: u32,
         unpacked_len: Option<u64>,
     ) -> Result<Vec<u8>> {
-        let _ = (stream, order, mem_size, unpacked_len);
-        todo!("awaiting ppmd_turbo::ppmd7::Ppmd7Decoder")
+        ppmd_turbo::decode_7z(stream, order, mem_size, unpacked_len)
     }
 
     /// Encodes `data` as a raw 7z `PPMD` stream without an end marker, as
@@ -43,18 +35,35 @@ mod api {
     }
 
     /// Decodes a raw variant H stream coded with the carry-less coder
-    /// (7-Zip's `Ppmd7a`, Shkarin's `.pmd`).
-    ///
-    /// Intended body: the 7a decoder over
-    /// `ppmd_turbo::rc::CarrylessRangeDecoder::new_7a(stream)`.
+    /// (7-Zip's `Ppmd7a`, Shkarin's `.pmd`): the model over
+    /// `CarrylessRangeDecoder::new_7a`. Exactly `unpacked_len` symbols when
+    /// given, otherwise up to the end marker; reading past the input is an
+    /// error, as in 7-Zip.
     pub fn decode_7a(
         stream: &[u8],
         order: u32,
         mem_size: u32,
         unpacked_len: Option<u64>,
     ) -> Result<Vec<u8>> {
-        let _ = (stream, order, mem_size, unpacked_len);
-        todo!("awaiting the 7a decoder")
+        let mut model = Model::new(order, mem_size)?;
+        let mut rc = CarrylessRangeDecoder::new_7a(stream)?;
+        let mut out = Vec::new();
+        while unpacked_len.is_none_or(|n| (out.len() as u64) < n) {
+            let symbol = model.decode_symbol(&mut rc)?;
+            if rc.zero_bytes_past_eof() != 0 {
+                return Err(Error::Truncated);
+            }
+            match symbol {
+                Some(byte) => out.push(byte),
+                None if unpacked_len.is_none() => break,
+                None => {
+                    return Err(Error::CorruptStream {
+                        detail: "end marker",
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Encodes `data` with the carry-less coder, without an end marker.
@@ -116,7 +125,6 @@ fn ppmd_rust_7a(data: &[u8], order: u32, mem_size: u32) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "awaiting model"]
 fn sevenz_streams_from_ppmd_rust_decode() {
     for (seed, (order, mem)) in PARAMS.into_iter().enumerate() {
         let data = sample(200_000, seed as u64);
@@ -127,7 +135,7 @@ fn sevenz_streams_from_ppmd_rust_decode() {
 }
 
 #[test]
-#[ignore = "awaiting model"]
+#[ignore = "awaiting encoder"]
 fn sevenz_encoding_is_byte_identical_to_ppmd_rust() {
     for (seed, (order, mem)) in PARAMS.into_iter().enumerate() {
         let data = sample(200_000, 100 + seed as u64);
@@ -138,7 +146,6 @@ fn sevenz_encoding_is_byte_identical_to_ppmd_rust() {
 }
 
 #[test]
-#[ignore = "awaiting model"]
 fn carryless_streams_from_ppmd_rust_decode() {
     for (seed, (order, mem)) in PARAMS.into_iter().enumerate() {
         let data = sample(200_000, 200 + seed as u64);
@@ -149,7 +156,7 @@ fn carryless_streams_from_ppmd_rust_decode() {
 }
 
 #[test]
-#[ignore = "awaiting model"]
+#[ignore = "awaiting encoder"]
 fn carryless_encoding_is_byte_identical_to_ppmd_rust() {
     for (seed, (order, mem)) in PARAMS.into_iter().enumerate() {
         let data = sample(200_000, 300 + seed as u64);
