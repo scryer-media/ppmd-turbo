@@ -237,6 +237,12 @@ impl<O: RangeOutput> SevenZipRangeEncoder<O> {
         &self.out
     }
 
+    /// The output, mutably. Writing to it directly corrupts the stream;
+    /// it is for flushing what the coder has already settled.
+    pub fn output_mut(&mut self) -> &mut O {
+        &mut self.out
+    }
+
     /// `Ppmd7z_Flush_RangeEnc` (five `ShiftLow` calls), then flushes the
     /// output and returns it.
     ///
