@@ -144,34 +144,50 @@ Every test in it is ignored, and without `PPMD_TURBO_ORACLES=1` each one
 returns at once. With the variable set, a missing `7zz` is a failure. RAR
 checks skip when `unrar` is not on `PATH`.
 
-## When the decoder and encoder APIs land
+`ppmd-oracle check-7z --codec turbo` runs the decoder check today and
+passes all 144 of its default decoder checks against 7-Zip 26.01; the
+encoder and container checks report themselves unavailable until the
+encoder lands. `check-rar` extracts every non-solid PPMd member with
+ppmd-turbo (`ppmd_corpus::rar` parses the archive, one volume at a time) and
+compares it with `unrar p`. Members that are stored, solid continuations, or
+that leave PPMd for an LZ block or a RarVM filter are reported unavailable.
 
-Everything that needs the API compiles against stubs today. To turn it on:
+## Where ppmd-turbo and ppmd-rust differ
 
-- **Fuzz harness.** Fill in the bodies in `fuzz/src/api.rs`, which are
-  written out in its doc comments. The targets then exercise ppmd-turbo
-  instead of skipping it.
-- **Hostile tests.** Fill in the `todo!()` bodies in
-  `tests/hostile_support/mod.rs` (`api::decode_7z` and
-  `api::RarDecoder::{new, decode_block}`). Then remove
-  `#[ignore = "awaiting decoder"]` from `tests/hostile_decode.rs` and
-  `tests/hostile_memory.rs`, and add `#[cfg_attr(miri, ignore)]` to any loop
-  too slow for Miri.
-- **Carry-less fault test.** `carryless_range_below_total_is_a_fault_not_a_division_by_zero`
-  needs a public, or `#[doc(hidden)]`, `RangeCoderState::new(low, code,
-  range)`. The coder fields are `pub(crate)` today. A random, guided and
-  hill-climbing search of about 300k decodes found no stream that drives
-  the range below the total (best range/total ratio about 1.74), so the
-  test sets the registers directly.
-- **Shim types.** These shims take `order` and `mem` as `u32`, as the
-  decoder does. The conformance shim in `tests/common/api.rs` uses `usize`.
-  Converge on the real signature.
-- **Errors.** `Error::CorruptStream` gains a `detail` field. The shims
-  classify errors with `Error::X { .. }` patterns, so either shape compiles.
-- **Oracles.** Set `TURBO_API = true` and fill in `turbo_encode_7z` in
-  `tests/differential_binaries.rs`. Fill in the `Codec::Turbo` arms in
-  `tools/ppmd-oracle/src/codec.rs`, and the RAR comparison in
-  `check_rar` in `tools/ppmd-oracle/src/main.rs`.
+The suites hold ppmd-turbo to 7-Zip's `PpmdDecoder.cpp` and unrar, not to
+ppmd-rust. Where ppmd-rust 1.5.0 behaves differently, the test or the
+fuzz agreement rule records it:
+
+- **7z input ends before the data does.** ppmd-turbo returns
+  `Error::Truncated` (`UnexpectedEof` through `Read`), as 7-Zip does when it
+  reads past the input. ppmd-rust treats the end of input as the end of the
+  data and returns what it has. `decode_differential_7z` and `structure_7z`
+  allow for this.
+- **7z end marker before a known size.** `Ppmd7Decoder` returns `Ok(0)`
+  there, as ppmd-rust does, so a caller that knows the size sees a short
+  read. `decode_7z` on a slice reports it as a corrupt stream. With
+  `set_finish_stream(true)`, 7-Zip's FinishStream mode, the `Read` path
+  reports it too and also requires the coder's code to be zero at the size.
+  FinishStream is opt-in, as in 7-Zip.
+- **RAR end marker reached on padding.** A PPMd end marker decoded after the
+  coder has run past the end of its input is `Error::Truncated`. Without
+  this check a member cut short could decode to `Ok` on the zeros the coder
+  feeds past the end.
+- **RAR block of zero bytes.** `decode_block` with empty coder input returns
+  `Ok(0)`, as documented: there is nothing to decode. The conformance cut at
+  length 0 expects that, and every later cut expects an error.
+
+## When the encoder API lands
+
+- **Fuzz harness.** Fill in the encoder bodies in `fuzz/src/api.rs`. The
+  round-trip targets then compare the two encoders byte for byte; until
+  then `roundtrip_7z` decodes ppmd-rust's stream with ppmd-turbo.
+- **Coder differential.** Remove `#[ignore = "awaiting encoder"]` from the
+  two encoder tests in `tests/coder_differential.rs`.
+- **Oracles.** Set `TURBO_ENCODER = true` and fill in `turbo_encode_7z` in
+  `tests/differential_binaries.rs`. Fill in the `Codec::Turbo` encode arm
+  in `tools/ppmd-oracle/src/codec.rs`.
+- **Bench.** Set `ENCODE_7Z` in `tools/ppmd-bench/src/turbo.rs`.
 - **Merge note.** The RAR extraction branch also adds
   `fuzz/fuzz_targets/decode_rar.rs` and edits `fuzz/Cargo.toml`. Keep this
   branch's target, which uses the shared layout and seeds, and fold in that

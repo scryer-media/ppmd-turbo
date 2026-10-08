@@ -72,7 +72,6 @@ fn manifest_matches_the_committed_files() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn raw_carry_less_streams_decode_to_their_payloads() {
     let manifest = common::manifest();
     let streams: Vec<_> = list(&manifest, "streams")
@@ -88,8 +87,8 @@ fn raw_carry_less_streams_decode_to_their_payloads() {
         let result = no_panic(name, || {
             RarDecoder::new().decode_block(
                 true,
-                u64_of(s, "order") as usize,
-                (u64_of(s, "mem") / MIB) as usize,
+                u64_of(s, "order") as u32,
+                (u64_of(s, "mem") / MIB) as u32,
                 &data,
                 len,
                 &mut out,
@@ -115,7 +114,6 @@ fn raw_carry_less_streams_decode_to_their_payloads() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rarlab_members_decode_to_their_bytes() {
     let manifest = common::manifest();
     let members = list(&manifest, "rar_members");
@@ -129,8 +127,8 @@ fn rarlab_members_decode_to_their_bytes() {
         let result = no_panic(name, || {
             RarDecoder::new().decode_block(
                 h["reset"] == true,
-                u64_of(h, "order") as usize,
-                u64_of(h, "mem_mb") as usize,
+                u64_of(h, "order") as u32,
+                u64_of(h, "mem_mb") as u32,
                 rc,
                 u64_of(m, "symbols"),
                 &mut symbols,
@@ -156,7 +154,6 @@ fn rarlab_members_decode_to_their_bytes() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn hostile_archives_return_without_panicking() {
     let manifest = common::manifest();
     let hostile = list(&manifest, "hostile");
@@ -168,8 +165,8 @@ fn hostile_archives_return_without_panicking() {
         let (skip, order, mem_mb) = if header.is_object() {
             (
                 u64_of(header, "len") as usize,
-                u64_of(header, "order") as usize,
-                u64_of(header, "mem_mb") as usize,
+                u64_of(header, "order") as u32,
+                u64_of(header, "mem_mb") as u32,
             )
         } else {
             (0, 6, 1)
@@ -186,7 +183,6 @@ fn hostile_archives_return_without_panicking() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn corrupted_streams_fail_as_their_recipes_say() {
     let manifest = common::manifest();
     let mut failures = Vec::new();
@@ -204,8 +200,8 @@ fn corrupted_streams_fail_as_their_recipes_say() {
             RarDecoder::new()
                 .decode_block(
                     true,
-                    u64_of(base, "order") as usize,
-                    (u64_of(base, "mem") / MIB) as usize,
+                    u64_of(base, "order") as u32,
+                    (u64_of(base, "mem") / MIB) as u32,
                     &bad,
                     u64_of(base, "payload_len"),
                     &mut out,
@@ -224,9 +220,11 @@ fn corrupted_streams_fail_as_their_recipes_say() {
     report(&failures, checked);
 }
 
-/// The RAR member truncated anywhere: an error, never a panic.
+/// The RAR member truncated anywhere: an error, never a panic. The one
+/// exception is a cut at 0: `RarDecoder::decode_block` documents empty coder
+/// data as a block with nothing to decode (`Ok(0)`, no output, no model
+/// built), so that cut must decode nothing rather than fail.
 #[test]
-#[ignore = "awaiting decoder"]
 fn truncated_member_is_an_error() {
     let manifest = common::manifest();
     let m = &list(&manifest, "rar_members")[0];
@@ -242,13 +240,14 @@ fn truncated_member_is_an_error() {
             RarDecoder::new().decode_block(
                 true,
                 16,
-                u64_of(h, "mem_mb") as usize,
+                u64_of(h, "mem_mb") as u32,
                 &rc[..cut],
                 u64_of(m, "symbols"),
                 &mut out,
             )
         }) {
             Err(e) => failures.push(e),
+            Ok(Ok(0)) if cut == 0 && out.is_empty() => {}
             Ok(Ok(_)) => failures.push(format!(
                 "{name}: decoded {} symbols without an error",
                 out.len()
@@ -262,7 +261,6 @@ fn truncated_member_is_an_error() {
 /// A block that does not reset, with no model yet, is an error (as in
 /// unrar-rs's `test_ppmd_block_without_init`).
 #[test]
-#[ignore = "awaiting decoder"]
 fn continuation_without_a_model_is_an_error() {
     let mut out = Vec::new();
     let result = RarDecoder::new().decode_block(false, 0, 0, &[0; 8], 10, &mut out);

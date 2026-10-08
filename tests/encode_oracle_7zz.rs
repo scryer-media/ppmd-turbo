@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use binaries::SevenZip;
 use encode_support::{corpus, first_difference};
-use ppmd_turbo::ppmd7::encode_to_vec;
+use ppmd_turbo::encode_7z;
 use sevenz::{read_archive, write_archive};
 
 fn oracle() -> Option<SevenZip> {
@@ -56,8 +56,8 @@ fn byte_identical_to_7zz() {
                     .compress_ppmd(&dir, "vexa.bin", &data, order, mem)
                     .unwrap_or_else(|e| panic!("{name} o={order} mem={mem}: {e}"));
                 let entry = read_archive(&archive).expect("reads 7-Zip's archive");
-                let ours = encode_to_vec(&data, u32::from(entry.order), entry.mem, false)
-                    .expect("encodes");
+                let ours =
+                    encode_7z(&data, u32::from(entry.order), entry.mem, false).expect("encodes");
                 assert_eq!(
                     first_difference(&ours, &entry.stream),
                     None,
@@ -90,7 +90,7 @@ fn sevenzip_extracts_turbo_streams() {
     for (name, data) in cases {
         for order in [2u8, 7, 33, 64] {
             for mem in [2048u32, 1 << 16, 1 << 20] {
-                let stream = encode_to_vec(&data, u32::from(order), mem, false).expect("encodes");
+                let stream = encode_7z(&data, u32::from(order), mem, false).expect("encodes");
                 let archive =
                     write_archive(order, mem, &stream, &data, "dunmere.bin").expect("writes");
                 let back = seven

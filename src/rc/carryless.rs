@@ -41,6 +41,17 @@ pub struct RangeCoderState {
     pub(crate) range: u32,
 }
 
+impl RangeCoderState {
+    /// Registers as given. A state saved with
+    /// [`CarrylessRangeDecoder::state`] is the normal source; this lets a
+    /// caller that kept the three values elsewhere (or a test that needs a
+    /// particular state) rebuild one. Any values are safe: a range the
+    /// coder cannot scale is reported as a fault, never a division by zero.
+    pub fn new(low: u32, code: u32, range: u32) -> Self {
+        Self { low, code, range }
+    }
+}
+
 /// The carry-less range decoder.
 ///
 /// Reads through any [`RangeInput`]. Past the end of the input it is fed
@@ -69,7 +80,7 @@ impl<I: RangeInput> CarrylessRangeDecoder<I> {
             code = (code << 8) | u32::from(input.next_byte());
         }
         if input.zero_bytes_past_eof() != 0 {
-            return Err(Error::Truncated);
+            return Err(input.take_io_error().map_or(Error::Truncated, Error::Io));
         }
         Ok(Self::from_parts(
             input,

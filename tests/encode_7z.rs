@@ -5,13 +5,13 @@
 mod common;
 mod encode_support;
 
-use std::io::Write;
+use std::io::{Read, Write};
 
 use encode_support::{
     exhausting_payload, first_difference, payloads, reference_7z, reference_decode_7z,
     turbo_decode_7z,
 };
-use ppmd_turbo::ppmd7::{Ppmd7Encoder, encode_to_vec};
+use ppmd_turbo::{Ppmd7Decoder, Ppmd7Encoder, decode_7z, encode_7z};
 
 /// Encodes through the `Write` adapter, in uneven chunks.
 fn encode_streaming(data: &[u8], order: u32, mem: u32, end_marker: bool) -> Vec<u8> {
@@ -21,6 +21,35 @@ fn encode_streaming(data: &[u8], order: u32, mem: u32, end_marker: bool) -> Vec<
     }
     enc.flush().expect("flushes");
     enc.finish(end_marker).expect("finishes")
+}
+
+/// Decodes `stream` through the crate's public 7z decoder, both entry
+/// points: `decode_7z` and `Ppmd7Decoder` read through `std::io::Read`.
+/// With a known size `Ppmd7Decoder` runs in `FinishStream` mode and must
+/// consume the stream exactly; without one, the end marker must stop it.
+fn real_decode_7z(stream: &[u8], order: u32, mem: u32, len: usize, end_marker: bool, what: &str) {
+    let known = (!end_marker).then_some(len as u64);
+    let sliced = decode_7z(stream, order, mem, known).unwrap_or_else(|e| panic!("{what}: {e}"));
+    assert!(sliced.len() == len, "{what}: decode_7z length");
+
+    let mut dec = match known {
+        Some(n) => {
+            let mut dec = Ppmd7Decoder::with_unpacked_size(stream, order, mem, n).unwrap();
+            dec.set_finish_stream(true);
+            dec
+        }
+        None => Ppmd7Decoder::new(stream, order, mem).unwrap(),
+    };
+    let mut read = Vec::new();
+    dec.read_to_end(&mut read)
+        .unwrap_or_else(|e| panic!("{what}: Ppmd7Decoder: {e}"));
+    assert!(dec.is_finished(), "{what}: Ppmd7Decoder finished");
+    assert_eq!(
+        dec.position(),
+        stream.len(),
+        "{what}: Ppmd7Decoder consumed"
+    );
+    assert!(read == sliced, "{what}: Ppmd7Decoder vs decode_7z");
 }
 
 /// Every 7z stream in the fixture manifest, whether `7zz` or ppmd-rust
@@ -49,7 +78,7 @@ fn reproduces_every_committed_7z_stream() {
             common::payload_sha256(&manifest, s),
             "{name}: payload"
         );
-        let ours = encode_to_vec(&payload, order, mem, end_marker).expect("encodes");
+        let ours = encode_7z(&payload, order, mem, end_marker).expect("encodes");
         if let Some(at) = first_difference(&ours, &stream) {
             failures.push(format!(
                 "{name} ({}): first difference at byte {at} of {}/{}",
@@ -76,7 +105,7 @@ fn byte_identical_to_ppmd_rust_across_the_grid() {
             for mem in [2048u32, 1 << 16, 1 << 20, 16 << 20] {
                 for end_marker in [false, true] {
                     let want = reference_7z(&data, order, mem, end_marker);
-                    let ours = encode_to_vec(&data, order, mem, end_marker).expect("encodes");
+                    let ours = encode_7z(&data, order, mem, end_marker).expect("encodes");
                     if let Some(at) = first_difference(&ours, &want) {
                         failures.push(format!(
                             "{name} o={order} mem={mem} eos={end_marker}: \
@@ -103,7 +132,7 @@ fn the_write_adapter_matches_the_slice_entry() {
             for end_marker in [false, true] {
                 assert_eq!(
                     encode_streaming(&data, order, mem, end_marker),
-                    encode_to_vec(&data, order, mem, end_marker).unwrap(),
+                    encode_7z(&data, order, mem, end_marker).unwrap(),
                     "{name} o={order} mem={mem} eos={end_marker}"
                 );
             }
@@ -111,16 +140,17 @@ fn the_write_adapter_matches_the_slice_entry() {
     }
 }
 
-/// Round trips through ppmd-rust's decoder and through the crate's model
-/// over the 7z range decoder, which must also finish with a zero code and
-/// read the stream exactly to its end.
+/// Round trips through ppmd-rust's decoder, through the crate's public
+/// `Ppmd7Decoder` and `decode_7z`, and through the crate's model over the
+/// 7z range decoder, which must also finish with a zero code and read the
+/// stream exactly to its end.
 #[test]
 #[cfg_attr(miri, ignore = "slow under Miri")]
 fn round_trips_through_both_decoders() {
     for (name, data) in payloads() {
         for (order, mem) in [(2u32, 1u32 << 20), (6, 1 << 16), (16, 2048), (64, 1 << 20)] {
             for end_marker in [false, true] {
-                let stream = encode_to_vec(&data, order, mem, end_marker).unwrap();
+                let stream = encode_7z(&data, order, mem, end_marker).unwrap();
                 let what = format!("{name} o={order} mem={mem} eos={end_marker}");
                 let len = (!end_marker).then_some(data.len());
                 assert!(
@@ -130,6 +160,11 @@ fn round_trips_through_both_decoders() {
                 let ours = turbo_decode_7z(&stream, order, mem, data.len(), end_marker);
                 assert!(ours.data == data, "{what}: ppmd-turbo's model");
                 assert_eq!(ours.end_marker, end_marker, "{what}: end marker");
+                real_decode_7z(&stream, order, mem, data.len(), end_marker, &what);
+                assert!(
+                    decode_7z(&stream, order, mem, len.map(|n| n as u64)).unwrap() == data,
+                    "{what}: decode_7z"
+                );
             }
         }
     }
@@ -142,11 +177,17 @@ fn round_trips_through_both_decoders() {
 fn arena_exhaustion_restarts_identically() {
     let data = exhausting_payload(200_000);
     for (order, mem) in [(64u32, 2048u32), (32, 4096), (16, 1 << 14), (8, 1 << 16)] {
-        let ours = encode_to_vec(&data, order, mem, true).unwrap();
+        let ours = encode_7z(&data, order, mem, true).unwrap();
         let want = reference_7z(&data, order, mem, true);
         assert_eq!(first_difference(&ours, &want), None, "o={order} mem={mem}");
         let back = turbo_decode_7z(&ours, order, mem, data.len(), true);
         assert!(back.data == data && back.end_marker, "o={order} mem={mem}");
+        let what = format!("o={order} mem={mem}");
+        real_decode_7z(&ours, order, mem, data.len(), true, &what);
+        assert!(
+            decode_7z(&ours, order, mem, None).unwrap() == data,
+            "{what}"
+        );
     }
 }
 
@@ -164,8 +205,14 @@ fn back_to_back_streams_on_one_writer() {
     let mut enc = Ppmd7Encoder::new(first, 6, 1 << 16).unwrap();
     enc.write_all(&b).unwrap();
     let both = enc.finish(true).unwrap();
-    assert_eq!(&both[..split], encode_to_vec(&a, 6, 1 << 16, true).unwrap());
-    assert_eq!(&both[split..], encode_to_vec(&b, 6, 1 << 16, true).unwrap());
+    assert_eq!(&both[..split], encode_7z(&a, 6, 1 << 16, true).unwrap());
+    assert_eq!(&both[split..], encode_7z(&b, 6, 1 << 16, true).unwrap());
+    // The first decoder stops at its end marker, exactly at the split.
+    let mut dec = Ppmd7Decoder::new(&both[..], 6, 1 << 16).unwrap();
+    let mut back = Vec::new();
+    dec.read_to_end(&mut back).unwrap();
+    assert!(back == a && dec.position() == split);
+    assert!(decode_7z(&both[split..], 6, 1 << 16, None).unwrap() == b);
 }
 
 /// Parameters outside variant H's range are refused before anything is
@@ -178,7 +225,7 @@ fn rejects_out_of_range_parameters() {
             Err(ppmd_turbo::Error::InvalidParameters)
         ));
         assert!(matches!(
-            encode_to_vec(b"x", order, mem, false),
+            encode_7z(b"x", order, mem, false),
             Err(ppmd_turbo::Error::InvalidParameters)
         ));
     }
@@ -207,10 +254,11 @@ fn small_inputs_under_miri() {
     let data = encode_support::corpus::text(7, 120);
     for (order, mem) in [(2u32, 2048u32), (6, 2048), (64, 4096)] {
         for end_marker in [false, true] {
-            let stream = encode_to_vec(&data, order, mem, end_marker).unwrap();
+            let stream = encode_7z(&data, order, mem, end_marker).unwrap();
             let back = turbo_decode_7z(&stream, order, mem, data.len(), end_marker);
             assert!(back.data == data, "o={order} mem={mem}");
             assert_eq!(back.end_marker, end_marker);
+            real_decode_7z(&stream, order, mem, data.len(), end_marker, "miri");
         }
     }
 }

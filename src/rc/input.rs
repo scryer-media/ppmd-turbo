@@ -54,6 +54,12 @@ pub trait RangeInput {
 
     /// Zero bytes fed past the end of the input so far.
     fn zero_bytes_past_eof(&self) -> u32;
+
+    /// Takes the I/O error that ended the input, if one did. Inputs that
+    /// cannot fail return `None`.
+    fn take_io_error(&mut self) -> Option<std::io::Error> {
+        None
+    }
 }
 
 /// Converts a value into the [`RangeInput`] a decoder reads from, so the
@@ -270,6 +276,10 @@ impl<R: Read> RangeInput for ReadInput<R> {
     #[inline]
     fn zero_bytes_past_eof(&self) -> u32 {
         self.zero_bytes_past_eof
+    }
+
+    fn take_io_error(&mut self) -> Option<std::io::Error> {
+        self.error.take()
     }
 }
 

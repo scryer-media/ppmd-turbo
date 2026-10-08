@@ -15,7 +15,6 @@ use std::io::{self, Write};
 
 use crate::error::Result;
 use crate::model::Model;
-use crate::ppmd7::into_io;
 use crate::rc::{CarrylessRangeEncoder, RangeOutput, WriteOutput};
 
 /// Encodes a raw carry-less PPMd stream into any [`std::io::Write`]: the
@@ -71,7 +70,7 @@ impl<W: Write> CarrylessEncoder<W> {
 
 impl<W: Write> Write for CarrylessEncoder<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.encode(buf).map_err(into_io)?;
+        self.encode(buf).map_err(io::Error::from)?;
         Ok(buf.len())
     }
 
@@ -79,14 +78,19 @@ impl<W: Write> Write for CarrylessEncoder<W> {
     /// flushes it. The coder's `low` stays until
     /// [`finish`](CarrylessEncoder::finish).
     fn flush(&mut self) -> io::Result<()> {
-        self.rc.output_mut().finish().map_err(into_io)
+        self.rc.output_mut().finish().map_err(io::Error::from)
     }
 }
 
 /// Encodes `data` into a new `Vec` as a raw carry-less stream.
 ///
 /// Errors: as [`CarrylessEncoder::new`] and [`CarrylessEncoder::finish`].
-pub fn encode_to_vec(data: &[u8], order: u32, mem_size: u32, end_marker: bool) -> Result<Vec<u8>> {
+pub fn encode_carryless(
+    data: &[u8],
+    order: u32,
+    mem_size: u32,
+    end_marker: bool,
+) -> Result<Vec<u8>> {
     let mut model = Model::new(order, mem_size)?;
     let mut rc = CarrylessRangeEncoder::new(Vec::with_capacity(data.len() / 2 + 16));
     model.encode_bytes(&mut rc, data)?;

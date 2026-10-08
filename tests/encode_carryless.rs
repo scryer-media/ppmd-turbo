@@ -13,7 +13,7 @@ use encode_support::{
     exhausting_payload, first_difference, payloads, reference_carryless,
     reference_decode_carryless, turbo_decode_carryless,
 };
-use ppmd_turbo::carryless::{CarrylessEncoder, encode_to_vec};
+use ppmd_turbo::carryless::{CarrylessEncoder, encode_carryless};
 use ppmd_turbo::rar::RarDecoder;
 use ppmd_turbo::rc::RarRangeDecoder;
 
@@ -42,7 +42,7 @@ fn reproduces_every_committed_carryless_stream() {
             common::payload_sha256(&manifest, s),
             "{name}: payload"
         );
-        let ours = encode_to_vec(&payload, order, mem, end_marker).expect("encodes");
+        let ours = encode_carryless(&payload, order, mem, end_marker).expect("encodes");
         if let Some(at) = first_difference(&ours, &stream) {
             failures.push(format!(
                 "{name}: first difference at byte {at} of {}/{}",
@@ -66,7 +66,7 @@ fn byte_identical_to_ppmd_rust_across_the_grid() {
             for mem in [2048u32, 1 << 16, 1 << 20] {
                 for end_marker in [false, true] {
                     let want = reference_carryless(&data, order, mem, end_marker);
-                    let ours = encode_to_vec(&data, order, mem, end_marker).expect("encodes");
+                    let ours = encode_carryless(&data, order, mem, end_marker).expect("encodes");
                     if let Some(at) = first_difference(&ours, &want) {
                         failures.push(format!(
                             "{name} o={order} mem={mem} eos={end_marker}: byte {at} of {}/{}",
@@ -89,7 +89,7 @@ fn round_trips_through_the_carryless_decoder() {
     for (name, data) in payloads() {
         for (order, mem) in [(2u32, 1u32 << 20), (6, 1 << 16), (16, 2048), (64, 1 << 20)] {
             for end_marker in [false, true] {
-                let stream = encode_to_vec(&data, order, mem, end_marker).unwrap();
+                let stream = encode_carryless(&data, order, mem, end_marker).unwrap();
                 let back = turbo_decode_carryless(&stream, order, mem, data.len(), end_marker);
                 let what = format!("{name} o={order} mem={mem} eos={end_marker}");
                 assert!(back.data == data, "{what}");
@@ -110,7 +110,7 @@ fn round_trips_through_the_rar_decoder() {
             let mem = mem_mb << 20;
             let what = format!("{name} o={order} mem={mem_mb}M");
 
-            let marked = encode_to_vec(&data, order, mem, true).unwrap();
+            let marked = encode_carryless(&data, order, mem, true).unwrap();
             let mut rar = RarDecoder::new();
             let mut out = Vec::new();
             let used = rar
@@ -119,7 +119,7 @@ fn round_trips_through_the_rar_decoder() {
             assert!(out == data, "{what}: decode_block to the end marker");
             assert!(used <= marked.len(), "{what}");
 
-            let unmarked = encode_to_vec(&data, order, mem, false).unwrap();
+            let unmarked = encode_carryless(&data, order, mem, false).unwrap();
             let mut rar = RarDecoder::new();
             let mut out = Vec::new();
             rar.decode_block(true, order, mem_mb, &unmarked, data.len() as u64, &mut out)
@@ -146,7 +146,7 @@ fn round_trips_through_the_rar_decoder() {
 fn arena_exhaustion_round_trips() {
     let data = exhausting_payload(200_000);
     for (order, mem) in [(64u32, 2048u32), (32, 4096), (16, 1 << 14)] {
-        let ours = encode_to_vec(&data, order, mem, true).unwrap();
+        let ours = encode_carryless(&data, order, mem, true).unwrap();
         assert_eq!(
             first_difference(&ours, &reference_carryless(&data, order, mem, true)),
             None,
@@ -157,7 +157,7 @@ fn arena_exhaustion_round_trips() {
     }
 
     let big = exhausting_payload(600_000);
-    let stream = encode_to_vec(&big, 64, 1 << 20, true).unwrap();
+    let stream = encode_carryless(&big, 64, 1 << 20, true).unwrap();
     let mut rar = RarDecoder::new();
     let mut out = Vec::new();
     rar.decode_block(true, 64, 1, &stream, u64::MAX, &mut out)
@@ -178,7 +178,7 @@ fn the_write_adapter_matches_the_slice_entry() {
             enc.flush().unwrap();
             assert_eq!(
                 enc.finish(end_marker).unwrap(),
-                encode_to_vec(&data, 8, 1 << 20, end_marker).unwrap(),
+                encode_carryless(&data, 8, 1 << 20, end_marker).unwrap(),
                 "{name} eos={end_marker}"
             );
         }
@@ -194,7 +194,7 @@ fn rejects_out_of_range_parameters() {
             Err(ppmd_turbo::Error::InvalidParameters)
         ));
         assert!(matches!(
-            encode_to_vec(b"x", order, mem, false),
+            encode_carryless(b"x", order, mem, false),
             Err(ppmd_turbo::Error::InvalidParameters)
         ));
     }
@@ -206,7 +206,7 @@ fn small_inputs_under_miri() {
     let data = encode_support::corpus::records(9, 120);
     for (order, mem) in [(2u32, 2048u32), (64, 4096)] {
         for end_marker in [false, true] {
-            let stream = encode_to_vec(&data, order, mem, end_marker).unwrap();
+            let stream = encode_carryless(&data, order, mem, end_marker).unwrap();
             let back = turbo_decode_carryless(&stream, order, mem, data.len(), end_marker);
             assert!(back.data == data, "o={order} mem={mem}");
             assert_eq!(back.end_marker, end_marker);

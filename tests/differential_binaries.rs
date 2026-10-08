@@ -32,9 +32,9 @@ use binaries::{SevenZip, Unrar};
 use hostile_support::{Coder, fixtures_of};
 use sevenz::{read_archive, write_archive};
 
-/// Flip to `true` when ppmd-turbo's 7z encoder and decoder land, together
-/// with [`turbo_encode_7z`] and `hostile_support::api::decode_7z`.
-const TURBO_API: bool = false;
+/// ppmd-turbo's 7z decoder is wired in; the encoder checks wait for
+/// [`turbo_encode_7z`]. Flip to `true` when ppmd-turbo's 7z encoder lands.
+const TURBO_ENCODER: bool = false;
 
 /// ppmd-turbo's 7z encoder, no end marker (as 7-Zip writes). Intended body:
 ///
@@ -45,7 +45,7 @@ const TURBO_API: bool = false;
 /// ```
 fn turbo_encode_7z(data: &[u8], order: u32, mem: u32) -> Vec<u8> {
     let _ = (data, order, mem);
-    unreachable!("guarded by TURBO_API")
+    unreachable!("guarded by TURBO_ENCODER")
 }
 
 fn turbo_decode_7z(stream: &[u8], order: u32, mem: u32, size: u64) -> Result<Vec<u8>, String> {
@@ -62,11 +62,11 @@ fn oracle() -> Option<SevenZip> {
     Some(seven)
 }
 
-fn turbo_ready() -> bool {
-    if !TURBO_API {
-        eprintln!("skipped: awaiting ppmd-turbo's 7z API (TURBO_API = false)");
+fn turbo_encoder_ready() -> bool {
+    if !TURBO_ENCODER {
+        eprintln!("skipped: awaiting ppmd-turbo's 7z encoder (TURBO_ENCODER = false)");
     }
-    TURBO_API
+    TURBO_ENCODER
 }
 
 fn work(test: &str) -> PathBuf {
@@ -121,7 +121,7 @@ fn container_round_trips_7zz_streams() {
 #[ignore = "binary oracle: PPMD_TURBO_ORACLES=1, --ignored"]
 fn turbo_encoder_is_byte_identical_to_7zz() {
     let Some(seven) = oracle() else { return };
-    if !turbo_ready() {
+    if !turbo_encoder_ready() {
         return;
     }
     let dir = work("encoder");
@@ -151,9 +151,6 @@ fn turbo_encoder_is_byte_identical_to_7zz() {
 #[ignore = "binary oracle: PPMD_TURBO_ORACLES=1, --ignored"]
 fn turbo_decoder_reads_7zz_streams() {
     let Some(seven) = oracle() else { return };
-    if !turbo_ready() {
-        return;
-    }
     let dir = work("decoder");
     for (name, data, order, mem) in encodable_cases() {
         let entry = read_archive(
@@ -179,7 +176,7 @@ fn turbo_decoder_reads_7zz_streams() {
 #[ignore = "binary oracle: PPMD_TURBO_ORACLES=1, --ignored"]
 fn sevenzip_reads_turbo_streams_at_every_order() {
     let Some(seven) = oracle() else { return };
-    if !turbo_ready() {
+    if !turbo_encoder_ready() {
         return;
     }
     let dir = work("reverse");
@@ -208,9 +205,6 @@ fn sevenzip_reads_turbo_streams_at_every_order() {
 #[ignore = "binary oracle: PPMD_TURBO_ORACLES=1, --ignored"]
 fn damaged_streams_7zz_accepts_turbo_accepts() {
     let Some(seven) = oracle() else { return };
-    if !turbo_ready() {
-        return;
-    }
     let dir = work("damaged");
     for fx in fixtures_of(Coder::SevenZ) {
         if fx.payload.is_empty() {

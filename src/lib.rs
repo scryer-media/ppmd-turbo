@@ -12,11 +12,25 @@
 //! 7-Zip's for the same parameters, and a RAR stream decodes to exactly what
 //! unrar produces.
 //!
-//! The crate is pre-release and the API is unstable until 1.0. RAR decoding
-//! ([`rar`]: RAR 2.9 through 4.x; RAR5 has no PPMd) and the 7z encoder
-//! ([`ppmd7::Ppmd7Encoder`]) are implemented. [`carryless`] writes raw
-//! carry-less streams for round-trip testing only; it never writes RAR
-//! blocks or archives.
+//! The crate is pre-release and the API is unstable until 1.0. Decoding is
+//! implemented for both framings: 7z ([`Ppmd7Decoder`] through
+//! [`std::io::Read`], or [`decode_7z`] for a stream in memory) and RAR
+//! ([`rar`]: RAR 2.9 through 4.x; RAR5 has no PPMd). The 7z encoder
+//! ([`Ppmd7Encoder`], or [`encode_7z`]) writes streams byte-identical to
+//! 7-Zip's. [`carryless`] writes raw carry-less streams for round-trip
+//! testing only; it never writes RAR blocks or archives.
+//!
+//! ```
+//! use std::io::Read;
+//!
+//! // The empty 7z PPMd stream: a zero byte and four flush bytes.
+//! let stream = [0u8; 5];
+//! let mut decoder = ppmd_turbo::Ppmd7Decoder::with_unpacked_size(&stream[..], 6, 1 << 16, 0)?;
+//! let mut out = Vec::new();
+//! decoder.read_to_end(&mut out)?;
+//! assert!(out.is_empty());
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 //!
 //! `unsafe` is permitted where it pays for itself, and only with a
 //! `// SAFETY:` proof on every block, Miri coverage where Miri can run, and a
@@ -32,6 +46,7 @@ pub mod rc;
 pub(crate) mod see;
 
 pub use error::{Error, Result};
+pub use ppmd7::{Ppmd7Decoder, Ppmd7Encoder, decode_7z, encode_7z};
 
 /// The smallest model order variant H accepts (`PPMD7_MIN_ORDER` in 7-Zip).
 pub const PPMD7_MIN_ORDER: u32 = 2;

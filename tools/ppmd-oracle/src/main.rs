@@ -230,14 +230,53 @@ fn check_rar(args: &Args) -> Result<Tally, String> {
                 continue;
             }
         }
-        // When ppmd-turbo's RAR API lands, compare `unrar p` with its
-        // extraction of the same archive here.
-        tally.record(
-            &format!("decoder {label}"),
-            Err(CodecError::Unavailable(
-                "ppmd-turbo's RAR API has not landed",
-            )),
-        );
+        let printed = match unrar.print(archive) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("FAIL unrar p {label}: {e}");
+                tally.failed += 1;
+                continue;
+            }
+        };
+        let members = match std::fs::read(archive)
+            .map_err(|e| e.to_string())
+            .and_then(|data| ppmd_corpus::rar::members(&[&data]))
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tally.record(
+                    &format!("parse {label}"),
+                    Err(CodecError::Failed(format!("{e} (one volume per archive)"))),
+                );
+                continue;
+            }
+        };
+        // `unrar p` prints the members back to back, in archive order.
+        let mut offset = 0usize;
+        for member in &members {
+            let what = format!("decoder {label}:{}", member.name);
+            let len = member.unpacked_len as usize;
+            let want = printed.get(offset..offset + len);
+            offset += len;
+            if member.solid || member.method == 0x30 {
+                tally.record(
+                    &what,
+                    Err(CodecError::Unavailable(
+                        "a stored or solid-continuation member",
+                    )),
+                );
+                continue;
+            }
+            let result = args
+                .codec
+                .decode_rar_member(&member.packed, member.unpacked_len)
+                .and_then(|ours| match want {
+                    Some(want) if want == ours => Ok(()),
+                    Some(want) => Err(CodecError::Failed(first_difference(want, &ours))),
+                    None => Err(CodecError::Failed("unrar printed fewer bytes".into())),
+                });
+            tally.record(&what, result);
+        }
     }
     Ok(tally)
 }

@@ -51,7 +51,6 @@ fn manifest_matches_the_committed_streams() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn every_stream_decodes_to_its_payload() {
     let manifest = common::manifest();
     let streams = sevenz_streams(&manifest);
@@ -90,7 +89,6 @@ fn every_stream_decodes_to_its_payload() {
 /// An end-marker stream read with its known length gives the same bytes:
 /// the marker after the last symbol is never reached.
 #[test]
-#[ignore = "awaiting decoder"]
 fn end_marker_streams_also_decode_by_length() {
     let manifest = common::manifest();
     let streams: Vec<_> = sevenz_streams(&manifest)
@@ -117,7 +115,6 @@ fn end_marker_streams_also_decode_by_length() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn corrupted_streams_fail_as_their_recipes_say() {
     let manifest = common::manifest();
     let mut failures = Vec::new();
@@ -153,7 +150,6 @@ fn corrupted_streams_fail_as_their_recipes_say() {
 /// Every prefix of a small stream: an error or, if the missing tail was
 /// never needed, the payload; never invented bytes and never a panic.
 #[test]
-#[ignore = "awaiting decoder"]
 fn every_truncation_of_a_small_stream_is_clean() {
     let manifest = common::manifest();
     let s = common::stream(&manifest, &"text-1k.o6.m64k.7zz.ppmd".into());
@@ -175,7 +171,6 @@ fn every_truncation_of_a_small_stream_is_clean() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn out_of_range_parameters_are_rejected() {
     let manifest = common::manifest();
     let s = common::stream(&manifest, &"text-1k.o6.m64k.7zz.ppmd".into());
