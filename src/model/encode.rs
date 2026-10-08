@@ -308,21 +308,23 @@ impl Model {
         let mut found = 0usize;
         let mut low = 0u32;
         let mut target_index = usize::MAX;
+        let mut hits = 0usize;
         for state_index in 0..ns as usize {
             let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
             let unmasked = char_mask[head as u8 as usize] != esc_count;
             let freq = u32::from(head >> 8) & 0u32.wrapping_sub(u32::from(unmasked));
-            // The target matches at most once in a consistent model, so this
-            // branch is taken once per walk; only the first unmasked match
-            // counts, as in the collecting loop below.
-            if unmasked && i32::from(head as u8) == target && target_index == usize::MAX {
-                target_index = state_index;
-                low = hi_cnt;
-            }
+            // Keep the last unmasked match and count the matches, so no
+            // state waits on the one before it. A consistent model holds the
+            // target at most once; more than one match takes the collecting
+            // loop below, where the first one counts.
+            let hit = unmasked & (i32::from(head as u8) == target);
+            target_index = if hit { state_index } else { target_index };
+            low = if hit { hi_cnt } else { low };
+            hits += usize::from(hit);
             hi_cnt += freq;
             found += usize::from(unmasked);
         }
-        let consistent = found == n;
+        let consistent = found == n && hits <= 1;
         let mut selected = None;
         if consistent {
             if target_index != usize::MAX {

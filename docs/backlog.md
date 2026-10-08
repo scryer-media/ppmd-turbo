@@ -469,6 +469,10 @@ applies to it beyond staying bit-exact.
   Recording the target behind a once-taken branch, instead of a
   branch-free `before` mask that chained every state to the last, then
   took binary to 3580M and mixed to 3527M (1.14x and 1.11x).
+  The compiler if-converted that branch back into a chain through the
+  target index; keeping the last match and counting matches (more than
+  one takes the collecting loop) leaves only one-cycle chains: binary
+  3521M to 3366M, mixed 3494M to 3374M (ppmd-rust 2280M and 2498M).
 
 ### E4. Share the model fast paths with decode
 

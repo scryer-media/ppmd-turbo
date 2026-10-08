@@ -23,8 +23,9 @@ is a released version.
   `roundtrip_7z` and `roundtrip_carryless` fuzz targets now run the crate's
   encoders.
 - Encode: the escape pass sums the unmasked states and finds the symbol in
-  one walk with no branch per state, 1.47x faster on binary input, 1.33x
-  on mixed and 1.11x on 64 KiB of text.
+  one walk with no branch per state and no state waiting on the one before,
+  1.56x faster on binary input, 1.40x on mixed and 1.11x on 64 KiB of
+  text.
 
 ## 0.1.0 - 2026-10-08
 
