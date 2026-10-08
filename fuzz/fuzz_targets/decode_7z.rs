@@ -18,8 +18,9 @@ fuzz_target!(|data: &[u8]| {
     let Some(case) = Decode7z::parse(data) else {
         return;
     };
-    let legal = (ppmd_turbo::PPMD7_MIN_ORDER..=ppmd_turbo::PPMD7_MAX_ORDER).contains(&case.order)
-        && (ppmd_turbo::PPMD7_MIN_MEM_SIZE..=ppmd_turbo::PPMD7_MAX_MEM_SIZE).contains(&case.mem);
+    let legal = (ppmd_turbo::Params::MIN_ORDER..=ppmd_turbo::Params::MAX_ORDER)
+        .contains(&case.order)
+        && (ppmd_turbo::Params::MIN_MEM..=ppmd_turbo::Params::MAX_MEM).contains(&case.mem);
     let Some(out) = api::decode_7z(case.stream, case.order, case.mem, case.known, OUTPUT_CAP)
     else {
         return;

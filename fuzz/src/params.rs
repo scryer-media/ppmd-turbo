@@ -24,7 +24,7 @@ pub const OUTPUT_CAP: usize = 1 << 20;
 pub const INVALID_ORDERS: [u32; 4] = [0, 1, 65, 255];
 
 /// 7z memory sizes outside 2 KiB..=`PPMD7_MAX_MEM_SIZE`.
-pub const INVALID_MEMS: [u32; 4] = [0, 1, 2047, ppmd_turbo::PPMD7_MAX_MEM_SIZE + 1];
+pub const INVALID_MEMS: [u32; 4] = [0, 1, 2047, ppmd_turbo::Params::MAX_MEM + 1];
 
 /// RAR arena sizes in MiB that must be refused: zero, and sizes whose byte
 /// count does not fit the 32-bit arena (4096 MiB is 2^32 bytes).
@@ -86,7 +86,7 @@ mod tests {
             assert!((1..=MAX_RAR_MEM_MB).contains(&rar_mem_mb_from(sel)));
             for low in [0, 1, 0x7FFF, u16::MAX] {
                 let mem = mem_from(sel, low, MAX_DECODE_MEM);
-                assert!((ppmd_turbo::PPMD7_MIN_MEM_SIZE..=MAX_DECODE_MEM).contains(&mem));
+                assert!((ppmd_turbo::Params::MIN_MEM..=MAX_DECODE_MEM).contains(&mem));
             }
         }
     }
