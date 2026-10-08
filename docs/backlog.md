@@ -398,10 +398,12 @@ them. See [Tests and fixtures](#tests-and-fixtures) and
 
 ## Encode backlog (ranked)
 
-Encode targets the 7z coder (and the 7a/`.pmd` carry-less encoder). There is
-**no RAR encoder**: the unRAR licence forbids using its source to build a
-RAR-compatible compressor, and the RAR PPM framing has no other public
-specification. Building one would need an operator and legal decision.
+Encode targets both coders: the 7z coder and the carry-less coder (the stream
+RAR 2.9 to 4.x PPM blocks and the `.pmd` format carry). Both encoders derive
+from Shkarin's public-domain PPMd and 7-Zip's `Ppmd7Enc.c`; nothing derives
+from unrar, which has no encoder. The carry-less encoder is a raw PPMd stream
+encoder only: the RAR block framing around it stays out of this crate, so no
+RAR archive is produced here.
 
 ### E1. Owned output buffer
 
