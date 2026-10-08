@@ -9,10 +9,10 @@ iteration counts, no sleeps and no clocks.
 |---|---|---|
 | unit and conformance tests | `src/`, `tests/conformance_*.rs`, `tests/fixtures/` | `cargo test`, every platform |
 | hostile-input tests | `tests/hostile_decode.rs`, `tests/hostile_memory.rs`, `tests/hostile_fixtures/` | `cargo test`, Miri, ASan |
-| fuzzing, six targets | `fuzz/` | the `fuzz` CI lane (short) and `fuzz-extended.yml` (long) |
+| fuzzing, nine targets | `fuzz/` | the `fuzz` CI lane (short) and `fuzz-extended.yml` (long) |
 | in-process differential | the fuzz targets, against ppmd-rust 1.5.0 | with fuzzing |
 | out-of-process oracles | `tools/ppmd-oracle/`, `tests/differential_binaries.rs` | on demand, against `7zz` and `unrar` |
-| Miri | `cargo miri nextest run` | the `miri-x86_64` CI lane |
+| Miri | `MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run` | the `miri-x86_64` CI lane |
 | AddressSanitizer | the hostile tests, and every fuzz target | the `asan-linux-x86_64` and `fuzz-*` CI lanes |
 
 ## Hostile-input tests
@@ -63,6 +63,9 @@ agreement rule, so every target stays a few lines long.
 | `roundtrip_7z` | 5-byte header + payload | both encoders write identical bytes; both decoders return the payload |
 | `roundtrip_carryless` | 3-byte header + payload | ppmd-rust's `7a` stream decodes through the RAR block API, and so does ppmd-turbo's |
 | `structure_7z` | parameters, a payload generator and up to 8 edits (flip, truncate, insert, delete, append) applied to a valid stream | an unedited stream decodes to its payload; an edited one agrees with ppmd-rust |
+| `range_coders` | 9-byte coder operations (total, start, size, binary probability) over both coders | arbitrary streams never panic or loop and a zero range is a fault; clamped operations round-trip and the decoder ends exactly at the stream's end |
+| `checked_vs_unchecked` | mode byte (coder, refill size 1..8) + a `decode_rar` or `decode_7z` input | the block/slice path and a symbol-at-a-time path over a one-byte-per-read `ReadInput` agree on every byte, verdict and coder position |
+| `model_ops` | up to 48 operations (init, reset, cleanup, start, restart, invalid parameters, symbol and block decodes) | invalid parameters change nothing; after any history a re-init, start or restart decodes a fresh known stream exactly |
 
 Memory per iteration is bounded: decode arenas cap at 64 MiB, round-trip
 arenas at 16 MiB, RAR arenas at 16 MiB, generated payloads at 16 KiB and
@@ -81,7 +84,8 @@ cargo +nightly fuzz run decode_7z fuzz/corpus/decode_7z fuzz/seeds/decode_7z -- 
 
 CI runs each target on x86_64 and aarch64 Linux from the seeds, with
 `-seed=1` and a fixed `-runs` per target (20000 for the decoders, 5000 for
-the round trips and 2000 for `structure_7z`). `fuzz-extended.yml` is
+the round trips, 2000 for `structure_7z`, 50000 for `range_coders`, 10000
+for `checked_vs_unchecked` and 5000 for `model_ops`). `fuzz-extended.yml` is
 dispatch-only. It takes `runs` and `seed` inputs, uploads crashes and the
 grown corpus, and can also run the `7zz` oracles.
 
@@ -108,6 +112,23 @@ cargo test --locked --manifest-path fuzz/Cargo.toml --lib -- --ignored regenerat
    failure). The fuzz input format is a harness detail; the hostile test is
    the lasting record.
 5. Fix the decoder.
+
+## Miri
+
+```sh
+MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri nextest run --locked --all-features
+```
+
+Isolation is off because the hostile tests read their fixtures from
+`tests/`; nothing in the suite reads a clock or the environment. The vector
+state searches are compiled out under Miri, so it checks the scalar paths.
+Long loops run shortened under `cfg(miri)`, and the corpus conformance and
+coder-differential suites are left out (`#![cfg(not(miri))]`): each takes
+Miri over half an hour, and the same decoders run under Miri through the
+hostile and library tests. The unchecked arena accessors in `src/alloc.rs`
+rely on a caller invariant that only debug assertions check (see
+`ValidatedArenaSpan`); `cargo +nightly fuzz build --debug-assertions` runs the
+fuzz targets with those checks on.
 
 ## Out-of-process oracles
 
