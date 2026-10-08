@@ -22,12 +22,14 @@ exclude = [
 [dependencies]
 
 [dev-dependencies]
+# The 7z container CRCs in tests/differential_binaries.rs.
+crc32fast = "1.5"
 
 # Repository tools (oracles, bench drivers) join as `tools/<name>` members so
 # their dependencies never reach this crate's own graph. The fuzz harness is
 # its own workspace, built on nightly by cargo-fuzz.
 [workspace]
-members = []
+members = ["tools/ppmd-oracle"]
 exclude = ["fuzz"]
 resolver = "3"
 
