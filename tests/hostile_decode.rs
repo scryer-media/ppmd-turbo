@@ -115,7 +115,6 @@ fn z7_truncation_never_yields_wrong_output() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_truncation_is_bounded() {
     for f in fixtures_of(Coder::CarryLess) {
         for cut in cut_points(&f.name, f.stream.len()) {
@@ -172,7 +171,6 @@ fn z7_bit_flips_are_errors_or_full_length() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_bit_flips_are_bounded() {
     for f in fixtures_of(Coder::CarryLess) {
         for i in 0..f.stream.len().min(64) {
@@ -241,7 +239,6 @@ fn z7_order_and_memory_out_of_range() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_order_and_memory_out_of_range() {
     let f = fixture("cl-text-o6-m1-eos");
     // Order 1 is rejected by RAR itself (algorithms.md 5.1); the mapped
@@ -303,7 +300,6 @@ fn z7_tiny_arena_garbage_terminates() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_restart_storm() {
     // The reset flag on every block: each block rebuilds the model, and the
     // output never depends on what came before.
@@ -365,7 +361,6 @@ fn z7_empty_payload_streams() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_zero_length_block() {
     let f = fixture("cl-text-o6-m1-eos");
     let (r, out) = decode_rar(&f, &[], 100);
@@ -387,7 +382,6 @@ fn rar_zero_length_block() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_no_reset_without_model_is_corrupt() {
     // algorithms.md 5.1: a no-reset block with no model is an error.
     let f = fixture("cl-text-o6-m1-eos");
@@ -399,7 +393,6 @@ fn rar_no_reset_without_model_is_corrupt() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_solid_continuation_after_an_error_does_not_panic() {
     let f = fixture("cl-text-o6-m1-eos");
     let mut dec = RarDecoder::new();
@@ -422,7 +415,6 @@ fn rar_solid_continuation_after_an_error_does_not_panic() {
 // Output size lies.
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_size_larger_than_payload_stops_at_end_marker() {
     let f = fixture("cl-text-o6-m1-eos");
     for remaining in [f.payload.len() as u64 + 1, 1 << 30, u64::MAX] {
@@ -433,7 +425,6 @@ fn rar_size_larger_than_payload_stops_at_end_marker() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_size_larger_than_payload_without_marker_terminates() {
     // No end marker: past the real data the coder reads zero padding until
     // the guard, then reports truncation. It must stop either way.
@@ -471,7 +462,7 @@ fn z7_size_larger_than_payload() {
 // The carry-less coder's range below the total.
 
 #[test]
-#[ignore = "awaiting decoder"]
+#[ignore = "needs a public RangeCoderState constructor"]
 fn carryless_range_below_total_is_a_fault_not_a_division_by_zero() {
     // After normalisation the carry-less range is at least 2^15 (BOT), and
     // an escape total can reach about 39.8k (255 states near MAX_FREQ plus a

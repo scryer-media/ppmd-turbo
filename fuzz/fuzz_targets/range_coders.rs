@@ -11,8 +11,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use ppmd_turbo::rc::{
-    CarrylessRangeDecoder, CarrylessRangeEncoder, RangeDecoder, RangeEncoder,
-    SevenZipRangeDecoder, SevenZipRangeEncoder,
+    CarrylessRangeDecoder, CarrylessRangeEncoder, RangeDecoder, RangeEncoder, SevenZipRangeDecoder,
+    SevenZipRangeEncoder,
 };
 
 /// One operation per 9 input bytes: a kind and two `u32`s.
@@ -105,7 +105,10 @@ fuzz_target!(|data: &[u8]| {
     let mut dec = SevenZipRangeDecoder::new(&coded[..]).expect("own stream initializes");
     check(&mut dec, &ops);
     assert!(dec.is_finished_ok());
-    assert_eq!((dec.position(), dec.zero_bytes_past_eof()), (coded.len(), 0));
+    assert_eq!(
+        (dec.position(), dec.zero_bytes_past_eof()),
+        (coded.len(), 0)
+    );
 
     let ops = valid_ops(script, 1 << 15);
     let mut enc = CarrylessRangeEncoder::new(Vec::new());
@@ -114,5 +117,8 @@ fuzz_target!(|data: &[u8]| {
     let mut dec = CarrylessRangeDecoder::new(&coded[..]).expect("own stream initializes");
     check(&mut dec, &ops);
     assert!(dec.is_finished_ok());
-    assert_eq!((dec.position(), dec.zero_bytes_past_eof()), (coded.len(), 0));
+    assert_eq!(
+        (dec.position(), dec.zero_bytes_past_eof()),
+        (coded.len(), 0)
+    );
 });

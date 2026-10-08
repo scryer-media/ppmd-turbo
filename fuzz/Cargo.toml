@@ -71,6 +71,20 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "checked_vs_unchecked"
+path = "fuzz_targets/checked_vs_unchecked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "model_ops"
+path = "fuzz_targets/model_ops.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
 

@@ -13,8 +13,9 @@
 //! - a carry-less encoder of the same shape whose output a `RarDecoder`
 //!   block decodes.
 //!
-//! Until an entry point exists its function here returns `None` and the
-//! targets skip the ppmd-turbo half of the iteration. To switch one on,
+//! The RAR decoder is live. Until another entry point exists its function
+//! here returns `None` and the targets skip the ppmd-turbo half of the
+//! iteration. To switch one on,
 //! replace its body with the call in its doc comment; `docs/testing.md` keeps
 //! the list.
 
@@ -45,28 +46,18 @@ pub fn decode_7z(
 
 /// RAR's PPMd decoder, kept across the blocks of a member or a solid run.
 pub struct RarSession {
-    // Intended: `inner: ppmd_turbo::rar::RarDecoder`.
-    _private: (),
+    inner: ppmd_turbo::rar::RarDecoder,
 }
 
 impl RarSession {
-    /// A decoder with no model yet, or `None` until the RAR decoder lands.
-    ///
-    /// Intended body:
-    /// `Some(Self { inner: ppmd_turbo::rar::RarDecoder::new() })`.
+    /// A decoder with no model yet. Always `Some`: the RAR decoder is live.
     pub fn new() -> Option<Self> {
-        None
+        Some(Self {
+            inner: ppmd_turbo::rar::RarDecoder::new(),
+        })
     }
 
     /// Decodes one block; returns the bytes of `rc_data` consumed.
-    ///
-    /// Intended body:
-    ///
-    /// ```ignore
-    /// self.inner
-    ///     .decode_block(reset, order, mem_mb, rc_data, unpacked_remaining, out)
-    ///     .map_err(|e| crate::outcome::classify(&e))
-    /// ```
     pub fn decode_block(
         &mut self,
         reset: bool,
@@ -76,8 +67,14 @@ impl RarSession {
         unpacked_remaining: u64,
         out: &mut Vec<u8>,
     ) -> Result<usize, ErrKind> {
-        let _ = (reset, order, mem_mb, rc_data, unpacked_remaining, out);
-        Err(ErrKind::Other)
+        self.inner
+            .decode_block(reset, order, mem_mb, rc_data, unpacked_remaining, out)
+            .map_err(|e| crate::outcome::classify(&e))
+    }
+
+    /// The decoder itself, for targets that drive its model directly.
+    pub fn decoder(&mut self) -> &mut ppmd_turbo::rar::RarDecoder {
+        &mut self.inner
     }
 }
 

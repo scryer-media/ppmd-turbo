@@ -138,7 +138,6 @@ fn z7_tiny_arena_long_input_stays_within_arena() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_restart_storm_reuses_the_arena() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let f = fixture("cl-text-o6-m1-eos");

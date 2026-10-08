@@ -4,9 +4,9 @@
 //!
 //! The shim has the shape of `tests/common/api.rs` (the conformance suites')
 //! with the parameter types the RAR decoder actually takes (`u32` order and
-//! arena). Until the decoder lands every entry point is a `todo!()` and every
-//! test that reaches one is `#[ignore = "awaiting decoder"]`; the flip list
-//! is in `docs/testing.md`.
+//! arena). The RAR entry point is live. The 7z one is a `todo!()` until the
+//! 7z decoder lands, and every test that reaches it is
+//! `#[ignore = "awaiting decoder"]`; the flip list is in `docs/testing.md`.
 
 #![allow(dead_code)]
 
@@ -47,25 +47,21 @@ pub mod api {
     }
 
     /// RAR's PPMd decoder, kept across the blocks of a member or a solid run.
-    /// Intended: a wrapper over `ppmd_turbo::rar::RarDecoder`.
     pub struct RarDecoder {
-        _private: (),
+        inner: ppmd_turbo::rar::RarDecoder,
     }
 
     impl RarDecoder {
         /// A decoder with no model yet; the first block must reset.
-        ///
-        /// Intended body: `Self { inner: ppmd_turbo::rar::RarDecoder::new() }`.
         pub fn new() -> Self {
-            Self { _private: () }
+            Self {
+                inner: ppmd_turbo::rar::RarDecoder::new(),
+            }
         }
 
         /// Decodes one block from the carry-less coder's bytes; returns the
         /// bytes of `rc_data` consumed. `order` is after RAR's mapping and
         /// `mem_mb` is `MaxMB + 1`; both are used only when `reset`.
-        ///
-        /// Intended body:
-        /// `self.inner.decode_block(reset, order, mem_mb, rc_data, unpacked_remaining, out)`.
         pub fn decode_block(
             &mut self,
             reset: bool,
@@ -75,8 +71,8 @@ pub mod api {
             unpacked_remaining: u64,
             out: &mut Vec<u8>,
         ) -> Result<usize> {
-            let _ = (reset, order, mem_mb, rc_data, unpacked_remaining, out);
-            todo!("awaiting ppmd_turbo::rar::RarDecoder")
+            self.inner
+                .decode_block(reset, order, mem_mb, rc_data, unpacked_remaining, out)
         }
     }
 

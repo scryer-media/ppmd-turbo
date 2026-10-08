@@ -15,17 +15,22 @@ use std::path::{Path, PathBuf};
 
 use crate::SplitMix64;
 use crate::layout::{Decode7z, RarBlock, Roundtrip7z, RoundtripCarryless};
+use crate::ops;
+use crate::paths;
 use crate::payload::{Kind, generate};
 use crate::reference::{encode_7z, encode_carryless};
 
 /// Every fuzz target, in the order CI lists them.
-pub const TARGETS: [&str; 6] = [
+pub const TARGETS: [&str; 9] = [
     "decode_7z",
     "decode_rar",
     "decode_differential_7z",
     "roundtrip_7z",
     "roundtrip_carryless",
     "structure_7z",
+    "range_coders",
+    "checked_vs_unchecked",
+    "model_ops",
 ];
 
 /// The directories this module owns, relative to the fuzz crate, and every
@@ -219,6 +224,133 @@ fn structure_seeds(files: &mut Files) {
     }
 }
 
+fn range_coder_seeds(files: &mut Files) {
+    let mut rng = SplitMix64::new(0x5243);
+    let mut put = |n: &str, split: u8, stream: &[u8], script: &[u8]| {
+        let mut v = vec![split];
+        v.extend_from_slice(&stream[..usize::from(split).min(stream.len())]);
+        v.extend_from_slice(script);
+        files.insert(seed_dir("range_coders").join(n), v);
+    };
+    let z7 = encode_7z(&generate(Kind::Text, 500, 400), 6, 1 << 16, true);
+    let cl = encode_carryless(&generate(Kind::Text, 501, 400), 6, 1 << 20, true);
+    let script = rng.bytes(9 * 64);
+    put("sevenz-stream", 255, &z7, &script);
+    put("carryless-stream", 255, &cl, &script);
+    put("short-stream", 3, &cl, &script);
+    put("no-stream", 0, &[], &script);
+    // Operation kinds 0, 1, 2 in turn, with totals and sizes at the edges.
+    let mut edges = Vec::new();
+    for (i, (a, b)) in [
+        (0u32, 0u32),
+        (1, 1),
+        (u32::MAX, u32::MAX),
+        (0x8000, 0x7FFF),
+        (16384, 95),
+        (65535, 65535),
+        (1 << 15, 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for kind in 0..3u8 {
+            edges.push(kind + 3 * i as u8);
+            edges.extend_from_slice(&a.to_le_bytes());
+            edges.extend_from_slice(&b.to_le_bytes());
+        }
+    }
+    put("edge-operations", 64, &rng.bytes(64), &edges);
+    let garbage = rng.bytes(512);
+    put("garbage", 128, &garbage, &garbage);
+}
+
+/// `checked_vs_unchecked` reuses the decode seeds behind its mode byte,
+/// cycling the refill size.
+fn checked_vs_unchecked_seeds(files: &mut Files) {
+    let mut seeds = Vec::new();
+    for (target, sevenz) in [("decode_rar", false), ("decode_7z", true)] {
+        let dir = seed_dir(target);
+        for (path, data) in files.range(dir.clone()..) {
+            if !path.starts_with(&dir) {
+                break;
+            }
+            let name = path.file_name().expect("seed file name").to_string_lossy();
+            let refill = 1 + seeds.len() % 8;
+            let mut v = vec![paths::mode(sevenz, refill)];
+            v.extend_from_slice(data);
+            let prefix = if sevenz { "7z" } else { "rar" };
+            seeds.push((format!("{prefix}-r{refill}-{name}"), v));
+        }
+    }
+    for (n, v) in seeds {
+        files.insert(seed_dir("checked_vs_unchecked").join(n), v);
+    }
+}
+
+fn model_ops_seeds(files: &mut Files) {
+    let mut rng = SplitMix64::new(0x4F50);
+    let cl = encode_carryless(&generate(Kind::Records, 510, 3000), 16, 2 << 20, false);
+    let z7 = encode_7z(&generate(Kind::Text, 511, 3000), 6, 1 << 16, false);
+    let mut put = |n: &str, op_list: &[[u8; 4]], pool: &[u8]| {
+        files.insert(seed_dir("model_ops").join(n), ops::seed(op_list, pool));
+    };
+    // Every kind once, over a valid carry-less stream.
+    let every: Vec<[u8; 4]> = (0..ops::OP_KINDS).map(|k| [k, 14, 1, 0x40]).collect();
+    put("every-op-carryless-pool", &every, &cl);
+    // Every kind with 7z-coder decodes, over a valid 7z stream.
+    let every7: Vec<[u8; 4]> = (0..ops::OP_KINDS).map(|k| [k, 4, 0, 0x41]).collect();
+    put("every-op-7z-pool", &every7, &z7);
+    // A solid run: init, decode, decode on, cleanup, decode, verify.
+    put(
+        "solid-cleanup-verify",
+        &[
+            [0, 14, 1, 0],
+            [3, 0, 0, 0xFE],
+            [3, 0, 2, 0xFE],
+            [2, 0, 0, 0],
+            [3, 7, 0, 0x80],
+            [5, 1, 0, 0],
+        ],
+        &cl,
+    );
+    // Errors without a model, refused parameters, then a reused arena.
+    put(
+        "refusals-and-reuse",
+        &[
+            [3, 0, 0, 0x10],
+            [4, 0, 0, 0x10],
+            [0, 0, 0, 0x80],
+            [0, 0, 1, 0x81],
+            [0, 4, 0, 0],
+            [5, 1, 0, 0],
+            [5, 1, 0, 0],
+            [1, 0, 0, 0],
+            [5, 3, 0, 0],
+        ],
+        &rng.bytes(1024),
+    );
+    // The bare model: starts, refusals, garbage, restart and verify.
+    put(
+        "bare-model-restarts",
+        &[
+            [6, 62, 0, 0],
+            [8, 0, 0, 0xFF],
+            [7, 0, 0, 0],
+            [7, 1, 1, 1],
+            [7, 2, 2, 2],
+            [9, 0, 0, 1],
+            [9, 3, 5, 0],
+            [6, 0, 9, 0],
+            [9, 2, 0, 0],
+        ],
+        &z7,
+    );
+    let storm: Vec<[u8; 4]> = (0..ops::MAX_OPS as u8)
+        .map(|i| [i % ops::OP_KINDS, i.wrapping_mul(37), i, i.wrapping_mul(11)])
+        .collect();
+    put("op-storm-garbage", &storm, &rng.bytes(2048));
+}
+
 /// One hostile fixture: a raw stream, its parameters and its payload.
 #[derive(Debug, Clone)]
 pub struct Fixture {
@@ -366,6 +498,9 @@ pub fn all() -> Files {
     decode_rar_seeds(&mut files);
     roundtrip_seeds(&mut files);
     structure_seeds(&mut files);
+    range_coder_seeds(&mut files);
+    checked_vs_unchecked_seeds(&mut files);
+    model_ops_seeds(&mut files);
     hostile_fixtures(&mut files);
     files
 }
