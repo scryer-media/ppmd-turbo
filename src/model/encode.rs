@@ -296,29 +296,29 @@ impl Model {
         let (esc_freq, see_index) = self.make_esc_freq2(context_head, suffix_ns, diff);
         let n = diff as usize;
 
-        // One branch-free pass over every state, as in the decoder: the
-        // unmasked frequency sum, the unmasked count, and the target's index
-        // and the unmasked sum before it. A consistent model has exactly
-        // `ns - num_masked` unmasked states; any other count falls back to
-        // collecting the first `n`, as the decoder does.
+        // One pass over every state, as in the decoder: the unmasked
+        // frequency sum and count without a branch per state, and the
+        // target's index and the unmasked sum before it. A consistent model
+        // has exactly `ns - num_masked` unmasked states; any other count
+        // falls back to collecting the first `n`, as the decoder does.
         let esc_count = self.esc_count;
         let alloc = &self.alloc;
         let char_mask = &self.char_mask;
         let mut hi_cnt = 0u32;
         let mut found = 0usize;
         let mut low = 0u32;
-        let mut before = u32::MAX;
         let mut target_index = usize::MAX;
         for state_index in 0..ns as usize {
             let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
             let unmasked = char_mask[head as u8 as usize] != esc_count;
             let freq = u32::from(head >> 8) & 0u32.wrapping_sub(u32::from(unmasked));
-            // Only the first unmasked match counts, as in the collecting
-            // loop below.
-            let hit = unmasked & (i32::from(head as u8) == target) & (before != 0);
-            before &= !0u32.wrapping_sub(u32::from(hit));
-            low += freq & before;
-            target_index = if hit { state_index } else { target_index };
+            // The target matches at most once in a consistent model, so this
+            // branch is taken once per walk; only the first unmasked match
+            // counts, as in the collecting loop below.
+            if unmasked && i32::from(head as u8) == target && target_index == usize::MAX {
+                target_index = state_index;
+                low = hi_cnt;
+            }
             hi_cnt += freq;
             found += usize::from(unmasked);
         }

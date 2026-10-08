@@ -466,6 +466,9 @@ applies to it beyond staying bit-exact.
   sum before it), with the collecting loop kept for an inconsistent model.
   1 MiB at order 6, cycles: binary 5244M to 4044M (ppmd-rust 2368M), mixed
   4721M to 3961M (2461M); text 64 KiB 381M to 344M (303M).
+  Recording the target behind a once-taken branch, instead of a
+  branch-free `before` mask that chained every state to the last, then
+  took binary to 3580M and mixed to 3527M (1.14x and 1.11x).
 
 ### E4. Share the model fast paths with decode
 
