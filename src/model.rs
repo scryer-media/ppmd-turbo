@@ -987,66 +987,33 @@ impl Model {
         let esc_count = self.esc_count;
         let alloc = &self.alloc;
         let char_mask = &self.char_mask;
-        let scratch = &mut self.unmasked_scratch[..n];
+        let scratch = &mut self.unmasked_scratch;
 
-        #[cfg(all(target_arch = "aarch64", not(miri)))]
-        {
-            let mut state_index = 0usize;
-            let mut scratch_index = 0usize;
-            while state_index + 8 <= ns as usize && scratch_index < n {
-                let heads = alloc.span_read_state_heads8(states_span, state_index * STATE_SIZE);
-                for (lane, head) in heads.into_iter().enumerate() {
-                    let sym = head as u8;
-                    if char_mask[sym as usize] != esc_count {
-                        hi_cnt += (head >> 8) as u32;
-                        scratch[scratch_index] = pack_unmasked_state(state_index + lane, head);
-                        scratch_index += 1;
-                        if scratch_index == n {
-                            break;
-                        }
-                    }
-                }
-                state_index += 8;
-            }
-            while scratch_index < n {
-                if state_index >= ns as usize {
-                    return false;
-                }
-                let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-                let sym = head as u8;
-                if char_mask[sym as usize] != esc_count {
-                    hi_cnt += (head >> 8) as u32;
-                    scratch[scratch_index] = pack_unmasked_state(state_index, head);
-                    scratch_index += 1;
-                }
-                state_index += 1;
-            }
+        // Branch-free gather: every state is written to the next scratch slot
+        // and the slot is kept only when the state is unmasked, so the walk
+        // has no data-dependent branch (whether a symbol is masked is close
+        // to a coin flip on escape-heavy input). `found <= state_index < 256`
+        // at every write, so the `& 0xff` never changes the index; it only
+        // lets the compiler drop the bounds check.
+        let mut found = 0usize;
+        for state_index in 0..ns as usize {
+            let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
+            let unmasked = char_mask[head as u8 as usize] != esc_count;
+            scratch[found & 0xff] = pack_unmasked_state(state_index, head);
+            hi_cnt += u32::from(head >> 8) & 0u32.wrapping_sub(u32::from(unmasked));
+            found += usize::from(unmasked);
         }
-
-        // Every target except NEON aarch64 walks the states one at a time. A
-        // pshufb gather feeding a scalar per-lane test measured as pure
-        // instruction bloat on x86-64 (more work per state than this loop),
-        // so x86-64 shares the plain scalar shape of the reference.
-        #[cfg(any(not(target_arch = "aarch64"), miri))]
-        {
-            let mut state_index = 0usize;
-            for slot in scratch.iter_mut() {
-                let head = loop {
-                    if state_index >= ns as usize {
-                        return false;
-                    }
-                    let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-                    let sym = head as u8;
-                    if char_mask[sym as usize] != esc_count {
-                        break head;
-                    }
-                    state_index += 1;
-                };
-
-                hi_cnt += (head >> 8) as u32;
-                *slot = pack_unmasked_state(state_index, head);
-                state_index += 1;
+        if found != n {
+            // A consistent model has exactly `ns - num_masked` unmasked
+            // states. A corrupt one keeps the reference's shape: too few is
+            // a failed decode, and with too many only the first `n` count.
+            if found < n {
+                return false;
             }
+            hi_cnt = scratch[..n]
+                .iter()
+                .map(|&packed| u32::from(unmasked_state_frequency(packed)))
+                .sum();
         }
         let scale = esc_freq + hi_cnt;
         let count = rc.get_threshold(scale);
