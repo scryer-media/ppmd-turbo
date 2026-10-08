@@ -197,7 +197,7 @@ fn collect_unmasked(
     n: usize,
     esc_count: u8,
 ) -> Option<u32> {
-    debug_assert!(ns <= 256 && n <= ns);
+    debug_assert!(ns <= 256);
     let mut found = 0usize;
     let mut hi_cnt = 0u32;
     for state_index in 0..ns {
