@@ -1331,12 +1331,16 @@ mod tests {
     /// total without a restart (the abort paths put the model back).
     #[test]
     fn noise_keeps_the_model_consistent_across_aborted_symbols() {
-        for seed in 1..=24u32 {
-            let data = noise(1 << 12, seed.wrapping_mul(0x9E37_79B9));
+        // Miri runs every order and arena size, over fewer seeds and symbols:
+        // the consistency check walks the whole model after each symbol, and
+        // the full grid ran past an hour under Miri.
+        let (seeds, symbols) = if cfg!(miri) { (2, 300) } else { (24, 3_000) };
+        for seed in 1..=seeds {
+            let data = noise(1 << 12, u32::wrapping_mul(seed, 0x9E37_79B9));
             for (order, mem) in [(2, 1 << 11), (6, 1 << 14), (16, 1 << 12), (64, 1 << 11)] {
                 let mut model = Model::new(order, mem).unwrap();
                 let mut rc = RarRangeDecoder::new(&data[..]).unwrap();
-                for _ in 0..3_000 {
+                for _ in 0..symbols {
                     let before = model.order_fall;
                     match model.decode_symbol(&mut rc) {
                         Ok(Some(_)) => {}
