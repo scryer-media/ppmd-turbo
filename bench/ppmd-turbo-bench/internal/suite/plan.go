@@ -67,9 +67,12 @@ type Scenario struct {
 	BytesOut int64 `json:"bytes_out"`
 	// CRC32 is the expected CRC-32 of a decode's output, or of the source
 	// an encode's output must decode back to.
-	CRC32    string `json:"crc32,omitempty"`
-	Note     string `json:"note,omitempty"`
-	Variants []Run  `json:"variants"`
+	CRC32 string `json:"crc32,omitempty"`
+	// ExpectedOut is an encode's expected output size, from a corpus
+	// archive of the same payload and order, for the projection only.
+	ExpectedOut int64  `json:"expected_out,omitempty"`
+	Note        string `json:"note,omitempty"`
+	Variants    []Run  `json:"variants"`
 }
 
 // Run is one variant's command for a scenario.
@@ -110,7 +113,7 @@ type EncodeSetting struct {
 const (
 	ProfileQuick = "quick" // the small corpus, one repeat: a smoke run
 	ProfileFull  = "full"  // the full corpus, 5 repeats, 1 warmup
-	ProfileFleet = "fleet" // the full corpus, 3 repeats, 1 warmup: one AWS host in about an hour
+	ProfileFleet = "fleet" // the full corpus less its non-text memory sweep, 3 repeats, 1 warmup: one AWS host in under an hour
 )
 
 // Profiles lists the run profiles in the order the help text gives them.
@@ -127,6 +130,10 @@ type RunProfile struct {
 	Encodes []EncodeSetting
 	// LargeRAR adds the RAR archives too large for a smoke run.
 	LargeRAR bool
+	// TextMemorySweep keeps the memory sweep (models above 16 MiB) for the
+	// text payload only: the other payloads' large-model rows cost the most
+	// and say the least.
+	TextMemorySweep bool
 }
 
 // ProfileByName returns a run profile.
@@ -138,7 +145,7 @@ func ProfileByName(name string) (RunProfile, error) {
 	case ProfileFull:
 		return RunProfile{Name: name, Corpus: "full", Repeats: 5, Warmups: 1, Encodes: full, LargeRAR: true}, nil
 	case ProfileFleet:
-		return RunProfile{Name: name, Corpus: "full", Repeats: 3, Warmups: 1, Encodes: full, LargeRAR: true}, nil
+		return RunProfile{Name: name, Corpus: "full", Repeats: 3, Warmups: 1, Encodes: full, LargeRAR: true, TextMemorySweep: true}, nil
 	}
 	return RunProfile{}, fmt.Errorf("unknown profile %q (want %s)", name, strings.Join(Profiles, ", "))
 }
@@ -154,13 +161,15 @@ func Processes(scenarios []Scenario, repeats, warmups int) int {
 
 // The projection's cost model. PPMd's time follows the coded bits, so a
 // decode or encode costs about its compressed size over a symbol-coding
-// rate, plus a pass over the plain bytes. The rates are ppmd-rust's and
-// 7zz's on an Apple M5 Max, where the two run within 10% of each other on
-// every quick row; X86Slowdown scales them to a fleet x86 host. A
+// rate, plus a pass over the plain bytes. The rates are the slowest
+// ppmd-rust and 7zz showed on the full corpus on an Apple M5 Max (random
+// and mixed payloads at order 16 over a 256 MiB model, text at order 32);
+// low orders and small models run up to ten times faster, so the model
+// overstates most rows. X86Slowdown scales it to a fleet x86 host. A
 // ppmd-turbo row is costed like ppmd-rust, which only overstates it.
 const (
-	codedBytesPerSecond = 4.5e6
-	plainBytesPerSecond = 200e6
+	codedBytesPerSecond = 1.6e6
+	plainBytesPerSecond = 100e6
 	processSeconds      = 0.01
 	// X86Slowdown is the single-thread gap assumed between the M5 Max and
 	// a fleet x86 host.
@@ -177,7 +186,10 @@ func Projected(scenarios []Scenario, repeats, warmups int) float64 {
 		coded := float64(scenario.BytesIn)
 		plain := float64(scenario.BytesOut)
 		if scenario.Op == OpEncode7z {
-			coded, plain = float64(scenario.BytesIn)*encodeRatio, float64(scenario.BytesIn)
+			coded, plain = float64(scenario.ExpectedOut), float64(scenario.BytesIn)
+			if scenario.ExpectedOut == 0 {
+				coded = float64(scenario.BytesIn) * encodeRatio
+			}
 		}
 		one := coded/codedBytesPerSecond + plain/plainBytesPerSecond + processSeconds
 		total += one * X86Slowdown * float64(len(scenario.Variants)*(repeats+warmups))
@@ -190,6 +202,9 @@ func Projected(scenarios []Scenario, repeats, warmups int) float64 {
 func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, profile RunProfile) ([]Scenario, error) {
 	p := planner{dir: dir, scratch: scratch, tools: tools}
 	for _, archive := range manifest.Archives {
+		if profile.TextMemorySweep && archive.Kind != "text" && archive.Mem > 16<<20 {
+			continue
+		}
 		p.decodeArchive(archive)
 	}
 	for _, raw := range manifest.Raw {
@@ -200,7 +215,7 @@ func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, profile
 	}
 	for _, source := range manifest.Sources {
 		for _, setting := range profile.Encodes {
-			p.encode(source, setting)
+			p.encode(source, setting, expectedSize(manifest, source.Name, setting.Order))
 		}
 	}
 	return p.scenarios, p.err
@@ -302,7 +317,19 @@ func (p *planner) decodeRAR(file fixtures.RARFile) {
 	})
 }
 
-func (p *planner) encode(source fixtures.Source, setting EncodeSetting) {
+// expectedSize is the packed size of the corpus's largest-memory archive of
+// payload at order, or 0.
+func expectedSize(manifest *fixtures.Manifest, payload string, order int) int64 {
+	var best fixtures.Archive
+	for _, archive := range manifest.Archives {
+		if archive.Payload == payload && archive.Order == order && archive.Mem >= best.Mem {
+			best = archive
+		}
+	}
+	return best.PackedLen
+}
+
+func (p *planner) encode(source fixtures.Source, setting EncodeSetting, expected int64) {
 	stem := strings.TrimSuffix(strings.TrimPrefix(source.Name, "fixture-"), ".bin")
 	label := fmt.Sprintf("%s.o%d.m%s", stem, setting.Order, MemLabel(setting.Mem))
 	slug := fmt.Sprintf("%d-%s", len(p.scenarios), label)
@@ -317,7 +344,7 @@ func (p *planner) encode(source fixtures.Source, setting EncodeSetting) {
 		Args: []string{"a", "-t7z", "-bso0", "-bsp0", "-y", "-mhc=off", "-mtm=off", "-mtc=off", "-mta=off", method, out, source.File}})
 	p.scenarios = append(p.scenarios, Scenario{
 		ID: "encode-7z/" + label, Group: "7z encode", Op: OpEncode7z, Fixture: source.Name, Kind: source.Kind,
-		Order: setting.Order, Mem: setting.Mem, BytesIn: source.Size, CRC32: source.CRC32,
+		Order: setting.Order, Mem: setting.Mem, BytesIn: source.Size, CRC32: source.CRC32, ExpectedOut: expected,
 		Note:     "ppmd-bench writes the raw stream, 7zz a one-file .7z around it (about 130 bytes of container); size ratio = 7zz / contender bytes",
 		Variants: variants,
 	})

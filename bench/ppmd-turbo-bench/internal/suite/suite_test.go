@@ -125,6 +125,30 @@ func TestNoProfileBenchmarksTheCarryLessEncoder(t *testing.T) {
 	}
 }
 
+func TestFleetDropsTheNonTextMemorySweep(t *testing.T) {
+	m := fakeManifest("full")
+	m.Archives = append(m.Archives,
+		fixtures.Archive{Name: "random.o6.m256m", Kind: "random", Order: 6, Mem: 256 << 20},
+		fixtures.Archive{Name: "text.o6.m256m", Kind: "text", Order: 6, Mem: 256 << 20})
+	tools := Tools{Driver: "ppmd-bench", SevenZip: "7zz", Turbo: map[string]bool{}}
+	ids := func(name string) map[string]bool {
+		profile, _ := ProfileByName(name)
+		scenarios, err := Plan(m, "/corpus", "/scratch", tools, profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]bool{}
+		for _, scenario := range scenarios {
+			out[scenario.ID] = true
+		}
+		return out
+	}
+	full, fleet := ids(ProfileFull), ids(ProfileFleet)
+	if !full["decode-7z/random.o6.m256m"] || fleet["decode-7z/random.o6.m256m"] || !fleet["decode-7z/text.o6.m256m"] || !fleet["decode-7z/random.o6.m16m"] {
+		t.Fatalf("full %v fleet %v", full, fleet)
+	}
+}
+
 func TestEncodeRowsWriteToScratch(t *testing.T) {
 	tools := Tools{Driver: "ppmd-bench", SevenZip: "7zz", Turbo: map[string]bool{OpEncode7z: true}}
 	for _, scenario := range plan(t, ProfileFull, tools) {
@@ -158,7 +182,7 @@ func TestProfilesAndCounts(t *testing.T) {
 	if got := Processes(scenarios, 3, 1); got != 20 {
 		t.Fatalf("Processes = %d, want 20", got)
 	}
-	one := []Scenario{{Op: OpDecode7z, BytesIn: 4_500_000, BytesOut: 200_000_000, Variants: make([]Run, 1)}}
+	one := []Scenario{{Op: OpDecode7z, BytesIn: codedBytesPerSecond, BytesOut: plainBytesPerSecond, Variants: make([]Run, 1)}}
 	if got, want := Projected(one, 1, 0), (1+1+processSeconds)*X86Slowdown; got < want-1e-9 || got > want+1e-9 {
 		t.Fatalf("Projected = %v, want %v", got, want)
 	}
