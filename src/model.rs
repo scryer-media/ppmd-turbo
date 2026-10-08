@@ -235,10 +235,6 @@ mod escape_neon {
     pub(super) struct Lookup {
         table: [uint8x16x4_t; 4],
         esc: uint8x16_t,
-        /// Unmasked frequency sum of each whole sixteen-state batch, from
-        /// the first pass, so the selection pass never redoes the lookups
-        /// for the batches it skips.
-        batch_sums: [u16; 16],
     }
 
     impl Lookup {
@@ -255,7 +251,6 @@ mod escape_neon {
                         vld1q_u8_x4(p.add(192)),
                     ],
                     esc: vdupq_n_u8(esc_count),
-                    batch_sums: [0; 16],
                 }
             }
         }
@@ -309,7 +304,7 @@ mod escape_neon {
     /// states (`ns >= MIN_STATES`).
     #[inline(always)]
     pub(super) fn unmasked_total(
-        lookup: &mut Lookup,
+        lookup: &Lookup,
         alloc: &SubAllocator,
         char_mask: &[u8; 256],
         states: ValidatedArenaSpan,
@@ -317,24 +312,23 @@ mod escape_neon {
         esc_count: u8,
     ) -> (u32, usize) {
         // SAFETY: as in `Lookup::masked`.
-        let mut masked_acc = unsafe { vdupq_n_u16(0) };
-        let mut hi_cnt = 0u32;
+        let mut freq_acc = unsafe { vdupq_n_u16(0) };
+        let mut masked_acc = freq_acc;
         let mut index = 0usize;
-        // Each u16 lane of `masked_acc` gathers two lanes of 0/1 per batch,
-        // at most 16 batches: no overflow.
+        // Each u16 lane gathers two u8 lanes per batch, at most 16 batches of
+        // 255: no overflow.
         while index + 16 <= ns {
             let (freqs, masked) = lookup.batch16(alloc, states, index);
             // SAFETY: as in `Lookup::masked`.
-            let sum = unsafe {
+            unsafe {
+                freq_acc = vpadalq_u8(freq_acc, freqs);
                 masked_acc = vpadalq_u8(masked_acc, vshrq_n_u8::<7>(masked));
-                vaddlvq_u8(freqs)
-            };
-            lookup.batch_sums[(index / 16) & 15] = sum;
-            hi_cnt += u32::from(sum);
+            }
             index += 16;
         }
         // SAFETY: as in `Lookup::masked`.
-        let masked = unsafe { vaddvq_u16(masked_acc) };
+        let (mut hi_cnt, masked) =
+            unsafe { (u32::from(vaddvq_u16(freq_acc)), vaddvq_u16(masked_acc)) };
         let mut unmasked = index - usize::from(masked);
         while index < ns {
             let head = alloc.span_read_u16(states, index * STATE_SIZE);
@@ -362,7 +356,9 @@ mod escape_neon {
         let mut cum = 0u32;
         let mut index = 0usize;
         while index + 16 <= ns {
-            let batch = u32::from(lookup.batch_sums[(index / 16) & 15]);
+            let (freqs, _) = lookup.batch16(alloc, states, index);
+            // SAFETY: as in `Lookup::masked`.
+            let batch = u32::from(unsafe { vaddlvq_u8(freqs) });
             if cum + batch > count {
                 break;
             }
@@ -1234,9 +1230,9 @@ impl Model {
         #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
         let vector = (ns as usize >= escape_neon::MIN_STATES)
             .then(|| escape_neon::Lookup::new(&self.char_mask, esc_count))
-            .and_then(|mut lookup| {
+            .and_then(|lookup| {
                 let (hi_cnt, unmasked) = escape_neon::unmasked_total(
-                    &mut lookup,
+                    &lookup,
                     &self.alloc,
                     &self.char_mask,
                     states_span,
@@ -2591,16 +2587,9 @@ mod tests {
 
                 #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
                 if ns >= escape_neon::MIN_STATES {
-                    let mut lookup = escape_neon::Lookup::new(&mask, esc);
+                    let lookup = escape_neon::Lookup::new(&mask, esc);
                     assert_eq!(
-                        escape_neon::unmasked_total(
-                            &mut lookup,
-                            &model.alloc,
-                            &mask,
-                            span,
-                            ns,
-                            esc
-                        ),
+                        escape_neon::unmasked_total(&lookup, &model.alloc, &mask, span, ns, esc),
                         (want, n)
                     );
                     let mut cum = 0u32;
