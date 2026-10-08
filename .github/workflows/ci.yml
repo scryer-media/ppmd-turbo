@@ -188,7 +188,7 @@ jobs:
         # model and the coders, plus the two small coder suites. The corpus,
         # conformance and hostile suites decode whole streams and ran past
         # the two-hour job limit under Miri; the native lanes run them.
-        run: cargo "+" miri nextest run --locked --all-features -j "$(nproc)" -E 'kind(lib) | binary(coder_differential) | binary(encode_carryless)'
+        run: cargo "+$NIGHTLY_TOOLCHAIN" miri nextest run --locked --all-features -j "$(nproc)" -E 'kind(lib) | binary(coder_differential) | binary(encode_carryless)'
 
   # The fuzz harness library, including the seed generator's own checks
   # (the fixtures job checks the generated seeds against their digests).
