@@ -294,7 +294,10 @@ impl Arena {
     }
 
     /// A read pointer to `len` bytes at `off`, for the vector passes.
-    #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
+    #[cfg(any(
+        all(target_arch = "aarch64", target_endian = "little", not(miri)),
+        all(target_arch = "x86_64", not(miri))
+    ))]
     #[inline(always)]
     pub(crate) fn ptr(&self, off: usize, len: usize) -> *const u8 {
         debug_assert!(off + len <= self.len);

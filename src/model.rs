@@ -149,6 +149,9 @@ pub struct Model {
     init_rl: i32,
     see: SeeTable,
     bin_summ: [[u16; 64]; 128],
+    /// The widest escape pass this CPU runs.
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    tier: simd::x86::Tier,
     /// Model restarts so far, including the ones a full arena forces.
     #[cfg(test)]
     restarts: u32,
@@ -186,6 +189,8 @@ impl Model {
             init_rl: 0,
             see: SeeTable::new(),
             bin_summ: [[0; 64]; 128],
+            #[cfg(all(target_arch = "x86_64", not(miri)))]
+            tier: simd::x86::Tier::detect(),
             #[cfg(test)]
             restarts: 0,
         };
@@ -922,7 +927,23 @@ impl Model {
             }
             sum
         }
-        #[cfg(not(all(target_arch = "aarch64", target_endian = "little", not(miri))))]
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        {
+            let p = self.a.ptr(from, to - from);
+            // SAFETY: `p[0..to - from]` is the state array's tail from
+            // `from`; the tier was detected on this CPU.
+            match self.tier {
+                simd::x86::Tier::Avx2 => unsafe { simd::x86::sum_avx2(p, to - from, char_mask) },
+                simd::x86::Tier::Ssse3 => unsafe { simd::x86::sum_ssse3(p, to - from, char_mask) },
+                simd::x86::Tier::Scalar => {
+                    self.masked_sum(char_mask, from, ((to - from) / SS) as u32)
+                }
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little", not(miri)),
+            all(target_arch = "x86_64", not(miri))
+        )))]
         {
             let mut sum = 0;
             let mut s = from;
@@ -954,7 +975,24 @@ impl Model {
             }
             s
         }
-        #[cfg(not(all(target_arch = "aarch64", target_endian = "little", not(miri))))]
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        {
+            let p = self.a.ptr(from, to - from);
+            // SAFETY: as in `masked_sum_wide`.
+            from + match self.tier {
+                simd::x86::Tier::Avx2 => unsafe {
+                    simd::x86::skip_avx2(p, to - from, char_mask, count)
+                },
+                simd::x86::Tier::Ssse3 => unsafe {
+                    simd::x86::skip_ssse3(p, to - from, char_mask, count)
+                },
+                simd::x86::Tier::Scalar => 0,
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little", not(miri)),
+            all(target_arch = "x86_64", not(miri))
+        )))]
         {
             let _ = (char_mask, to, count);
             from
@@ -1083,7 +1121,12 @@ impl Model {
             let end = stats + ns as usize * SS;
             #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
             let wide = ns >= simd::neon::MIN_STATES;
-            #[cfg(not(all(target_arch = "aarch64", target_endian = "little", not(miri))))]
+            #[cfg(all(target_arch = "x86_64", not(miri)))]
+            let wide = ns >= simd::x86::MIN_STATES && self.tier != simd::x86::Tier::Scalar;
+            #[cfg(not(any(
+                all(target_arch = "aarch64", target_endian = "little", not(miri)),
+                all(target_arch = "x86_64", not(miri))
+            )))]
             let wide = false;
             let hi_cnt = if wide {
                 self.masked_sum_wide(&char_mask, stats, end)
