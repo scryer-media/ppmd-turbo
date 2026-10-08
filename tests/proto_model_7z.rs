@@ -52,3 +52,67 @@ fn model_decodes_every_7z_stream_to_its_payload() {
     }
     report(&failures, streams.len());
 }
+
+/// The RAR side of the gate, through the crate's own `rar::RarDecoder` (the
+/// conformance suite's shim is still a placeholder): every raw carry-less
+/// stream decodes to its payload, and the RARLAB member to its symbols and,
+/// through the RAR3 escape layer, its bytes.
+#[test]
+#[cfg_attr(miri, ignore = "reads fixture files")]
+fn rar_decoder_decodes_every_carry_less_stream_and_member() {
+    use ppmd_turbo::rar::RarDecoder;
+    let manifest = common::manifest();
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for s in list(&manifest, "streams")
+        .iter()
+        .filter(|s| s["coder"] == "carry-less")
+    {
+        checked += 1;
+        let name = s["name"].as_str().unwrap();
+        let mut out = Vec::new();
+        let result = RarDecoder::new().decode_block(
+            true,
+            u64_of(s, "order") as u32,
+            (u64_of(s, "mem") >> 20) as u32,
+            &read(s),
+            u64_of(s, "payload_len"),
+            &mut out,
+        );
+        match result {
+            Ok(_) if sha256(&out) == payload_sha256(&manifest, s) => {}
+            Ok(_) => failures.push(format!("{name}: output differs")),
+            Err(e) => failures.push(format!("{name}: {e}")),
+        }
+    }
+    for m in list(&manifest, "rar_members") {
+        checked += 1;
+        let name = m["name"].as_str().unwrap();
+        let packed = read(m);
+        let h = &m["header"];
+        let mut symbols = Vec::new();
+        let result = RarDecoder::new().decode_block(
+            h["reset"] == true,
+            u64_of(h, "order") as u32,
+            u64_of(h, "mem_mb") as u32,
+            &packed[u64_of(h, "len") as usize..],
+            u64_of(m, "symbols"),
+            &mut symbols,
+        );
+        if let Err(e) = result {
+            failures.push(format!("{name}: {e}"));
+            continue;
+        }
+        if sha256(&symbols) != m["symbols_sha256"] {
+            failures.push(format!("{name}: symbols differ"));
+            continue;
+        }
+        let esc = h["esc"].as_u64().map_or(2, |e| e as u8);
+        match common::rar3_unescape(&symbols, esc, u64_of(m, "unpacked_len") as usize) {
+            Ok(bytes) if sha256(&bytes) == m["payload_sha256"] => {}
+            Ok(_) => failures.push(format!("{name}: member bytes differ")),
+            Err(e) => failures.push(format!("{name}: {e}")),
+        }
+    }
+    report(&failures, checked);
+}
