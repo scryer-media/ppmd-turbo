@@ -2,109 +2,95 @@
 //!
 //! Variant H's SEE contexts are adaptive estimators of the escape frequency
 //! in a masked (non-binary) context, indexed by the context's shape. The
-//! design is part of Dmitry Shkarin's PPMd variant H; the table schedule and
-//! update rule follow 7-Zip's `Ppmd7.c` (Igor Pavlov), `CPpmd_See`.
+//! design is part of Dmitry Shkarin's PPMd variant H; this is a translation of
+//! ppmd-rust 1.5.0's `See` (CC0-1.0 / MIT-0), itself a translation of
+//! `CPpmd_See` in Igor Pavlov's `C/Ppmd7.c` (7-Zip, public domain).
 
-/// Period bits for SEE scaling.
+/// `PPMD_PERIOD_BITS`.
 const PERIOD_BITS: u8 = 7;
 
-/// A single SEE context that tracks escape probability.
-#[derive(Clone, Copy)]
-pub(crate) struct SeeContext {
-    /// Scaled sum of escape frequencies.
+/// The table's 25 x 16 contexts, flattened, plus the dummy context the
+/// 256-symbol context uses.
+pub(crate) const SEE_CELLS: usize = 25 * 16 + 1;
+
+/// Index of `DummySee`.
+pub(crate) const DUMMY: usize = 25 * 16;
+
+/// One SEE context (`CPpmd_See`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct See {
+    /// Scaled sum of escape frequencies. It wraps at 16 bits as the
+    /// reference's does: only its low 16 bits are ever used.
     pub(crate) summ: u16,
-    /// Right-shift count for extracting the mean estimate.
+    /// Right shift that turns `summ` into the mean.
     pub(crate) shift: u8,
-    /// Count of updates before adaptation.
+    /// Updates left before the next adaptation step.
     pub(crate) count: u8,
 }
 
-impl SeeContext {
-    /// Create a new SEE context with initial value.
-    pub(crate) fn init(init_val: u16) -> Self {
-        let shift = PERIOD_BITS - 4;
-        Self {
-            summ: init_val << shift,
-            shift,
-            count: 4,
-        }
-    }
-
-    /// Create a zeroed SEE context (for the dummy context).
-    pub(crate) fn dummy() -> Self {
-        Self {
-            summ: 0,
-            shift: PERIOD_BITS,
-            count: 0,
-        }
-    }
-
-    /// Get the current escape frequency estimate.
-    ///
-    /// Returns the mean AND subtracts it from summ.
-    /// Minimum return value is 1 to avoid zero-frequency issues.
-    #[inline]
-    pub(crate) fn get_mean(&mut self) -> u32 {
-        // RetVal = Summ >> Shift; Summ -= RetVal; return RetVal + (RetVal == 0);
-        let ret = (self.summ >> self.shift) as i16;
-        self.summ = self.summ.wrapping_sub(ret as u16);
-        let ret = ret as u32;
-        if ret == 0 { 1 } else { ret }
-    }
-
-    /// Update after a successful symbol decode.
-    #[inline]
+impl See {
+    /// `Ppmd_See_UPDATE`: after a symbol found through this context.
+    #[inline(always)]
     pub(crate) fn update(&mut self) {
         if self.shift < PERIOD_BITS {
             self.count = self.count.wrapping_sub(1);
             if self.count == 0 {
-                self.summ = self.summ.wrapping_add(self.summ);
-                self.count = 3 << self.shift;
+                self.summ = self.summ.wrapping_shl(1);
+                self.count = (3u32 << self.shift) as u8;
                 self.shift += 1;
             }
         }
     }
-}
 
-/// The SEE table: 25 x 16 contexts indexed by model state.
-pub(crate) struct SeeTable {
-    pub(crate) contexts: [[SeeContext; 16]; 25],
-    pub(crate) dummy: SeeContext,
-}
-
-impl Default for SeeTable {
-    fn default() -> Self {
-        Self::new()
+    /// The escape frequency `MakeEscFreq` takes from this context:
+    /// `r = summ >> shift; summ -= r; r + (r == 0)`.
+    #[inline(always)]
+    pub(crate) fn take_mean(&mut self) -> u32 {
+        let r = self.summ >> self.shift;
+        self.summ -= r;
+        u32::from(r) + u32::from(r == 0)
     }
+}
+
+/// The SEE table with its dummy context.
+pub(crate) struct SeeTable {
+    pub(crate) cells: [See; SEE_CELLS],
 }
 
 impl SeeTable {
-    /// Initialize the SEE table: row `i` starts at `5 * i + 10`, as in 7-Zip's
-    /// `RestartModel`.
+    /// A table as `RestartModel` leaves it.
     pub(crate) fn new() -> Self {
-        let mut contexts = [[SeeContext::init(0); 16]; 25];
-        for (i, row) in contexts.iter_mut().enumerate() {
-            for ctx in row.iter_mut() {
-                *ctx = SeeContext::init((5 * i + 10) as u16);
+        let mut table = Self {
+            cells: [See::default(); SEE_CELLS],
+        };
+        table.reset();
+        table
+    }
+
+    /// `RestartModel`'s SEE part: row `i` starts at `(5 * i + 10) << 3`
+    /// with shift 3 and count 4; the dummy at summ 0, shift 7, count 64.
+    pub(crate) fn reset(&mut self) {
+        for i in 0..25 {
+            let summ = ((5 * i + 10) << (PERIOD_BITS - 4)) as u16;
+            for k in 0..16 {
+                self.cells[i * 16 + k] = See {
+                    summ,
+                    shift: PERIOD_BITS - 4,
+                    count: 4,
+                };
             }
         }
-        Self {
-            contexts,
-            dummy: SeeContext::dummy(),
-        }
+        self.cells[DUMMY] = See {
+            summ: 0,
+            shift: PERIOD_BITS,
+            count: 64,
+        };
     }
 
-    /// Look up a SEE context by index.
-    ///
-    /// `idx0` is NS2Indx[Diff-1] (0..24).
-    /// `idx1` is the combined index from context properties (0..15).
-    pub(crate) fn get(&mut self, idx0: usize, idx1: usize) -> &mut SeeContext {
-        &mut self.contexts[idx0][idx1]
-    }
-
-    /// Get the dummy context (for the 256-symbol order-0 context).
-    pub(crate) fn get_dummy(&mut self) -> &mut SeeContext {
-        &mut self.dummy
+    /// The context at `index` (`row * 16 + column`, or [`DUMMY`]).
+    #[inline(always)]
+    pub(crate) fn get(&mut self, index: usize) -> &mut See {
+        &mut self.cells[index]
     }
 }
 
@@ -113,52 +99,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_see_context_init() {
-        let ctx = SeeContext::init(20);
-        // shift = PERIOD_BITS - 4 = 3
-        // summ = 20 << 3 = 160
-        assert_eq!(ctx.summ, 160);
-        assert_eq!(ctx.shift, 3);
-        assert_eq!(ctx.count, 4);
+    fn reset_matches_restart_model() {
+        let table = SeeTable::new();
+        assert_eq!(table.cells[0].summ, 80);
+        assert_eq!(table.cells[24 * 16 + 15].summ, 1040);
+        assert_eq!((table.cells[0].shift, table.cells[0].count), (3, 4));
+        assert_eq!(
+            table.cells[DUMMY],
+            See {
+                summ: 0,
+                shift: 7,
+                count: 64
+            }
+        );
     }
 
     #[test]
-    fn test_see_get_mean() {
-        let mut ctx = SeeContext::init(20);
-        // summ=160, shift=3 → mean = 160 >> 3 = 20, summ = 160 - 20 = 140
-        let mean = ctx.get_mean();
-        assert_eq!(mean, 20);
-        assert_eq!(ctx.summ, 140);
-    }
-
-    #[test]
-    fn test_see_get_mean_min_one() {
-        let mut ctx = SeeContext {
-            summ: 0,
+    fn take_mean_subtracts_and_never_returns_zero() {
+        let mut see = See {
+            summ: 160,
             shift: 3,
             count: 4,
         };
-        assert_eq!(ctx.get_mean(), 1);
+        assert_eq!(see.take_mean(), 20);
+        assert_eq!(see.summ, 140);
+        see.summ = 0;
+        assert_eq!(see.take_mean(), 1);
+        assert_eq!(see.summ, 0);
     }
 
     #[test]
-    fn test_see_table_init() {
-        let table = SeeTable::new();
-        // contexts[0] should have init(10): summ = 10 << 3 = 80
-        assert_eq!(table.contexts[0][0].summ, 80);
-        // contexts[24] should have init(130): summ = 130 << 3 = 1040
-        assert_eq!(table.contexts[24][0].summ, 1040);
-    }
-
-    #[test]
-    fn test_see_update() {
-        let mut ctx = SeeContext::init(20);
-        // shift=3, count=4
-        ctx.update(); // count=3
-        ctx.update(); // count=2
-        ctx.update(); // count=1
-        ctx.update(); // count=0 → summ doubles, count = 3 << 3 = 24 (pre-increment), shift becomes 4
-        assert_eq!(ctx.shift, 4);
-        assert_eq!(ctx.count, 24);
+    fn update_doubles_after_count_and_stops_at_period_bits() {
+        let mut see = See {
+            summ: 160,
+            shift: 3,
+            count: 4,
+        };
+        for _ in 0..4 {
+            see.update();
+        }
+        assert_eq!((see.summ, see.shift, see.count), (320, 4, 24));
+        let mut top = See {
+            summ: 0x9000,
+            shift: 7,
+            count: 1,
+        };
+        top.update();
+        assert_eq!((top.summ, top.shift, top.count), (0x9000, 7, 1));
+        // The doubling keeps only the low 16 bits.
+        let mut wrap = See {
+            summ: 0x9000,
+            shift: 6,
+            count: 1,
+        };
+        wrap.update();
+        assert_eq!((wrap.summ, wrap.shift, wrap.count), (0x2000, 7, 192));
     }
 }

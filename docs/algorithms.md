@@ -21,6 +21,16 @@ component gives line references into those sources:
   These are consulted for behaviour only; nothing in them is copied;
 - the ppmd-rust 1.5.0 crate.
 
+**Provenance of the implementation.** ppmd-turbo's model, sub-allocator and
+SEE (`src/model.rs`, `src/model/encode.rs`, `src/alloc.rs`, `src/see.rs`) are
+a direct, bit-exact translation of ppmd-rust 1.5.0's `internal/ppmd7` (the
+ppmd-rust authors, CC0-1.0 OR MIT-0), which is itself a port of 7-Zip's
+`C/Ppmd7.c`, `C/Ppmd7Dec.c` and `C/Ppmd7Enc.c` (Igor Pavlov, public domain).
+They are not seeded from unrar-rs: an earlier model was, and it was replaced
+by this translation. The range coders' arithmetic is 7-Zip's (section 4).
+Where this document describes unrar's choices, they are behaviour that the
+translation reproduces through 7-Zip's code, not code it contains.
+
 The section [Attribution index](#attribution-index) names the authors of the
 algorithms that conventionally carry their author's name.
 
@@ -210,6 +220,7 @@ It does the following:
      coded symbol that went through an escape. On wrap to 0 the array is
      cleared (ClearMask). This saves a 256-byte fill per escape. Both schemes
      select the same set.
+   - **In ppmd-turbo** the mask is 7-Zip's local byte array.
 
 ### 1.5 Rescale (`Ppmd7.c:808-927`; unrar `model.cpp:119-168`)
 
@@ -296,8 +307,11 @@ the NextContext fast path.
 4. If allocation fails, return NULL, and the caller restarts.
 
 unrar adds an explicit depth guard (the CVE-2017-17969 fix): `if (pps >= ps + MAX_O) return NULL`.
-7-Zip bounds the loop by its array size. ppmd-turbo must bound the walk as well;
-under the invariant the bound is never hit, but it costs one compare.
+7-Zip bounds the loop by its array size. ppmd-turbo bounds the walk as well
+(a 64-entry array, `PPMD7_MAX_ORDER`), and bounds every symbol search in
+CreateSuccessors and UpdateModel by NumStats, where the reference searches
+without a bound. Under the invariants of section 1.9 no bound is ever hit; if
+one were, the model restarts instead of reading past the array.
 
 ### 1.8 Order and memory parameters
 
@@ -314,6 +328,73 @@ ranges and return `InvalidParameters` for anything else;
 `RarDecoder::init_model` takes the order and the size in MiB and rejects
 orders outside 2..64 and sizes outside 1..256 MiB. The unrar-rs seed clamped
 out-of-range values instead of rejecting them.
+
+
+### 1.9 Model consistency
+
+The model's only input is the coder's choice among the outcomes the model
+offers: which state of a context, or escape. Whatever bytes the stream holds,
+the model therefore evolves only through its own update rules, and every
+corrupt stream is, to the model, some sequence of legitimate choices. Those
+rules keep four invariants:
+
+- **(I1)** the symbols of a context's states are distinct;
+- **(I2)** the symbols of a context are a subset of its suffix's;
+- **(I3)** the order-0 context holds all 256 symbols;
+- **(I4)** between symbols, `MinContext == MaxContext`, and throughout,
+  `order(MinContext) + OrderFall == MaxOrder`, where a context's order is its
+  depth in the suffix chain.
+
+(I4) holds at RestartModel (the order-0 context, `OrderFall = MaxOrder`); each
+escape step moves to the suffix and raises OrderFall; UpdateModel either moves
+to the (order + 1) successor and lowers OrderFall, stays at the order-0
+context (the null-successor case), or at `OrderFall == 0` stays at MaxOrder,
+as NextContext's fast path does.
+
+Rescale is the only rule that removes symbols. It removes zero-frequency
+states only when `OrderFall == 0`, which by (I4) means MinContext is a
+MaxOrder context. No context has a MaxOrder child, so removing symbols there
+keeps (I2) for every child, and the context itself only shrinks. It never
+runs at the order-0 context with `OrderFall == 0` (MaxOrder is at least 2), so
+(I3) holds.
+
+UpdateModel adds the found symbol to every context from MaxContext down to,
+but not including, MinContext. The coder escaped out of each of them, so each
+of their symbols was masked before the escape chain reached MinContext, and
+the symbol was found in MinContext among its unmasked states: none of those
+contexts holds it, which keeps (I1). Each of them gains it, and so does
+MinContext, so (I2) holds along the chain. CreateSuccessors' new contexts hold
+one symbol that their suffix holds.
+
+Consequences that the implementation relies on:
+
+- In every context the escape loop stops at, the unmasked count is
+  `NumStats - numMasked`, at least 1. Summing every state with `Freq & mask`
+  (7-Zip, ppmd-rust and ppmd-turbo) and taking the first `NumStats -
+  numMasked` unmasked states (unrar) select the same states, so the
+  "inconsistent model" case unrar guards against cannot occur, for any input.
+- `Suffix.NumStats - NumStats` in MakeEscFreq never wraps (7-Zip's unsigned
+  and unrar's signed arithmetic agree), and `NS2Indx[nonMasked - 1]` is in
+  range.
+- The decoder's search for the count found below `hiCnt` ends inside the
+  state array, and every symbol search in CreateSuccessors and UpdateModel
+  finds its symbol.
+- Every record offset the model follows is one the allocator returned (inside
+  the unit area), a text position below UnitsStart, or null.
+
+**Abandoned symbols.** Three things end a symbol part way: a count at or past
+the total (SYM_ERROR), the end marker (an escape out of the order-0 context),
+and a coder fault on a range scaled to zero (the coder's arithmetic stays
+defined, so the model either takes a legitimate choice or reaches one of the
+first two, and the symbol is reported corrupt). After an escape, MinContext is below
+MaxContext and OrderFall has been raised; carrying on from there would break
+(I4) and could add a symbol twice. 7-Zip never continues past such a symbol.
+ppmd-turbo's callers may (RAR's decoder does after a corrupt block), so every
+abandon path puts `MinContext = MaxContext` and OrderFall back to their values
+at the start of the symbol. No valid stream codes a symbol after one of these,
+so output is unchanged; the unit test
+`noise_keeps_the_model_consistent_across_aborted_symbols` checks (I1) to (I4)
+after every symbol of arbitrary input, carrying on through abandoned symbols.
 
 ---
 
@@ -338,11 +419,13 @@ and 7-Zip reuses coders across 7z folders, so the arena is reused.
     accounting keeps the model decisions (when to restart, when the text area
     is full) identical to 7-Zip's. ppmd-turbo uses 12-byte units, so it needs
     no fake accounting.
-- **In ppmd-turbo** the arena is allocated once, at unrar's length (the
-  request rounded down to whole units, plus one leading and two trailing
-  units), and never grows. A restart with the same size reuses it, as
-  `StartSubAllocator` does. Every pointer read from the arena is checked
-  against it before use (`alloc.rs`, validated spans).
+- **In ppmd-turbo** the arena is 7-Zip's: `AlignOffset + Size` bytes with
+  `AlignOffset = (4 - Size) & 3`, the text area from `AlignOffset`, and the
+  order-0 context in the last unit. It is allocated once and never grows; a
+  restart with the same size reuses it, as `Ppmd7_Alloc` does. Records are
+  addressed by 32-bit offsets from the arena base and read without bounds
+  checks in release builds, on the strength of the invariants in section
+  1.9; debug builds, Miri and the fuzz targets check every access.
 
 ### 2.2 Free lists
 
@@ -421,10 +504,9 @@ runs out and when RestartModel fires.
 - unrar uses a doubly-linked list.
 - Both produce the same final list order on any input. That has to be
   preserved, not re-derived.
-- **In ppmd-turbo** gluing is intrusive (the free blocks themselves hold the
-  links), as in the unrar-rs seed. The test
-  `intrusive_glue_matches_reference_order_for_every_size_class` checks the
-  list order after gluing against a reference glue for every size class.
+- **In ppmd-turbo** gluing is 7-Zip's singly-linked, single-direction walk,
+  translated from ppmd-rust, so the list order is the reference's by
+  construction.
 
 ---
 
@@ -687,8 +769,10 @@ corrupt.
 
 **In ppmd-turbo** `RarDecoder::decode_symbol` returns `Ok(None)` for the -1
 and `RarDecoder::cleanup` performs CleanUp, so a caller can reproduce
-unrar's recovery output exactly; the unrar-rs RAR3 unpacker does. Coder or
-model faults (section 4.2, pointer checks) are `Err(CorruptStream)` instead.
+unrar's recovery output exactly; the unrar-rs RAR3 unpacker does. Coder
+faults (section 4.2) are `Err(CorruptStream)` instead. The model does not
+check its own pointers, as unrar does: section 1.9 shows they cannot go
+wrong, whatever the input.
 
 **Solid archives.** The model and coder continue across file boundaries,
 mid-block. ppmd-turbo's `RarDecoder` holds the model across blocks and
@@ -777,5 +861,6 @@ General-purpose implementation techniques are not attributed.
 | PPMd variant H (PPMII: information inheritance, binary-context SEE, the sub-allocator design) | Dmitry Shkarin. "PPM: one step to practicality", Proc. Data Compression Conference 2002, pp. 202-211 | Variant H source released into the public domain (as recorded in the 7-Zip and unrar file headers) | The model (sections 1-3) |
 | Carry-less range coder (1999) | Dmitry Subbotin | Public domain | RAR and 7a coder (section 4.2) |
 | SEE, secondary escape estimation, from PPMZ | Charles Bloom: https://www.cbloom.com/papers/ppmz.pdf; retrospective at http://cbloomrants.blogspot.com/2018/05/secondary-estimation-from-ppmz-see-to.html | Published papers | Origin of the escape-estimation scheme (section 3) |
-| 7-Zip `Ppmd7` implementation, the 7z range-coder pairing (`Ppmd7z`), and 7z method framing | Igor Pavlov | `C/Ppmd*.{h,c}` public domain | Implementation reference for the model, sub-allocator, 7z coder and 7z framing |
+| 7-Zip `Ppmd7` implementation, the 7z range-coder pairing (`Ppmd7z`), and 7z method framing | Igor Pavlov | `C/Ppmd*.{h,c}` public domain | Implementation reference for the model, sub-allocator, 7z coder and 7z framing; the translated model's origin |
+| ppmd-rust 1.5.0 (`internal/ppmd7`), the Rust port of 7-Zip's `Ppmd7` | The ppmd-rust authors (github.com/hasenbanck/ppmd-rust) | CC0-1.0 OR MIT-0 | The model, sub-allocator and SEE are translated from it (sections 1-3) |
 | RAR 2.9-4.x PPM integration (block framing, EscChar protocol) | Eugene Roshal (format); RARLAB unrar source, copyright Alexander Roshal | unRAR licence: extraction use only; using the source to build a RAR-compatible compressor is forbidden | Behavioural reference only for the RAR path; no code copied |

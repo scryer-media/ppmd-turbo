@@ -1,52 +1,36 @@
 //! Encoding through the variant H model.
 //!
-//! The mirror of the decode path in `model.rs`, derived from Igor Pavlov's
-//! `Ppmd7z_EncodeSymbol` (`C/Ppmd7Enc.c`, public domain) and Dmitry
-//! Shkarin's PPMd variant H encoder (public domain). Nothing here derives
-//! from unrar, which has no encoder.
-//!
-//! The encoder drives the model through exactly the update code the decoder
-//! uses (`update1_0`, `update1`, `update2`, the binary-context updates,
-//! SEE, `rescale` and `next_context`/`UpdateModel`), so a stream encoded
-//! here leaves the model in the state the decoder reaches reading it back.
-//! Only the search differs: the decoder looks for the cumulative count the
-//! coder hands it, the encoder for the symbol it was given. With the 7z
-//! coder the output is byte-identical to 7-Zip's.
+//! A translation of ppmd-rust 1.5.0's `internal/ppmd7/encoder.rs`
+//! (CC0-1.0 / MIT-0), itself a translation of Igor Pavlov's
+//! `Ppmd7z_EncodeSymbol` (`C/Ppmd7Enc.c`, 7-Zip, public domain). The encoder
+//! drives the model through exactly the update code the decoder uses, so a
+//! stream encoded here leaves the model in the state the decoder reaches
+//! reading it back; with the 7z coder the output is byte-identical to
+//! 7-Zip's. The reference divides the range in the model and then calls
+//! `RC_Encode(start, size)`; [`RangeEncoder::encode`] takes the total and
+//! does both.
 
-use super::{
-    Model, STATE_SIZE, ValidatedArenaSpan, pack_unmasked_state, unmasked_state_frequency,
-    unmasked_state_index, unmasked_state_symbol,
-};
+use super::{CTX_ONE_STATE, EXP_ESCAPE, INT_BITS, Model, STATE_SIZE, hi_bits_flag3, update_prob_1};
 use crate::error::Result;
-use crate::rc::RangeEncoder;
-
-/// The symbol value the end marker is coded as (`PPMD7_SYM_END`): it
-/// matches no state, so it escapes out of every context including order 0.
-const END_MARKER: i32 = crate::SYM_END;
+use crate::rc::{RangeEncoder, corrupt};
 
 impl Model {
     /// Encodes one symbol: `Some(byte)` for a byte, `None` for the end
     /// marker (an escape out of the order-0 context).
     ///
     /// The model must be fresh from [`Model::new`], [`Model::start`] or
-    /// [`Model::restart`], or have encoded only bytes since: after the end
-    /// marker it has to be restarted before it codes again. The coder
-    /// normalizes on every call, as [`RangeEncoder`] requires.
+    /// [`Model::restart`], or have encoded only bytes since, for the stream
+    /// to decode. The coder normalizes on every call, as [`RangeEncoder`]
+    /// requires.
     ///
     /// Errors: [`Error::CorruptStream`](crate::Error::CorruptStream) if the
-    /// coder met a range scaled to zero or the model is inconsistent (for
-    /// example a byte after the end marker). Neither happens to a model
-    /// driven only through this method.
+    /// coder met a range scaled to zero, which a model driven only through
+    /// this method never produces.
     #[inline(always)]
     pub fn encode_symbol<E: RangeEncoder>(&mut self, rc: &mut E, sym: Option<u8>) -> Result<()> {
-        let target = sym.map_or(END_MARKER, i32::from);
-        let coded = self.encode_char(rc, target);
+        self.encode_char(rc, sym.map_or(crate::SYM_END, i32::from));
         if rc.faulted() {
-            self.model_fault = false;
-            return Self::corrupt_model("frequency total exceeds the encoder's range");
-        }
-        if core::mem::take(&mut self.model_fault) || coded != target {
-            return Self::corrupt_model("encoder model state is inconsistent");
+            return Err(corrupt("frequency total exceeds the encoder's range"));
         }
         Ok(())
     }
@@ -59,341 +43,120 @@ impl Model {
         Ok(())
     }
 
-    /// `Ppmd7z_EncodeSymbol`: returns the coded symbol (`target`), -1 once
-    /// the end marker escaped out of order 0, or -1 with `model_fault` set.
-    fn encode_char<E: RangeEncoder>(&mut self, rc: &mut E, target: i32) -> i32 {
-        let Some(context_span) = self.validated_context(self.min_context) else {
-            return self.fail_model();
-        };
-        let mut active_context_span = context_span;
-        let context_head = self.span_context_head(context_span);
-        let mut active_context_head = context_head;
-        let mut found_span = None;
-
-        let ns = (context_head >> 32) as u16;
-        if ns == 0 || ns > 256 {
-            return self.fail_model();
-        }
+    /// `Ppmd7z_EncodeSymbol`.
+    #[inline(always)]
+    fn encode_char<E: RangeEncoder>(&mut self, rc: &mut E, symbol: i32) {
+        let entry_order_fall = self.order_fall;
+        let mut char_mask: [u8; 256];
+        let mc = self.min_context;
+        let ns = self.num_stats(mc);
 
         if ns != 1 {
-            let stats = self.span_ctx_stats(context_span);
-            let Some(states_span) = self.validated_states(stats, ns as usize) else {
-                return self.fail_model();
-            };
-            if !self.encode_symbol1(
-                rc,
-                context_span,
-                states_span,
-                context_head,
-                target,
-                &mut found_span,
-            ) {
-                return -1;
+            let mut s = self.stats(mc);
+            let summ_freq = self.summ_freq(mc);
+            if self.sym(s) as i32 == symbol {
+                rc.encode(0, self.freq(s), summ_freq);
+                self.found_state = s;
+                self.update1_0();
+                return;
             }
-        } else if !self.encode_bin_symbol(rc, context_span, context_head, target, &mut found_span) {
-            return -1;
+            self.prev_success = 0;
+            let mut sum = self.freq(s);
+            for _ in 1..ns {
+                s += STATE_SIZE;
+                if self.sym(s) as i32 == symbol {
+                    rc.encode(sum, self.freq(s), summ_freq);
+                    self.found_state = s;
+                    self.update1();
+                    return;
+                }
+                sum += self.freq(s);
+            }
+            rc.encode(sum, summ_freq - sum, summ_freq);
+
+            self.hi_bits_flag = hi_bits_flag3(self.sym(self.found_state));
+            char_mask = [u8::MAX; 256];
+            self.mask_symbols(&mut char_mask, s, self.stats(mc));
+        } else {
+            let s = mc + CTX_ONE_STATE;
+            let (row, col) = self.bin_summ_index();
+            let pr = self.bin_summ[row][col] as u32;
+            if self.sym(s) as i32 == symbol {
+                self.bin_summ[row][col] = (update_prob_1(pr) + (1 << INT_BITS)) as u16;
+                rc.encode_bit(pr, 0);
+                self.update_bin(s);
+                return;
+            }
+            let pr1 = update_prob_1(pr);
+            self.bin_summ[row][col] = pr1 as u16;
+            self.init_esc = EXP_ESCAPE[(pr1 >> 10) as usize] as u32;
+            rc.encode_bit(pr, 1);
+            char_mask = [u8::MAX; 256];
+            char_mask[self.sym(s) as usize] = 0;
+            self.prev_success = 0;
         }
 
-        // Escape loop: walk the suffix chain past contexts whose symbols are
-        // all masked, exactly as the decoder does.
-        let mut validated_suffix: Option<(ValidatedArenaSpan, u64)> = None;
-        while found_span.is_none() {
-            let (code_context_span, code_context_head) = loop {
+        loop {
+            let mut mc = self.min_context;
+            let num_masked = self.num_stats(mc);
+            let mut i;
+            loop {
                 self.order_fall += 1;
-                let suffix = active_context_head as u32;
-                self.min_context = suffix;
-                if self.min_context == 0 {
-                    // Escaped out of order 0: the end marker.
-                    return -1;
+                let suffix = self.suffix(mc);
+                if suffix == 0 {
+                    // The end marker (or a symbol no context holds).
+                    self.abandon_symbol(entry_order_fall);
+                    return;
                 }
-                let (suffix_span, suffix_head) = if let Some((span, head)) = validated_suffix.take()
-                {
-                    if span.offset() != self.min_context as usize {
-                        return self.fail_model();
-                    }
-                    (span, head)
-                } else {
-                    let Some(span) = self.validated_context(self.min_context) else {
-                        return self.fail_model();
-                    };
-                    (span, self.span_context_head(span))
-                };
-                active_context_span = suffix_span;
-                active_context_head = suffix_head;
-                let ns2 = (suffix_head >> 32) as u16 as u32;
-                if ns2 != self.num_masked {
-                    break (suffix_span, suffix_head);
+                mc = suffix;
+                i = self.num_stats(mc);
+                if i != num_masked {
+                    break;
                 }
-            };
-            if !self.encode_symbol2(
-                rc,
-                code_context_span,
-                code_context_head,
-                target,
-                &mut found_span,
-                &mut validated_suffix,
-            ) {
-                return -1;
             }
-        }
+            self.min_context = mc;
 
-        let Some(found_span) = found_span else {
-            return self.fail_model();
-        };
-        self.next_context(found_span, active_context_span, active_context_head)
-    }
+            let (see, esc_freq) = self.make_esc_freq(num_masked);
+            let stats = self.stats(mc);
+            let mut s = stats;
+            let mut sum = 0u32;
 
-    /// The binary-context branch of `Ppmd7z_EncodeSymbol`.
-    fn encode_bin_symbol<E: RangeEncoder>(
-        &mut self,
-        rc: &mut E,
-        context_span: ValidatedArenaSpan,
-        context_head: u64,
-        target: i32,
-        found_span: &mut Option<ValidatedArenaSpan>,
-    ) -> bool {
-        let ctx = self.min_context;
-        debug_assert_eq!(context_span.offset(), ctx as usize);
-        let symbol = (context_head >> 48) as u8;
-        let freq = (context_head >> 56) as u8;
-        let Some(index) = self.bin_summ_index(context_head) else {
-            return false;
-        };
-        let bs = u32::from(self.bin_summ[index.0][index.1]);
+            while i != 0 {
+                let cur = self.sym(s);
+                if cur as i32 == symbol {
+                    let low = sum;
+                    let freq = self.freq(s);
+                    self.see.get(see).update();
+                    self.found_state = s;
+                    sum += esc_freq;
 
-        if i32::from(symbol) == target {
-            rc.encode_bit(bs, 0);
-            self.update_bin_hit(ctx, context_span, freq, index, found_span);
-            true
-        } else {
-            rc.encode_bit(bs, 1);
-            self.update_bin_escape(symbol, index, found_span)
-        }
-    }
-
-    /// The multi-symbol branch of `Ppmd7z_EncodeSymbol`: the first state,
-    /// then the rest in order, then the escape.
-    fn encode_symbol1<E: RangeEncoder>(
-        &mut self,
-        rc: &mut E,
-        context_span: ValidatedArenaSpan,
-        states_span: ValidatedArenaSpan,
-        context_head: u64,
-        target: i32,
-        found_span: &mut Option<ValidatedArenaSpan>,
-    ) -> bool {
-        let ctx = self.min_context;
-        debug_assert_eq!(context_span.offset(), ctx as usize);
-        let ns = (context_head >> 32) as u16 as usize;
-        let sum_freq = (context_head >> 48) as u16 as u32;
-        debug_assert_eq!(states_span.len(), ns * STATE_SIZE);
-
-        if sum_freq == 0 {
-            self.model_fault = true;
-            return false;
-        }
-
-        let p0_freq = self.span_state_freq(states_span, 0) as u32;
-        if i32::from(self.span_state_sym(states_span, 0)) == target {
-            rc.encode(0, p0_freq, sum_freq);
-            return self.update1_0(
-                ctx,
-                context_span,
-                states_span,
-                p0_freq,
-                sum_freq,
-                found_span,
-            );
-        }
-
-        if self.found_state == 0 {
-            return false;
-        }
-
-        self.prev_success = 0;
-        let mut hi_cnt = p0_freq;
-        for state_index in 1..ns {
-            let p_freq = self.span_state_freq(states_span, state_index) as u32;
-            if i32::from(self.span_state_sym(states_span, state_index)) == target {
-                rc.encode(hi_cnt, p_freq, sum_freq);
-                return self.update1(
-                    ctx,
-                    context_span,
-                    states_span,
-                    state_index,
-                    p_freq as u8,
-                    found_span,
-                );
-            }
-            hi_cnt += p_freq;
-        }
-
-        // Escape: mask every symbol of this context.
-        self.hi_bits_flag = self.hb2_flag[self.prev_sym as usize];
-        self.num_masked = ns as u32;
-        self.found_state = 0;
-        *found_span = None;
-        for index in (0..ns).rev() {
-            let sym = self.span_state_sym(states_span, index);
-            self.char_mask[sym as usize] = self.esc_count;
-        }
-        let Some(escape_freq) = sum_freq.checked_sub(hi_cnt) else {
-            self.model_fault = true;
-            return false;
-        };
-        rc.encode(hi_cnt, escape_freq, sum_freq);
-        true
-    }
-
-    /// The masked-context loop body of `Ppmd7z_EncodeSymbol`: SEE's escape
-    /// estimate, the unmasked states, then the symbol or another escape.
-    fn encode_symbol2<E: RangeEncoder>(
-        &mut self,
-        rc: &mut E,
-        context_span: ValidatedArenaSpan,
-        context_head: u64,
-        target: i32,
-        found_span: &mut Option<ValidatedArenaSpan>,
-        validated_suffix: &mut Option<(ValidatedArenaSpan, u64)>,
-    ) -> bool {
-        *validated_suffix = None;
-        let ctx = self.min_context;
-        debug_assert_eq!(context_span.offset(), ctx as usize);
-        let ns = (context_head >> 32) as u16 as u32;
-        let stats = self.span_ctx_stats(context_span);
-        let Some(states_span) = self.validated_states(stats, ns as usize) else {
-            self.model_fault = true;
-            return false;
-        };
-        let suffix = context_head as u32;
-        let suffix_data = if ns != 256 {
-            if suffix == 0 {
-                self.model_fault = true;
-                return false;
-            }
-            let Some(span) = self.validated_context(suffix) else {
-                self.model_fault = true;
-                return false;
-            };
-            Some((span, self.span_context_head(span)))
-        } else {
-            None
-        };
-        let Some(diff) = ns.checked_sub(self.num_masked) else {
-            self.model_fault = true;
-            return false;
-        };
-        if diff == 0 {
-            self.model_fault = true;
-            return false;
-        }
-
-        let suffix_ns = suffix_data.map_or(0, |(_, head)| (head >> 32) as u16 as u32);
-        if ns != 256 && suffix_ns > 256 {
-            self.model_fault = true;
-            return false;
-        }
-        let (esc_freq, see_index) = self.make_esc_freq2(context_head, suffix_ns, diff);
-        let n = diff as usize;
-
-        // One pass over every state, as in the decoder: the unmasked
-        // frequency sum and count without a branch per state, and the
-        // target's index and the unmasked sum before it. A consistent model
-        // has exactly `ns - num_masked` unmasked states; any other count
-        // falls back to collecting the first `n`, as the decoder does.
-        let esc_count = self.esc_count;
-        let alloc = &self.alloc;
-        let char_mask = &self.char_mask;
-        let mut hi_cnt = 0u32;
-        let mut found = 0usize;
-        let mut low = 0u32;
-        let mut target_index = usize::MAX;
-        let mut hits = 0usize;
-        for state_index in 0..ns as usize {
-            let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-            let unmasked = char_mask[head as u8 as usize] != esc_count;
-            let freq = u32::from(head >> 8) & 0u32.wrapping_sub(u32::from(unmasked));
-            // Keep the last unmasked match and count the matches, so no
-            // state waits on the one before it. A consistent model holds the
-            // target at most once; more than one match takes the collecting
-            // loop below, where the first one counts.
-            let hit = unmasked & (i32::from(head as u8) == target);
-            target_index = if hit { state_index } else { target_index };
-            low = if hit { hi_cnt } else { low };
-            hits += usize::from(hit);
-            hi_cnt += freq;
-            found += usize::from(unmasked);
-        }
-        let consistent = found == n && hits <= 1;
-        let mut selected = None;
-        if consistent {
-            if target_index != usize::MAX {
-                let head = alloc.span_read_u16(states_span, target_index * STATE_SIZE);
-                selected = Some((pack_unmasked_state(target_index, head), low));
-            }
-        } else {
-            hi_cnt = 0u32;
-            let scratch = &mut self.unmasked_scratch[..n];
-            let mut state_index = 0usize;
-            for slot in scratch.iter_mut() {
-                let head = loop {
-                    if state_index >= ns as usize {
-                        self.model_fault = true;
-                        return false;
+                    // The rest of the unmasked total, the found state
+                    // included.
+                    let odd = i & 1;
+                    sum += freq & 0u32.wrapping_sub(odd);
+                    s += odd * STATE_SIZE;
+                    for _ in 0..i / 2 {
+                        let sym0 = self.sym(s);
+                        let sym1 = self.sym(s + STATE_SIZE);
+                        sum += self.freq(s) & char_mask[sym0 as usize] as u32;
+                        sum += self.freq(s + STATE_SIZE) & char_mask[sym1 as usize] as u32;
+                        s += 2 * STATE_SIZE;
                     }
-                    let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-                    if char_mask[head as u8 as usize] != esc_count {
-                        break head;
-                    }
-                    state_index += 1;
-                };
-                let packed = pack_unmasked_state(state_index, head);
-                let freq = u32::from(unmasked_state_frequency(packed));
-                if selected.is_none() && i32::from(unmasked_state_symbol(packed)) == target {
-                    selected = Some((packed, hi_cnt));
+                    rc.encode(low, freq, sum);
+                    self.update2();
+                    return;
                 }
-                hi_cnt += freq;
-                *slot = packed;
-                state_index += 1;
+                sum += self.freq(s) & char_mask[cur as usize] as u32;
+                s += STATE_SIZE;
+                i -= 1;
             }
-        }
-        let scale = esc_freq + hi_cnt;
 
-        if let Some((packed, low)) = selected {
-            let state_freq = unmasked_state_frequency(packed);
-            rc.encode(low, u32::from(state_freq), scale);
-            self.see_update_success(see_index);
-            return self.update2(
-                ctx,
-                context_span,
-                states_span,
-                unmasked_state_index(packed),
-                state_freq,
-                found_span,
-            );
-        }
+            let total = sum + esc_freq;
+            let cell = self.see.get(see);
+            cell.summ = (cell.summ as u32).wrapping_add(total) as u16;
+            rc.encode(sum, esc_freq, total);
 
-        // Escape again.
-        rc.encode(hi_cnt, esc_freq, scale);
-        self.see_update_escape(see_index, scale);
-
-        // In a consistent model every state is masked already or one of the
-        // unmasked ones, so stamping all of them is the same mask.
-        let char_mask = &mut self.char_mask;
-        if consistent {
-            for state_index in 0..ns as usize {
-                let sym = self
-                    .alloc
-                    .span_read_u8(states_span, state_index * STATE_SIZE);
-                char_mask[sym as usize] = esc_count;
-            }
-        } else {
-            for &packed in &self.unmasked_scratch[..n] {
-                char_mask[unmasked_state_symbol(packed) as usize] = esc_count;
-            }
+            self.mask_symbols(&mut char_mask, s - STATE_SIZE, stats);
         }
-        self.num_masked = ns;
-        *validated_suffix = suffix_data;
-        true
     }
 }

@@ -1,156 +1,152 @@
 //! The variant H context model.
 //!
-//! Dmitry Shkarin's PPMd variant H, as 7-Zip implements it in `Ppmd7.c` and
-//! `Ppmd7Dec.c` (Igor Pavlov): contexts and their symbol states, binary
+//! Dmitry Shkarin's PPMd variant H: contexts and their symbol states, binary
 //! contexts with their adaptive `BinSumm` probabilities, secondary escape
 //! estimation for masked contexts, model update (`UpdateModel`,
 //! `CreateSuccessors`, `Rescale`) and restart when the arena fills.
 //!
-//! The model decodes through any [`RangeDecoder`] and encodes through any
-//! [`RangeEncoder`](crate::rc::RangeEncoder) (`encode.rs`, after 7-Zip's
-//! `Ppmd7Enc.c`); it never normalizes the coder itself (see the traits'
-//! contracts).
+//! This is a direct translation of ppmd-rust 1.5.0's `internal/ppmd7`
+//! (CC0-1.0 / MIT-0), which is in turn a translation of Igor Pavlov's
+//! `C/Ppmd7.c`, `C/Ppmd7Dec.c` and `C/Ppmd7Enc.c` in 7-Zip (public domain).
+//! Every update rule, table and branch is the reference's; only the
+//! representation differs: records are addressed by 32-bit offsets into the
+//! [`Arena`], and the range coder is reached through [`RangeDecoder`] and
+//! [`RangeEncoder`](crate::rc::RangeEncoder) (`encode.rs`), whose calls
+//! normalize eagerly where 7-Zip normalizes at the top of the escape loop.
 //!
-//! Every arena pointer the model follows comes from the stream's own history
-//! and so is untrusted: each one is checked against the arena and the text
-//! boundary before it is dereferenced, and a pointer that fails the check
-//! ends decoding with [`Error::CorruptStream`]. The checks produce
-//! validated-span tokens, so a record is checked once and then read
-//! field by field without repeating the check.
+//! **Consistency, and why the model trusts its own records.** Input reaches
+//! the model only as the coder's choice among the symbols the model offers,
+//! so whatever the input, the model evolves only through its own updates.
+//! Those updates keep it consistent: every context's symbols are distinct,
+//! a subset of its suffix's, and the order-0 context holds all 256. The
+//! proof is in `docs/algorithms.md` ("Model consistency"). An aborted symbol
+//! (a count past the total, a coder fault, or the end marker) would leave
+//! `MinContext` below `MaxContext` with `OrderFall` raised; continuing from
+//! there could add a symbol twice. Every abort path therefore puts both back
+//! as they were when the symbol began, so the model stays consistent between
+//! calls whatever the caller does next. Arena access is unchecked in release
+//! builds on the strength of that invariant and checked by `debug_assert!`
+//! in debug builds, Miri and the fuzz targets.
 
-use crate::alloc::{NodeRef, SubAllocator, UNIT_SIZE, ValidatedArenaOffset, ValidatedArenaSpan};
+use crate::alloc::{Arena, UNIT_SIZE, u2i};
 use crate::error::{Error, Result};
-use crate::rc::RangeDecoder;
-#[cfg(test)]
-use crate::rc::RarRangeDecoder;
-use crate::see::SeeTable;
+use crate::rc::{RangeDecoder, corrupt};
+use crate::see::{DUMMY, SeeTable};
 use crate::{PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER};
 
 mod encode;
 
-// --- Constants ---
+// --- Constants (`Ppmd.h`, `Ppmd7.c`) ---
 
 const MAX_ORDER: usize = PPMD7_MAX_ORDER as usize;
-const MAX_FREQ: u8 = 124;
-
-const BIN_SCALE: u32 = 1 << 14; // 16384
-const INTERVAL: u16 = 1 << 7; // 128
+const MAX_FREQ: u32 = 124;
+const INT_BITS: u32 = 7;
+const PERIOD_BITS: u32 = 7;
+const BIN_SCALE: u32 = 1 << (INT_BITS + PERIOD_BITS);
 
 const INIT_BIN_ESC: [u16; 8] = [
     0x3CDD, 0x1F3F, 0x59BF, 0x48F3, 0x64A1, 0x5ABC, 0x6632, 0x6051,
 ];
 
-const EXP_ESCAPE: [u8; 16] = [25, 14, 9, 7, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 2];
+static EXP_ESCAPE: [u8; 16] = [25, 14, 9, 7, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 2];
 
-// --- Context layout (12 bytes per context node) ---
-// Contexts are allocated as single units from the arena.
+/// `NS2BSIndx`.
+static NS2BS_INDEX: [u8; 256] = {
+    let mut t = [0u8; 256];
+    t[1] = 2;
+    let mut i = 2;
+    while i < 256 {
+        t[i] = if i < 11 { 4 } else { 6 };
+        i += 1;
+    }
+    t
+};
 
-/// Byte offset of suffix context ref (u32, stored as byte offset in arena).
-const CTX_SUFFIX: usize = 0;
-/// Byte offset of NumStats (u16). NumStats = number of symbols (1 = binary).
-const CTX_NUM_STATS: usize = 4;
-// Union at offset 6 (6 bytes):
-//   NumStats == 1: OneState inline — symbol(1) + freq(1) + successor(4)
-//   NumStats > 1: SummFreq(2) + Stats pointer(4)
-const CTX_SUMM_FREQ: usize = 6;
-const CTX_STATS: usize = 8;
-// OneState aliases (same offsets, different interpretation):
-const CTX_ONE_SYM: usize = 6;
-const CTX_ONE_FREQ: usize = 7;
-const CTX_ONE_SUCC: usize = 8;
+/// `NS2Indx`.
+static NS2INDEX: [u8; 256] = {
+    let mut t = [0u8; 256];
+    t[0] = 0;
+    t[1] = 1;
+    t[2] = 2;
+    let mut m = 3u32;
+    let mut k = 1u32;
+    let mut i = 3;
+    while i < 256 {
+        t[i] = m as u8;
+        k -= 1;
+        if k == 0 {
+            m += 1;
+            k = m - 2;
+        }
+        i += 1;
+    }
+    t
+};
 
-// --- State layout (6 bytes, packed 2 per 12-byte unit) ---
-const STATE_SIZE: usize = 6;
-const STATE_SYM: usize = 0;
-const STATE_FREQ: usize = 1;
-const STATE_SUCC: usize = 2;
-
+/// `PPMD_GET_MEAN`.
 #[inline(always)]
-const fn pack_unmasked_state(index: usize, head: u16) -> u32 {
-    debug_assert!(index <= u8::MAX as usize);
-    index as u32 | ((head as u32) << 8)
+const fn get_mean(prob: u32) -> u32 {
+    (prob + (1 << (PERIOD_BITS - 2))) >> PERIOD_BITS
 }
 
+/// `PPMD_UPDATE_PROB_1`.
 #[inline(always)]
-const fn unmasked_state_index(packed: u32) -> usize {
-    (packed as u8) as usize
+const fn update_prob_1(prob: u32) -> u32 {
+    prob - get_mean(prob)
 }
 
+/// `PPMD7_HiBitsFlag_3`: 8 for symbols 0x40 and up.
 #[inline(always)]
-const fn unmasked_state_symbol(packed: u32) -> u8 {
-    (packed >> 8) as u8
+const fn hi_bits_flag3(sym: u32) -> u32 {
+    ((sym + 0xC0) >> (8 - 3)) & (1 << 3)
 }
 
+/// `PPMD7_HiBitsFlag_4`: 16 for symbols 0x40 and up.
 #[inline(always)]
-const fn unmasked_state_frequency(packed: u32) -> u8 {
-    (packed >> 16) as u8
+const fn hi_bits_flag4(sym: u32) -> u32 {
+    ((sym + 0xC0) >> (8 - 4)) & (1 << 4)
 }
+
+// --- Record layout ---
+//
+// Context (one 12-byte unit): NumStats u16 at 0; SummFreq u16 at 2; Stats
+// u32 at 4; Suffix u32 at 8. A binary context (NumStats == 1) keeps its one
+// state in place of SummFreq and Stats: symbol at 2, freq at 3, successor at 4.
+// State (6 bytes, two per unit): symbol at 0, freq at 1, successor u32 at 2.
+
+const CTX_NUM_STATS: u32 = 0;
+const CTX_SUMM_FREQ: u32 = 2;
+const CTX_STATS: u32 = 4;
+const CTX_SUFFIX: u32 = 8;
+/// The binary context's state (`Ppmd7Context_OneState`).
+const CTX_ONE_STATE: u32 = 2;
+
+const STATE_SIZE: u32 = 6;
+const ST_SYMBOL: u32 = 0;
+const ST_FREQ: u32 = 1;
+const ST_SUCCESSOR: u32 = 2;
 
 /// A PPMd variant H context model with its arena.
 ///
-/// One model decodes one stream; RAR's framing keeps it alive across blocks
-/// and members, which is why it is separate from the range decoder.
+/// One model codes one stream; RAR's framing keeps it alive across blocks
+/// and members, which is why it is separate from the range coder.
 pub struct Model {
-    alloc: SubAllocator,
-    see: SeeTable,
-    max_order: usize,
-
-    // Context tracking (all stored as byte offsets in arena, 0 = NULL).
+    a: Arena,
     min_context: u32,
     max_context: u32,
-
-    // Found state (byte offset of the matched state, 0 = not found).
     found_state: u32,
-
-    order_fall: i32,
-
-    // Binary summation table [freq-1][combined_index].
-    bin_summ: [[u16; 64]; 128],
-
-    // Lookup tables.
-    ns2_indx: [u8; 256],
-    ns2_bs_indx: [u8; 256],
-    hb2_flag: [u8; 256],
-
-    // Mask and counters.
-    char_mask: [u8; 256],
-    esc_count: u8,
-    num_masked: u32,
-
-    // State.
-    prev_success: u8,
-    /// Symbol of the previous decode's found state (`FoundState->Symbol` at
-    /// the top of the next `DecodeChar`). Kept as a byte instead of
-    /// re-validating `found_state` on every binary/escape decode: rescale and
-    /// update relocate the found state but never change its symbol, so the
-    /// returned symbol of decode N IS `FoundState->Symbol` seen by decode
-    /// N+1. Restart re-seeds it from the restart-installed found state.
-    prev_sym: u8,
-    hi_bits_flag: u8,
-    init_esc: u8,
+    order_fall: u32,
+    init_esc: u32,
+    prev_success: u32,
+    max_order: u32,
+    hi_bits_flag: u32,
     run_length: i32,
     init_rl: i32,
-    // Reused packed escape-decode state index/head values. Keeping this on the model avoids
-    // clearing a padded 2 KiB `(u32, u8)` array on every masked-context walk.
-    unmasked_scratch: [u32; 256],
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    use_ssse3_state_batches: bool,
-    model_fault: bool,
+    see: SeeTable,
+    bin_summ: [[u16; 64]; 128],
     /// Model restarts so far, including the ones a full arena forces.
     #[cfg(test)]
     restarts: u32,
-}
-
-// --- Helpers for converting between NodeRef and byte offsets ---
-
-#[inline]
-fn ref_to_off(node: NodeRef) -> u32 {
-    node.offset() as u32
-}
-
-#[inline]
-fn off_to_ref(off: u32) -> NodeRef {
-    NodeRef(off / UNIT_SIZE as u32)
 }
 
 impl Model {
@@ -159,39 +155,28 @@ impl Model {
     /// `order` must be in [`PPMD7_MIN_ORDER`]`..=`[`PPMD7_MAX_ORDER`] and
     /// `mem_size` in [`PPMD7_MIN_MEM_SIZE`]`..=`[`PPMD7_MAX_MEM_SIZE`];
     /// anything else is [`Error::InvalidParameters`]. The arena is allocated
-    /// here, once, and never grows: its length is `mem_size` rounded down to
-    /// whole 12-byte units, plus three units, as unrar lays it out.
+    /// here, once, and never grows: `mem_size` bytes plus up to three bytes
+    /// of alignment, as 7-Zip's `Ppmd7_Alloc` lays it out.
     pub fn new(order: u32, mem_size: u32) -> Result<Self> {
-        let (order, mem_size) = Self::check_parameters(order, mem_size)?;
+        Self::check_parameters(order, mem_size)?;
         let mut model = Self {
-            alloc: SubAllocator::new(mem_size),
-            see: SeeTable::new(),
-            max_order: order,
+            a: Arena::new(mem_size),
             min_context: 0,
             max_context: 0,
             found_state: 0,
             order_fall: 0,
-            bin_summ: [[0u16; 64]; 128],
-            ns2_indx: [0u8; 256],
-            ns2_bs_indx: [0u8; 256],
-            hb2_flag: [0u8; 256],
-            char_mask: [0u8; 256],
-            esc_count: 1,
-            num_masked: 0,
-            prev_success: 0,
-            prev_sym: 0,
-            hi_bits_flag: 0,
             init_esc: 0,
+            prev_success: 0,
+            max_order: order,
+            hi_bits_flag: 0,
             run_length: 0,
-            init_rl: -(order.min(12) as i32) - 1,
-            unmasked_scratch: [0; 256],
-            #[cfg(all(target_arch = "x86_64", not(miri)))]
-            use_ssse3_state_batches: std::arch::is_x86_feature_detected!("ssse3"),
-            model_fault: false,
+            init_rl: 0,
+            see: SeeTable::new(),
+            bin_summ: [[0; 64]; 128],
             #[cfg(test)]
             restarts: 0,
         };
-        model.start_checked(order, mem_size);
+        model.restart_model();
         Ok(model)
     }
 
@@ -206,1858 +191,837 @@ impl Model {
 
     /// The model order.
     pub fn order(&self) -> u32 {
-        self.max_order as u32
+        self.max_order
     }
 
     /// The arena size in bytes the model was created or last started with.
     pub fn mem_size(&self) -> u32 {
-        self.alloc.allocated_size() as u32
+        self.a.size()
     }
 
-    /// Address of the model arena; see [`SubAllocator::arena_addr`].
+    /// Address of the model arena, for tests that check a same-size restart
+    /// keeps it.
     #[cfg(test)]
     pub(crate) fn arena_addr(&self) -> usize {
-        self.alloc.arena_addr()
+        self.a.arena_addr()
     }
 
     /// Restarts the model with a new order and arena size, as a fresh
     /// [`Model::new`] would be, but keeping the arena when its size is
     /// unchanged so its pages are not faulted in again.
     pub fn start(&mut self, order: u32, mem_size: u32) -> Result<()> {
-        let (order, mem_size) = Self::check_parameters(order, mem_size)?;
-        self.start_checked(order, mem_size);
+        Self::check_parameters(order, mem_size)?;
+        if self.a.size() != mem_size {
+            self.a = Arena::new(mem_size);
+        }
+        self.max_order = order;
+        self.restart_model();
         Ok(())
     }
 
-    fn start_checked(&mut self, max_order: usize, alloc_size: usize) {
-        if self.alloc.allocated_size() != alloc_size {
-            self.alloc = SubAllocator::new(alloc_size);
-        }
-        self.max_order = max_order;
-        self.esc_count = 1;
-        self.model_fault = false;
-        self.restart_model();
-        self.build_lookup_tables();
-    }
-
     /// Restarts the model from scratch with its current order and arena
-    /// size: the state a stream begins in.
+    /// size: the state a stream begins in (`Ppmd7_Init`).
     pub fn restart(&mut self) {
-        self.start_checked(self.max_order, self.alloc.allocated_size());
+        self.restart_model();
     }
 
-    fn build_lookup_tables(&mut self) {
-        // NS2BSIndx
-        self.ns2_bs_indx[0] = 0;
-        self.ns2_bs_indx[1] = 2;
-        for i in 2..11 {
-            self.ns2_bs_indx[i] = 4;
-        }
-        for i in 11..256 {
-            self.ns2_bs_indx[i] = 6;
-        }
+    // ---- record access -----------------------------------------------------
 
-        // NS2Indx: 0,1,2 then groups of increasing size
-        self.ns2_indx[0] = 0;
-        self.ns2_indx[1] = 1;
-        self.ns2_indx[2] = 2;
-        let mut m = 3u8;
-        let mut step = 1usize;
-        let mut k = step;
-        for i in 3..256 {
-            self.ns2_indx[i] = m;
-            k -= 1;
-            if k == 0 {
-                step += 1;
-                k = step;
-                m += 1;
+    #[inline(always)]
+    fn num_stats(&self, c: u32) -> u32 {
+        self.a.u16(c + CTX_NUM_STATS) as u32
+    }
+
+    #[inline(always)]
+    fn set_num_stats(&mut self, c: u32, v: u32) {
+        self.a.set_u16(c + CTX_NUM_STATS, v as u16);
+    }
+
+    #[inline(always)]
+    fn summ_freq(&self, c: u32) -> u32 {
+        self.a.u16(c + CTX_SUMM_FREQ) as u32
+    }
+
+    #[inline(always)]
+    fn set_summ_freq(&mut self, c: u32, v: u32) {
+        self.a.set_u16(c + CTX_SUMM_FREQ, v as u16);
+    }
+
+    #[inline(always)]
+    fn stats(&self, c: u32) -> u32 {
+        self.a.u32(c + CTX_STATS)
+    }
+
+    #[inline(always)]
+    fn set_stats(&mut self, c: u32, v: u32) {
+        self.a.set_u32(c + CTX_STATS, v);
+    }
+
+    #[inline(always)]
+    fn suffix(&self, c: u32) -> u32 {
+        self.a.u32(c + CTX_SUFFIX)
+    }
+
+    #[inline(always)]
+    fn set_suffix(&mut self, c: u32, v: u32) {
+        self.a.set_u32(c + CTX_SUFFIX, v);
+    }
+
+    #[inline(always)]
+    fn sym(&self, s: u32) -> u32 {
+        self.a.u8(s + ST_SYMBOL) as u32
+    }
+
+    #[inline(always)]
+    fn freq(&self, s: u32) -> u32 {
+        self.a.u8(s + ST_FREQ) as u32
+    }
+
+    #[inline(always)]
+    fn set_freq(&mut self, s: u32, v: u32) {
+        self.a.set_u8(s + ST_FREQ, v as u8);
+    }
+
+    #[inline(always)]
+    fn successor(&self, s: u32) -> u32 {
+        self.a.u32(s + ST_SUCCESSOR)
+    }
+
+    #[inline(always)]
+    fn set_successor(&mut self, s: u32, v: u32) {
+        self.a.set_u32(s + ST_SUCCESSOR, v);
+    }
+
+    /// The first state of `ns` from `stats` with symbol `sym`. The model's
+    /// invariants guarantee one exists wherever the reference searches
+    /// without a bound; the bound only keeps the walk inside the array.
+    #[inline(always)]
+    fn find_state(&self, stats: u32, ns: u32, sym: u32) -> Option<u32> {
+        let end = stats + ns * STATE_SIZE;
+        let mut s = stats;
+        while s < end {
+            if self.sym(s) == sym {
+                return Some(s);
             }
+            s += STATE_SIZE;
         }
-
-        // HB2Flag
-        for i in 0..0x40 {
-            self.hb2_flag[i] = 0;
-        }
-        for i in 0x40..256 {
-            self.hb2_flag[i] = 0x08;
-        }
+        debug_assert!(
+            false,
+            "symbol {sym} missing from a context that must hold it"
+        );
+        None
     }
 
-    /// `RestartModel`: empty the arena and rebuild the order-0 context. Used
-    /// when the arena fills; unlike [`Self::restart`] it keeps the escape
-    /// counter's caller-chosen value.
+    // ---- RestartModel ------------------------------------------------------
+
+    /// `RestartModel`: empty the arena and rebuild the order-0 context.
+    #[inline(never)]
     fn restart_model(&mut self) {
         #[cfg(test)]
         {
             self.restarts += 1;
         }
-        self.char_mask = [0; 256];
-        self.alloc.reset();
+        self.a.reset();
+
+        self.order_fall = self.max_order;
         self.init_rl = -(self.max_order.min(12) as i32) - 1;
-
-        let root = self.alloc.alloc_context();
-        if root.is_null() {
-            return;
-        }
-        let root_off = ref_to_off(root);
-        self.min_context = root_off;
-        self.max_context = root_off;
-
-        self.alloc.write_u32(root, CTX_SUFFIX, 0);
-        self.order_fall = self.max_order as i32;
-        self.alloc.write_u16(root, CTX_NUM_STATS, 256);
-        self.alloc.write_u16(root, CTX_SUMM_FREQ, 257);
-
-        let states = self.alloc.alloc_units(128);
-        if states.is_null() {
-            return;
-        }
-        let states_off = ref_to_off(states);
-        self.alloc.write_u32(root, CTX_STATS, states_off);
-        self.found_state = states_off;
-
         self.run_length = self.init_rl;
         self.prev_success = 0;
-        self.prev_sym = 0;
+
+        self.a.hi_unit -= UNIT_SIZE;
+        let mc = self.a.hi_unit;
+        let s = self.a.lo_unit;
+        self.a.lo_unit += (256 / 2) * UNIT_SIZE;
+        self.min_context = mc;
+        self.max_context = mc;
+        self.found_state = s;
+
+        self.set_num_stats(mc, 256);
+        self.set_summ_freq(mc, 256 + 1);
+        self.set_stats(mc, s);
+        self.set_suffix(mc, 0);
+
         for i in 0..256u32 {
-            let off = states_off as usize + i as usize * STATE_SIZE;
-            self.alloc.write_byte_at(off + STATE_SYM, i as u8);
-            self.alloc.write_byte_at(off + STATE_FREQ, 1);
-            self.alloc.write_u32_at(off + STATE_SUCC, 0);
+            let st = s + i * STATE_SIZE;
+            self.a.set_u8(st + ST_SYMBOL, i as u8);
+            self.a.set_u8(st + ST_FREQ, 1);
+            self.set_successor(st, 0);
         }
 
-        for i in 0..128u16 {
+        for (i, row) in self.bin_summ.iter_mut().enumerate() {
             for (k, &esc) in INIT_BIN_ESC.iter().enumerate() {
-                let val = BIN_SCALE as u16 - esc / (i + 2);
+                let val = (BIN_SCALE - esc as u32 / (i as u32 + 2)) as u16;
                 for m in (0..64).step_by(8) {
-                    self.bin_summ[i as usize][k + m] = val;
+                    row[k + m] = val;
                 }
             }
         }
-        self.see = SeeTable::new();
+
+        self.see.reset();
     }
 
-    // --- Context field accessors ---
+    // ---- CreateSuccessors / UpdateModel ------------------------------------
 
-    #[inline(always)]
-    fn validated_context(&self, ctx: u32) -> Option<ValidatedArenaSpan> {
-        self.alloc.validated_model_span(ctx, UNIT_SIZE)
-    }
-
-    #[inline(always)]
-    fn validated_states(&self, stats: u32, count: usize) -> Option<ValidatedArenaSpan> {
-        if !(2..=256).contains(&count) {
-            return None;
-        }
-        self.alloc.validated_model_span(stats, count * STATE_SIZE)
-    }
-
-    #[inline(always)]
-    fn validated_state(&self, state: u32) -> Option<ValidatedArenaSpan> {
-        self.alloc.validated_tail_span(state, STATE_SIZE)
-    }
-
-    /// Packed context bytes 0..8: suffix, NumStats, and the first two union
-    /// bytes (SummFreq or OneState symbol/frequency).
-    #[inline(always)]
-    fn span_context_head(&self, span: ValidatedArenaSpan) -> u64 {
-        self.alloc.span_read_u64(span, 0)
-    }
-
-    #[inline(always)]
-    fn span_ctx_suffix(&self, span: ValidatedArenaSpan) -> u32 {
-        self.alloc.span_read_u32(span, CTX_SUFFIX)
-    }
-
-    #[inline(always)]
-    fn span_ctx_num_stats(&self, span: ValidatedArenaSpan) -> u16 {
-        self.alloc.span_read_u16(span, CTX_NUM_STATS)
-    }
-
-    #[inline(always)]
-    fn span_ctx_summ_freq(&self, span: ValidatedArenaSpan) -> u16 {
-        self.alloc.span_read_u16(span, CTX_SUMM_FREQ)
-    }
-
-    #[inline(always)]
-    fn span_ctx_stats(&self, span: ValidatedArenaSpan) -> u32 {
-        self.alloc.span_read_u32(span, CTX_STATS)
-    }
-
-    #[inline(always)]
-    fn span_one_sym(&self, span: ValidatedArenaSpan) -> u8 {
-        self.alloc.span_read_u8(span, CTX_ONE_SYM)
-    }
-
-    #[inline(always)]
-    fn span_one_freq(&self, span: ValidatedArenaSpan) -> u8 {
-        self.alloc.span_read_u8(span, CTX_ONE_FREQ)
-    }
-
-    #[inline(always)]
-    fn span_one_succ(&self, span: ValidatedArenaSpan) -> u32 {
-        self.alloc.span_read_u32(span, CTX_ONE_SUCC)
-    }
-
-    #[inline(always)]
-    fn span_set_one_freq(&mut self, span: ValidatedArenaSpan, value: u8) {
-        self.alloc.span_write_u8(span, CTX_ONE_FREQ, value);
-    }
-
-    #[inline(always)]
-    fn span_state_sym(&self, span: ValidatedArenaSpan, index: usize) -> u8 {
-        self.alloc
-            .span_read_u8(span, index * STATE_SIZE + STATE_SYM)
-    }
-
-    #[inline(always)]
-    fn span_state_freq(&self, span: ValidatedArenaSpan, index: usize) -> u8 {
-        self.alloc
-            .span_read_u8(span, index * STATE_SIZE + STATE_FREQ)
-    }
-
-    #[inline(always)]
-    fn span_state_succ(&self, span: ValidatedArenaSpan, index: usize) -> u32 {
-        self.alloc
-            .span_read_u32(span, index * STATE_SIZE + STATE_SUCC)
-    }
-
-    #[inline(always)]
-    fn span_set_state_freq(&mut self, span: ValidatedArenaSpan, index: usize, value: u8) {
-        self.alloc
-            .span_write_u8(span, index * STATE_SIZE + STATE_FREQ, value);
-    }
-
-    #[inline(always)]
-    fn span_set_state_sym(&mut self, span: ValidatedArenaSpan, index: usize, value: u8) {
-        self.alloc
-            .span_write_u8(span, index * STATE_SIZE + STATE_SYM, value);
-    }
-
-    #[inline(always)]
-    fn span_set_state_succ(&mut self, span: ValidatedArenaSpan, index: usize, value: u32) {
-        self.alloc
-            .span_write_u32(span, index * STATE_SIZE + STATE_SUCC, value);
-    }
-
-    #[inline(always)]
-    fn span_write_state(
-        &mut self,
-        span: ValidatedArenaSpan,
-        index: usize,
-        symbol: u8,
-        frequency: u8,
-        successor: u32,
-    ) {
-        let relative = index * STATE_SIZE;
-        let head = u16::from(symbol) | (u16::from(frequency) << 8);
-        self.alloc.span_write_u16(span, relative, head);
-        self.alloc
-            .span_write_u32(span, relative + STATE_SUCC, successor);
-    }
-
-    #[inline(always)]
-    fn span_copy_state(&mut self, span: ValidatedArenaSpan, dst: usize, src: usize) {
-        let head = self.alloc.span_read_u16(span, src * STATE_SIZE);
-        let successor = self
-            .alloc
-            .span_read_u32(span, src * STATE_SIZE + STATE_SUCC);
-        self.alloc.span_write_u16(span, dst * STATE_SIZE, head);
-        self.alloc
-            .span_write_u32(span, dst * STATE_SIZE + STATE_SUCC, successor);
-    }
-
-    #[inline(always)]
-    fn span_swap_states(&mut self, span: ValidatedArenaSpan, a: usize, b: usize) {
-        let a_head = self.alloc.span_read_u16(span, a * STATE_SIZE);
-        let a_successor = self.alloc.span_read_u32(span, a * STATE_SIZE + STATE_SUCC);
-        let b_head = self.alloc.span_read_u16(span, b * STATE_SIZE);
-        let b_successor = self.alloc.span_read_u32(span, b * STATE_SIZE + STATE_SUCC);
-        self.alloc.span_write_u16(span, a * STATE_SIZE, b_head);
-        self.alloc
-            .span_write_u32(span, a * STATE_SIZE + STATE_SUCC, b_successor);
-        self.alloc.span_write_u16(span, b * STATE_SIZE, a_head);
-        self.alloc
-            .span_write_u32(span, b * STATE_SIZE + STATE_SUCC, a_successor);
-    }
-
-    #[inline(always)]
-    fn span_set_ctx_num_stats(&mut self, span: ValidatedArenaSpan, value: u16) {
-        self.alloc.span_write_u16(span, CTX_NUM_STATS, value);
-    }
-
-    #[inline(always)]
-    fn span_set_ctx_summ_freq(&mut self, span: ValidatedArenaSpan, value: u16) {
-        self.alloc.span_write_u16(span, CTX_SUMM_FREQ, value);
-    }
-
-    #[inline(always)]
-    fn span_set_ctx_stats(&mut self, span: ValidatedArenaSpan, value: u32) {
-        self.alloc.span_write_u32(span, CTX_STATS, value);
-    }
-
-    #[inline(always)]
-    fn span_set_ctx_suffix(&mut self, span: ValidatedArenaSpan, value: u32) {
-        self.alloc.span_write_u32(span, CTX_SUFFIX, value);
-    }
-
-    #[inline(always)]
-    fn span_set_one_sym(&mut self, span: ValidatedArenaSpan, value: u8) {
-        self.alloc.span_write_u8(span, CTX_ONE_SYM, value);
-    }
-
-    #[inline(always)]
-    fn span_set_one_succ(&mut self, span: ValidatedArenaSpan, value: u32) {
-        self.alloc.span_write_u32(span, CTX_ONE_SUCC, value);
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn ctx_num_stats(&self, ctx: u32) -> u16 {
-        self.alloc.read_u16_at(ctx as usize + CTX_NUM_STATS)
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn ctx_summ_freq(&self, ctx: u32) -> u16 {
-        self.alloc.read_u16_at(ctx as usize + CTX_SUMM_FREQ)
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn ctx_stats(&self, ctx: u32) -> u32 {
-        self.alloc.read_u32_at(ctx as usize + CTX_STATS)
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn set_ctx_stats(&mut self, ctx: u32, val: u32) {
-        self.alloc.write_u32_at(ctx as usize + CTX_STATS, val);
-    }
-
-    // State accessors at arbitrary byte offset.
-    #[cfg(test)]
-    #[inline]
-    fn st_sym(&self, off: u32) -> u8 {
-        self.alloc.read_byte_at(off as usize + STATE_SYM)
-    }
-    #[cfg(test)]
-    #[inline]
-    fn st_freq(&self, off: u32) -> u8 {
-        self.alloc.read_byte_at(off as usize + STATE_FREQ)
-    }
-    /// Check if a successor value is a text pointer.
-    fn is_text_succ(&self, succ: u32) -> bool {
-        succ != 0 && (succ as usize) <= self.alloc.text_position()
-    }
-
-    #[cold]
+    /// `CreateSuccessors`: turns the raw successor of `FoundState` (a
+    /// position in the text) into real contexts, linking them from
+    /// `FoundState` and from the identical raw successors in the suffix
+    /// contexts of `MinContext`. `None` when the arena is full.
     #[inline(never)]
-    fn fail_model(&mut self) -> i32 {
-        self.model_fault = true;
-        -1
-    }
+    fn create_successors(&mut self) -> Option<u32> {
+        let mut c = self.min_context;
+        let fs = self.found_state;
+        let up_branch = self.successor(fs);
+        let fs_sym = self.sym(fs);
+        let mut ps = [0u32; MAX_ORDER];
+        let mut num_ps = 0usize;
 
-    #[cold]
-    #[inline(never)]
-    fn corrupt_model<T>(detail: &'static str) -> Result<T> {
-        Err(Error::CorruptStream { detail })
-    }
-
-    // =======================================================================
-    // Decode entry point
-    // =======================================================================
-
-    /// `DecodeSymbol`: 0-255 on success, -1 at the end marker or on a
-    /// fault (`model_fault` tells the two apart).
-    fn decode_char<R: RangeDecoder>(&mut self, rc: &mut R) -> i32 {
-        let Some(context_span) = self.validated_context(self.min_context) else {
-            return self.fail_model();
-        };
-        let mut active_context_span = context_span;
-        let context_head = self.span_context_head(context_span);
-        let mut active_context_head = context_head;
-        let mut found_span = None;
-
-        let ns = (context_head >> 32) as u16;
-        if ns == 0 || ns > 256 {
-            return self.fail_model();
+        if self.order_fall != 0 {
+            ps[0] = fs;
+            num_ps = 1;
         }
 
-        if ns != 1 {
-            let stats = self.span_ctx_stats(context_span);
-            let Some(states_span) = self.validated_states(stats, ns as usize) else {
-                return self.fail_model();
-            };
-            // Multi-symbol context.
-            if !self.decode_symbol1(rc, context_span, states_span, context_head, &mut found_span) {
-                return -1;
+        loop {
+            let suffix = self.suffix(c);
+            if suffix == 0 {
+                break;
             }
+            c = suffix;
+            let ns = self.num_stats(c);
+            let s = if ns != 1 {
+                self.find_state(self.stats(c), ns, fs_sym)?
+            } else {
+                c + CTX_ONE_STATE
+            };
+            let successor = self.successor(s);
+            if successor != up_branch {
+                // `c` is the real context here.
+                c = successor;
+                if num_ps == 0 {
+                    // A real MAX-order context: nothing to create.
+                    return Some(c);
+                }
+                break;
+            }
+            *ps.get_mut(num_ps)? = s;
+            num_ps += 1;
+        }
+
+        // Every new context has a single symbol whose raw successor is the
+        // next text position after `FoundState`'s.
+        let new_sym = self.a.u8(up_branch) as u32;
+        let up_branch = up_branch + 1;
+
+        let ns = self.num_stats(c);
+        let new_freq = if ns == 1 {
+            self.freq(c + CTX_ONE_STATE)
         } else {
-            // Binary context.
-            if !self.decode_bin_symbol(rc, context_span, context_head, &mut found_span) {
-                return -1;
+            let s = self.find_state(self.stats(c), ns, new_sym)?;
+            let cf = self.freq(s) - 1;
+            let s0 = self.summ_freq(c) - ns - cf;
+            1 + if 2 * cf <= s0 {
+                (5 * cf > s0) as u32
+            } else {
+                // `s0 >= 1` in a consistent model (it counts the escape).
+                (2 * cf + s0 - 1) / (2 * s0).max(1) + 1
             }
-        }
-
-        // Escape loop: walk suffix chain until a symbol is found.
-        let mut validated_suffix: Option<(ValidatedArenaSpan, u64)> = None;
-        while found_span.is_none() {
-            let (decode_context_span, decode_context_head) = loop {
-                self.order_fall += 1;
-                let prev_ctx = self.min_context;
-                debug_assert_eq!(active_context_span.offset(), prev_ctx as usize);
-                let suffix = active_context_head as u32;
-                self.min_context = suffix;
-                if self.min_context == 0 {
-                    return -1;
-                }
-                let (suffix_span, suffix_head) = if let Some((span, head)) = validated_suffix.take()
-                {
-                    if span.offset() != self.min_context as usize {
-                        return self.fail_model();
-                    }
-                    (span, head)
-                } else {
-                    // Validate context pointer.
-                    let Some(span) = self.validated_context(self.min_context) else {
-                        return self.fail_model();
-                    };
-                    (span, self.span_context_head(span))
-                };
-                active_context_span = suffix_span;
-                active_context_head = suffix_head;
-                let ns2 = (suffix_head >> 32) as u16 as u32;
-                if ns2 != self.num_masked {
-                    break (suffix_span, suffix_head);
-                }
-            };
-            if !self.decode_symbol2(
-                rc,
-                decode_context_span,
-                decode_context_head,
-                &mut found_span,
-                &mut validated_suffix,
-            ) {
-                return -1;
-            }
-        }
-
-        let Some(found_span) = found_span else {
-            return self.fail_model();
         };
-        self.next_context(found_span, active_context_span, active_context_head)
+
+        // New single-symbol contexts, from low order to high.
+        while num_ps != 0 {
+            let c1 = self.a.alloc_context()?;
+            self.set_num_stats(c1, 1);
+            self.a.set_u8(c1 + CTX_ONE_STATE + ST_SYMBOL, new_sym as u8);
+            self.a.set_u8(c1 + CTX_ONE_STATE + ST_FREQ, new_freq as u8);
+            self.set_successor(c1 + CTX_ONE_STATE, up_branch);
+            self.set_suffix(c1, c);
+            num_ps -= 1;
+            self.set_successor(ps[num_ps], c1);
+            c = c1;
+        }
+        Some(c)
     }
 
-    /// `NextContext` / `UpdateModel` after a symbol was coded in the
-    /// context `active_context_span`: returns the symbol, or -1 on a model
-    /// fault. Shared by the decoder and the encoder.
-    #[inline(always)]
-    fn next_context(
-        &mut self,
-        found_span: ValidatedArenaSpan,
-        active_context_span: ValidatedArenaSpan,
-        active_context_head: u64,
-    ) -> i32 {
-        let symbol = self.span_state_sym(found_span, 0);
+    /// `UpdateModel`.
+    #[inline(never)]
+    fn update_model(&mut self) {
+        let fs = self.found_state;
+        let fs_sym = self.sym(fs);
+        let mc = self.min_context;
+
+        if self.freq(fs) < MAX_FREQ / 4 && self.suffix(mc) != 0 {
+            // Update the frequency in the suffix context.
+            let c = self.suffix(mc);
+            if self.num_stats(c) == 1 {
+                let s = c + CTX_ONE_STATE;
+                if self.freq(s) < 32 {
+                    self.set_freq(s, self.freq(s) + 1);
+                }
+            } else {
+                let mut s = self.stats(c);
+                if self.sym(s) != fs_sym {
+                    let Some(found) = self.find_state(s, self.num_stats(c), fs_sym) else {
+                        self.restart_model();
+                        return;
+                    };
+                    s = found;
+                    if self.freq(s) >= self.freq(s - STATE_SIZE) {
+                        self.a.swap6(s, s - STATE_SIZE);
+                        s -= STATE_SIZE;
+                    }
+                }
+                if self.freq(s) < MAX_FREQ - 9 {
+                    self.set_freq(s, self.freq(s) + 2);
+                    self.set_summ_freq(c, self.summ_freq(c) + 2);
+                }
+            }
+        }
 
         if self.order_fall == 0 {
-            let succ = self.span_state_succ(found_span, 0);
-            if succ != 0 && !self.is_text_succ(succ) {
-                // Deterministic context jump.
-                // The successor is range-checked before dereference at the
-                // next decode entry, avoiding the same check twice.
-                self.min_context = succ;
-                self.max_context = succ;
-            } else {
-                if !self.update_model(found_span, active_context_span, active_context_head) {
-                    return -1;
-                }
-                if self.esc_count == 0 {
-                    self.clear_mask();
-                }
-            }
+            // MAX-order context: `FoundState`'s successor is raw.
+            let Some(c) = self.create_successors() else {
+                self.restart_model();
+                return;
+            };
+            self.min_context = c;
+            self.max_context = c;
+            self.set_successor(self.found_state, c);
+            return;
+        }
+
+        // NON-MAX-order context.
+        let text = self.a.text;
+        self.a.set_u8(text, fs_sym as u8);
+        let text = text + 1;
+        self.a.text = text;
+        if text >= self.a.units_start {
+            self.restart_model();
+            return;
+        }
+        let mut max_successor = text;
+        let mut min_successor = self.successor(fs);
+
+        if min_successor == 0 {
+            // Only the order-0 context holds null successors: make it raw,
+            // and the next context is the order-0 context again.
+            self.set_successor(fs, max_successor);
+            min_successor = self.min_context;
         } else {
-            if !self.update_model(found_span, active_context_span, active_context_head) {
-                return -1;
+            if min_successor <= max_successor {
+                // A raw successor: create the real contexts.
+                let Some(c) = self.create_successors() else {
+                    self.restart_model();
+                    return;
+                };
+                min_successor = c;
             }
-            if self.esc_count == 0 {
-                self.clear_mask();
+            // `min_successor` is now the real (order + 1) context.
+            self.order_fall -= 1;
+            if self.order_fall == 0 {
+                max_successor = min_successor;
+                self.a.text -= (self.max_context != self.min_context) as u32;
             }
         }
 
-        self.prev_sym = symbol;
-        symbol as i32
+        let mc = self.min_context;
+        let mut c = self.max_context;
+        self.min_context = min_successor;
+        self.max_context = min_successor;
+
+        if c == mc {
+            return;
+        }
+
+        // s0: the pure escape frequency.
+        let ns = self.num_stats(mc);
+        let fs_freq = self.freq(fs);
+        let s0 = self.summ_freq(mc) - ns - (fs_freq - 1);
+
+        while c != mc {
+            let ns1 = self.num_stats(c);
+            let mut sum;
+            if ns1 != 1 {
+                if ns1 & 1 == 0 {
+                    // Grow the state array by one unit.
+                    let old_nu = ns1 >> 1;
+                    let i = u2i(old_nu);
+                    if i != u2i(old_nu + 1) {
+                        let Some(ptr) = self.a.alloc_units(i + 1) else {
+                            self.restart_model();
+                            return;
+                        };
+                        let old_ptr = self.stats(c);
+                        self.a.copy(old_ptr, ptr, old_nu * UNIT_SIZE);
+                        self.a.insert_node(old_ptr, i);
+                        self.set_stats(c, ptr);
+                    }
+                }
+                sum = self.summ_freq(c);
+                // The escape frequency grows by at most 3 here.
+                sum += ((2 * ns1 < ns) as u32)
+                    + 2 * (((4 * ns1 <= ns) as u32) & ((sum <= 8 * ns1) as u32));
+            } else {
+                // The binary context becomes a two-symbol context.
+                let Some(s) = self.a.alloc_units(0) else {
+                    self.restart_model();
+                    return;
+                };
+                let one = c + CTX_ONE_STATE;
+                let mut freq = self.freq(one);
+                let one_sym = self.a.u8(one + ST_SYMBOL);
+                let one_successor = self.successor(one);
+                self.a.set_u8(s + ST_SYMBOL, one_sym);
+                self.set_successor(s, one_successor);
+                self.set_stats(c, s);
+                if freq < MAX_FREQ / 4 - 1 {
+                    freq <<= 1;
+                } else {
+                    freq = MAX_FREQ - 4;
+                }
+                self.set_freq(s, freq);
+                sum = freq + self.init_esc + ((ns > 3) as u32);
+            }
+
+            let s = self.stats(c) + ns1 * STATE_SIZE;
+            let mut cf = 2 * (sum + 6) * fs_freq;
+            let sf = s0 + sum;
+            self.a.set_u8(s + ST_SYMBOL, fs_sym as u8);
+            self.set_num_stats(c, ns1 + 1);
+            self.set_successor(s, max_successor);
+            if cf < 6 * sf {
+                cf = 1 + ((cf > sf) as u32) + ((cf >= 4 * sf) as u32);
+                sum += 3;
+            } else {
+                cf = 4
+                    + ((cf >= 9 * sf) as u32)
+                    + ((cf >= 12 * sf) as u32)
+                    + ((cf >= 15 * sf) as u32);
+                sum += cf;
+            }
+            self.set_summ_freq(c, sum);
+            self.set_freq(s, cf);
+
+            c = self.suffix(c);
+        }
     }
+
+    // ---- Rescale -----------------------------------------------------------
+
+    /// `Rescale`: halves the frequencies of `MinContext`, keeping the states
+    /// sorted, and drops zero-frequency states (possible only in a MAX-order
+    /// context, where `OrderFall == 0`).
+    #[inline(never)]
+    fn rescale(&mut self) {
+        let mc = self.min_context;
+        let stats = self.stats(mc);
+        let mut s = self.found_state;
+
+        // Move the found state to the front.
+        if s != stats {
+            let tmp = self.a.read6(s);
+            while s != stats {
+                let prev = self.a.read6(s - STATE_SIZE);
+                self.a.write6(s, prev);
+                s -= STATE_SIZE;
+            }
+            self.a.write6(s, tmp);
+        }
+
+        let mut sum_freq = self.freq(s);
+        let mut esc_freq = self.summ_freq(mc) - sum_freq;
+        let adder = (self.order_fall != 0) as u32;
+
+        sum_freq = (sum_freq + 4 + adder) >> 1;
+        let num_stats = self.num_stats(mc);
+        self.set_freq(s, sum_freq);
+
+        for _ in 0..num_stats - 1 {
+            s += STATE_SIZE;
+            let mut freq = self.freq(s);
+            esc_freq -= freq;
+            freq = (freq + adder) >> 1;
+            sum_freq += freq;
+            self.set_freq(s, freq);
+            if freq > self.freq(s - STATE_SIZE) {
+                let tmp = self.a.read6(s);
+                let mut s1 = s;
+                loop {
+                    let prev = self.a.read6(s1 - STATE_SIZE);
+                    self.a.write6(s1, prev);
+                    s1 -= STATE_SIZE;
+                    if !(s1 != stats && freq > self.freq(s1 - STATE_SIZE)) {
+                        break;
+                    }
+                }
+                self.a.write6(s1, tmp);
+            }
+        }
+
+        if self.freq(s) == 0 {
+            // Remove the zero-frequency states at the tail.
+            let mut i = 0;
+            while self.freq(s) == 0 {
+                i += 1;
+                s -= STATE_SIZE;
+            }
+            esc_freq += i;
+            let num_stats_new = num_stats - i;
+            self.set_num_stats(mc, num_stats_new);
+            let n0 = (num_stats + 1) >> 1;
+
+            if num_stats_new == 1 {
+                // A single-symbol context.
+                let mut freq = self.freq(stats);
+                loop {
+                    esc_freq >>= 1;
+                    freq = (freq + 1) >> 1;
+                    if esc_freq <= 1 {
+                        break;
+                    }
+                }
+                let one = mc + CTX_ONE_STATE;
+                let state = self.a.read6(stats);
+                self.a.write6(one, state);
+                self.set_freq(one, freq);
+                self.found_state = one;
+                self.a.insert_node(stats, u2i(n0));
+                return;
+            }
+
+            let n1 = (num_stats_new + 1) >> 1;
+            if n0 != n1 {
+                let i0 = u2i(n0);
+                let i1 = u2i(n1);
+                if i0 != i1 {
+                    if self.a.has_free(i1) {
+                        let ptr = self.a.remove_node(i1);
+                        self.set_stats(mc, ptr);
+                        self.a.copy(stats, ptr, n1 * UNIT_SIZE);
+                        self.a.insert_node(stats, i0);
+                    } else {
+                        self.a.split_block(stats, i0, i1);
+                    }
+                }
+            }
+        }
+
+        // Halve the escape frequency.
+        self.set_summ_freq(mc, sum_freq + esc_freq - (esc_freq >> 1));
+        self.found_state = self.stats(mc);
+    }
+
+    // ---- SEE and BinSumm ---------------------------------------------------
+
+    /// `Ppmd7_MakeEscFreq`: the SEE context for the masked context
+    /// `MinContext` and the escape frequency it estimates.
+    #[inline(always)]
+    fn make_esc_freq(&mut self, num_masked: u32) -> (usize, u32) {
+        let mc = self.min_context;
+        let num_stats = self.num_stats(mc);
+        if num_stats != 256 {
+            let non_masked = num_stats - num_masked;
+            let suffix_ns = self.num_stats(self.suffix(mc));
+            // Unsigned, as in `Ppmd7.c`; a consistent model never wraps it
+            // (a suffix holds every symbol of its child).
+            let idx = NS2INDEX[non_masked as usize - 1] as usize * 16
+                + (non_masked < suffix_ns.wrapping_sub(num_stats)) as usize
+                + 2 * (self.summ_freq(mc) < 11 * num_stats) as usize
+                + 4 * (num_masked > non_masked) as usize
+                + self.hi_bits_flag as usize;
+            let esc = self.see.get(idx).take_mean();
+            (idx, esc)
+        } else {
+            (DUMMY, 1)
+        }
+    }
+
+    /// `Ppmd7_GetBinSumm`: the `BinSumm` cell of the binary context
+    /// `MinContext`, setting `HiBitsFlag` from the previous symbol.
+    #[inline(always)]
+    fn bin_summ_index(&mut self) -> (usize, usize) {
+        let mc = self.min_context;
+        let one = mc + CTX_ONE_STATE;
+        let hb3 = hi_bits_flag3(self.sym(self.found_state));
+        let hb4 = hi_bits_flag4(self.sym(one));
+        self.hi_bits_flag = hb3;
+        let suffix_ns = self.num_stats(self.suffix(mc));
+        let col = self.prev_success
+            + ((self.run_length as u32 >> 26) & 0x20)
+            + NS2BS_INDEX[suffix_ns as usize - 1] as u32
+            + hb4
+            + hb3;
+        (self.freq(one) as usize - 1, col as usize)
+    }
+
+    // ---- symbol updates ----------------------------------------------------
+
+    /// `NextContext`.
+    #[inline(always)]
+    fn next_context(&mut self) {
+        let c = self.successor(self.found_state);
+        if self.order_fall == 0 && c >= self.a.units_start {
+            self.min_context = c;
+            self.max_context = c;
+        } else {
+            self.update_model();
+        }
+    }
+
+    /// `Ppmd7_Update1`: a symbol other than the first found in `MinContext`.
+    #[inline(always)]
+    fn update1(&mut self) {
+        let mut s = self.found_state;
+        let freq = self.freq(s) + 4;
+        let mc = self.min_context;
+        self.set_summ_freq(mc, self.summ_freq(mc) + 4);
+        self.set_freq(s, freq);
+        if freq > self.freq(s - STATE_SIZE) {
+            self.a.swap6(s, s - STATE_SIZE);
+            s -= STATE_SIZE;
+            self.found_state = s;
+            if freq > MAX_FREQ {
+                self.rescale();
+            }
+        }
+        self.next_context();
+    }
+
+    /// `Ppmd7_Update1_0`: the first symbol of `MinContext`.
+    #[inline(always)]
+    fn update1_0(&mut self) {
+        let s = self.found_state;
+        let mc = self.min_context;
+        let freq = self.freq(s);
+        let summ_freq = self.summ_freq(mc);
+        self.prev_success = (2 * freq > summ_freq) as u32;
+        self.run_length = self.run_length.wrapping_add(self.prev_success as i32);
+        self.set_summ_freq(mc, summ_freq + 4);
+        let freq = freq + 4;
+        self.set_freq(s, freq);
+        if freq > MAX_FREQ {
+            self.rescale();
+        }
+        self.next_context();
+    }
+
+    /// `Ppmd7_Update2`: a symbol found after an escape.
+    #[inline(always)]
+    fn update2(&mut self) {
+        let s = self.found_state;
+        let freq = self.freq(s) + 4;
+        self.run_length = self.init_rl;
+        let mc = self.min_context;
+        self.set_summ_freq(mc, self.summ_freq(mc) + 4);
+        self.set_freq(s, freq);
+        if freq > MAX_FREQ {
+            self.rescale();
+        }
+        self.update_model();
+    }
+
+    /// `Ppmd7_UpdateBin`: the binary context's symbol was coded.
+    #[inline(always)]
+    fn update_bin(&mut self, s: u32) {
+        let freq = self.freq(s);
+        self.found_state = s;
+        self.prev_success = 1;
+        self.run_length = self.run_length.wrapping_add(1);
+        self.set_freq(s, freq + (freq < 128) as u32);
+        self.next_context();
+    }
+
+    /// Masks the symbols of the states `[stats, last]`, two at a time from
+    /// the front and `last` on its own, as `Ppmd7.c`'s `MASK_SYMBOLS` does.
+    #[inline(always)]
+    fn mask_symbols(&self, char_mask: &mut [u8; 256], last: u32, stats: u32) {
+        char_mask[self.sym(last) as usize] = 0;
+        let mut s2 = stats;
+        while s2 < last {
+            let sym0 = self.sym(s2);
+            let sym1 = self.sym(s2 + STATE_SIZE);
+            s2 += 2 * STATE_SIZE;
+            char_mask[sym0 as usize] = 0;
+            char_mask[sym1 as usize] = 0;
+        }
+    }
+
+    /// Puts the model back as it was when the symbol began, after the
+    /// symbol was abandoned part way down the escape chain (see the module
+    /// documentation).
+    #[cold]
+    fn abandon_symbol(&mut self, order_fall: u32) {
+        self.min_context = self.max_context;
+        self.order_fall = order_fall;
+    }
+
+    // ---- decoding (`Ppmd7Dec.c`) -------------------------------------------
 
     /// Decodes one symbol.
     ///
     /// Returns `Ok(Some(byte))` for a decoded byte and `Ok(None)` for the end
-    /// marker (an escape out of the order-0 context; RAR also reads it as the
-    /// model giving up on a stream it cannot decode). A model whose arena
-    /// pointers or frequencies are inconsistent, or a coder that faulted,
-    /// is [`Error::CorruptStream`]; the model must be restarted before it is
-    /// used again.
+    /// marker (an escape out of the order-0 context) or a count past the
+    /// frequency total, which a valid stream never produces; RAR reads both
+    /// as the model giving up on the block. A coder that faulted is
+    /// [`Error::CorruptStream`]. The model stays consistent either way and
+    /// may be used again.
     #[inline(always)]
     pub fn decode_symbol<R: RangeDecoder>(&mut self, rc: &mut R) -> Result<Option<u8>> {
         let ch = self.decode_char(rc);
         if rc.faulted() {
             // A frequency total outran the coder's range: the stream is
             // corrupt whatever symbol the arithmetic then produced.
-            self.model_fault = false;
-            return Self::corrupt_model("frequency total exceeds the coder's range");
+            return Err(corrupt("frequency total exceeds the coder's range"));
         }
-        if ch < 0 {
-            if core::mem::take(&mut self.model_fault) {
-                return Self::corrupt_model("model pointer or frequency out of bounds");
+        Ok(u8::try_from(ch).ok())
+    }
+
+    /// `Ppmd7z_DecodeSymbol`: the symbol, or -1 (end marker) or -2 (a count
+    /// past the total).
+    #[inline(always)]
+    fn decode_char<R: RangeDecoder>(&mut self, rc: &mut R) -> i32 {
+        let entry_order_fall = self.order_fall;
+        let mut char_mask: [u8; 256];
+        let mc = self.min_context;
+        let ns = self.num_stats(mc);
+
+        if ns != 1 {
+            let mut s = self.stats(mc);
+            let summ_freq = self.summ_freq(mc);
+            let mut count = rc.get_threshold(summ_freq);
+            let hi_cnt = count;
+
+            let freq = self.freq(s);
+            if count < freq {
+                rc.decode(0, freq);
+                self.found_state = s;
+                let sym = self.sym(s);
+                self.update1_0();
+                return sym as i32;
             }
-            Ok(None)
+            count -= freq;
+
+            self.prev_success = 0;
+            for _ in 1..ns {
+                s += STATE_SIZE;
+                let freq = self.freq(s);
+                if count < freq {
+                    rc.decode(hi_cnt - count, freq);
+                    self.found_state = s;
+                    let sym = self.sym(s);
+                    self.update1();
+                    return sym as i32;
+                }
+                count -= freq;
+            }
+
+            if hi_cnt >= summ_freq {
+                self.abandon_symbol(entry_order_fall);
+                return crate::SYM_ERROR;
+            }
+
+            let hi_cnt = hi_cnt - count;
+            rc.decode(hi_cnt, summ_freq - hi_cnt);
+
+            self.hi_bits_flag = hi_bits_flag3(self.sym(self.found_state));
+            char_mask = [u8::MAX; 256];
+            self.mask_symbols(&mut char_mask, s, self.stats(mc));
         } else {
-            Ok(Some(ch as u8))
+            let s = mc + CTX_ONE_STATE;
+            let (row, col) = self.bin_summ_index();
+            let pr = self.bin_summ[row][col] as u32;
+            if rc.decode_bit(pr) == 0 {
+                self.bin_summ[row][col] = (update_prob_1(pr) + (1 << INT_BITS)) as u16;
+                let sym = self.sym(s);
+                self.update_bin(s);
+                return sym as i32;
+            }
+            let pr = update_prob_1(pr);
+            self.bin_summ[row][col] = pr as u16;
+            self.init_esc = EXP_ESCAPE[(pr >> 10) as usize] as u32;
+            char_mask = [u8::MAX; 256];
+            char_mask[self.sym(s) as usize] = 0;
+            self.prev_success = 0;
         }
-    }
-
-    // =======================================================================
-    // decode_bin_symbol (NumStats == 1)
-    // =======================================================================
-
-    fn decode_bin_symbol<R: RangeDecoder>(
-        &mut self,
-        rc: &mut R,
-        context_span: ValidatedArenaSpan,
-        context_head: u64,
-        found_span: &mut Option<ValidatedArenaSpan>,
-    ) -> bool {
-        let ctx = self.min_context;
-        debug_assert_eq!(context_span.offset(), ctx as usize);
-        let symbol = (context_head >> 48) as u8;
-        let freq = (context_head >> 56) as u8;
-        let Some((idx0, idx1)) = self.bin_summ_index(context_head) else {
-            return false;
-        };
-        let bs = self.bin_summ[idx0][idx1];
-
-        if rc.decode_bit(u32::from(bs)) == 0 {
-            self.update_bin_hit(ctx, context_span, freq, (idx0, idx1), found_span);
-            true
-        } else {
-            self.update_bin_escape(symbol, (idx0, idx1), found_span)
-        }
-    }
-
-    /// `Ppmd7_GetBinSumm`: the `BinSumm` cell a binary context codes against,
-    /// setting `HiBitsFlag` from the previous symbol on the way. `None` for
-    /// an inconsistent model (`model_fault` set) or an out-of-range
-    /// probability. Shared by the decoder and the encoder.
-    #[inline(always)]
-    fn bin_summ_index(&mut self, context_head: u64) -> Option<(usize, usize)> {
-        let symbol = (context_head >> 48) as u8;
-        let freq = (context_head >> 56) as u8;
-
-        if self.found_state == 0 {
-            self.model_fault = true;
-            return None;
-        }
-        self.hi_bits_flag = self.hb2_flag[self.prev_sym as usize];
-        let suffix = context_head as u32;
-        if freq == 0 || freq > 128 || suffix == 0 {
-            self.model_fault = true;
-            return None;
-        }
-        let Some(suffix_span) = self.validated_context(suffix) else {
-            self.model_fault = true;
-            return None;
-        };
-        let suffix_ns = (self.span_context_head(suffix_span) >> 32) as u16;
-        if suffix_ns == 0 || suffix_ns > 256 {
-            self.model_fault = true;
-            return None;
-        }
-        let idx1 = self.prev_success as usize
-            + self.ns2_bs_indx[suffix_ns as usize - 1] as usize
-            + self.hi_bits_flag as usize
-            + 2 * self.hb2_flag[symbol as usize] as usize
-            + ((self.run_length >> 26) as usize & 0x20);
-        let idx0 = freq as usize - 1;
-        debug_assert!(idx1 < 64);
-        if self.bin_summ[idx0][idx1] as u32 > BIN_SCALE {
-            return None;
-        }
-        Some((idx0, idx1))
-    }
-
-    /// A binary context's symbol was coded (`UpdateBin` with the `BinSumm`
-    /// raise). Shared by the decoder and the encoder.
-    #[inline(always)]
-    fn update_bin_hit(
-        &mut self,
-        ctx: u32,
-        context_span: ValidatedArenaSpan,
-        freq: u8,
-        (idx0, idx1): (usize, usize),
-        found_span: &mut Option<ValidatedArenaSpan>,
-    ) {
-        let bs = self.bin_summ[idx0][idx1];
-        self.found_state = ctx + CTX_ONE_SYM as u32;
-        *found_span = Some(context_span.subspan(CTX_ONE_SYM, STATE_SIZE));
-        let new_freq = if freq < 128 { freq + 1 } else { freq };
-        self.span_set_one_freq(context_span, new_freq);
-
-        // Update BinSumm: increase probability.
-        let mean = ((bs as u32 + 32) >> 7) as u16;
-        self.bin_summ[idx0][idx1] = bs.wrapping_add(INTERVAL).wrapping_sub(mean);
-
-        self.prev_success = 1;
-        // `RunLength` is only ever compared or shifted (see the `>> 26`
-        // index in `decode_bin_symbol`), so the reference's C `int` overflow
-        // is benign there but trips Rust's overflow checks. A corrupt stream
-        // can hold a binary context for billions of symbols, so saturate
-        // instead of wrapping: a wrap would flip the sign bit and silently
-        // change the `>> 26` bucket.
-        self.run_length = self.run_length.saturating_add(1);
-    }
-
-    /// A binary context escaped: lower `BinSumm`, take `InitEsc` and mask
-    /// the context's symbol. Shared by the decoder and the encoder.
-    #[inline(always)]
-    fn update_bin_escape(
-        &mut self,
-        symbol: u8,
-        (idx0, idx1): (usize, usize),
-        found_span: &mut Option<ValidatedArenaSpan>,
-    ) -> bool {
-        let bs = self.bin_summ[idx0][idx1];
-        let mean = ((bs as u32 + 32) >> 7) as u16;
-        let new_bs = bs.wrapping_sub(mean);
-        let Some(&init_esc) = EXP_ESCAPE.get((new_bs >> 10) as usize) else {
-            return false;
-        };
-        self.bin_summ[idx0][idx1] = new_bs;
-
-        self.init_esc = init_esc;
-        self.num_masked = 1;
-        self.char_mask[symbol as usize] = self.esc_count;
-        self.prev_success = 0;
-        self.found_state = 0;
-        *found_span = None;
-        true
-    }
-
-    // =======================================================================
-    // decode_symbol1 (NumStats > 1)
-    // =======================================================================
-
-    fn decode_symbol1<R: RangeDecoder>(
-        &mut self,
-        rc: &mut R,
-        context_span: ValidatedArenaSpan,
-        states_span: ValidatedArenaSpan,
-        context_head: u64,
-        found_span: &mut Option<ValidatedArenaSpan>,
-    ) -> bool {
-        let ctx = self.min_context;
-        debug_assert_eq!(context_span.offset(), ctx as usize);
-        let ns = (context_head >> 32) as u16 as usize;
-        let sum_freq = (context_head >> 48) as u16 as u32;
-        let stats = self.span_ctx_stats(context_span);
-        debug_assert_eq!(states_span.offset(), stats as usize);
-        debug_assert_eq!(states_span.len(), ns * STATE_SIZE);
-
-        if sum_freq == 0 {
-            self.model_fault = true;
-            return false;
-        }
-        let count = rc.get_threshold(sum_freq);
-        if count >= sum_freq {
-            return false;
-        }
-
-        // Check first symbol.
-        let p0_freq = self.span_state_freq(states_span, 0) as u32;
-        if count < p0_freq {
-            // First symbol matched.
-            let model_valid = self.update1_0(
-                ctx,
-                context_span,
-                states_span,
-                p0_freq,
-                sum_freq,
-                found_span,
-            );
-            rc.decode(0, p0_freq);
-            return model_valid;
-        }
-
-        if self.found_state == 0 {
-            return false;
-        }
-
-        self.prev_success = 0;
-        let mut hi_cnt = p0_freq;
-        let mut remaining = ns - 1;
-        let mut state_index = 1usize;
 
         loop {
-            let p_freq = self.span_state_freq(states_span, state_index) as u32;
-            hi_cnt += p_freq;
-            if hi_cnt > count {
-                // Found a symbol.
-                let low = hi_cnt - p_freq;
-                rc.decode(low, p_freq);
-                return self.update1(
-                    ctx,
-                    context_span,
-                    states_span,
-                    state_index,
-                    p_freq as u8,
-                    found_span,
-                );
-            }
-            remaining -= 1;
-            if remaining == 0 {
-                self.hi_bits_flag = self.hb2_flag[self.prev_sym as usize];
-                self.num_masked = ns as u32;
-                self.found_state = 0;
-                *found_span = None;
-
-                for index in (0..ns).rev() {
-                    let sym = self.span_state_sym(states_span, index);
-                    self.char_mask[sym as usize] = self.esc_count;
+            let mut mc = self.min_context;
+            let num_masked = self.num_stats(mc);
+            loop {
+                self.order_fall += 1;
+                let suffix = self.suffix(mc);
+                if suffix == 0 {
+                    self.abandon_symbol(entry_order_fall);
+                    return crate::SYM_END;
                 }
-
-                let escape_freq = sum_freq - hi_cnt;
-                rc.decode(hi_cnt, escape_freq);
-                return true;
-            }
-            state_index += 1;
-        }
-    }
-
-    /// `Update1_0`: the first state of a multi-symbol context was coded.
-    /// Shared by the decoder and the encoder.
-    #[inline(always)]
-    fn update1_0(
-        &mut self,
-        ctx: u32,
-        context_span: ValidatedArenaSpan,
-        states_span: ValidatedArenaSpan,
-        p0_freq: u32,
-        sum_freq: u32,
-        found_span: &mut Option<ValidatedArenaSpan>,
-    ) -> bool {
-        self.prev_success = if 2 * p0_freq > sum_freq { 1 } else { 0 };
-        // Same saturation rationale as `decode_bin_symbol`; see there.
-        self.run_length = self.run_length.saturating_add(self.prev_success as i32);
-        self.found_state = states_span.offset() as u32;
-        *found_span = Some(states_span.subspan(0, STATE_SIZE));
-
-        // unrar's model.cpp:420-423 stores the wrapped byte into `Freq` but keeps
-        // comparing the un-truncated `int HiCnt` against MAX_FREQ, so a
-        // corrupt state with `Freq >= 252` still rescales.
-        let raised_freq = p0_freq + 4;
-        let new_freq = raised_freq as u8;
-        let needs_rescale = raised_freq > MAX_FREQ as u32;
-        self.span_set_state_freq(states_span, 0, new_freq);
-        self.span_set_ctx_summ_freq(context_span, (sum_freq + 4) as u16);
-
-        let model_valid = !needs_rescale || self.rescale(ctx);
-        if needs_rescale {
-            *found_span = self.validated_state(self.found_state);
-        }
-        model_valid
-    }
-
-    /// update1: increase freq, maintain sorted order, rescale if needed.
-    #[inline(always)]
-    fn update1(
-        &mut self,
-        ctx: u32,
-        context_span: ValidatedArenaSpan,
-        states_span: ValidatedArenaSpan,
-        state_index: usize,
-        state_freq: u8,
-        found_span: &mut Option<ValidatedArenaSpan>,
-    ) -> bool {
-        debug_assert!(state_index < self.span_ctx_num_stats(context_span) as usize);
-        let p = self.span_ctx_stats(context_span) + state_index as u32 * STATE_SIZE as u32;
-        self.found_state = p;
-        let new_freq = state_freq.wrapping_add(4);
-        self.span_set_state_freq(states_span, state_index, new_freq);
-
-        let sf = self.span_ctx_summ_freq(context_span);
-        self.span_set_ctx_summ_freq(context_span, sf.wrapping_add(4));
-
-        let mut found_index = state_index;
-        if state_index > 0 {
-            let prev = p - STATE_SIZE as u32;
-            if new_freq > self.span_state_freq(states_span, state_index - 1) {
-                self.span_swap_states(states_span, state_index, state_index - 1);
-                self.found_state = prev;
-                found_index -= 1;
-                if self.span_state_freq(states_span, state_index - 1) > MAX_FREQ {
-                    let model_valid = self.rescale(ctx);
-                    *found_span = self.validated_state(self.found_state);
-                    return model_valid && found_span.is_some();
+                mc = suffix;
+                if self.num_stats(mc) != num_masked {
+                    break;
                 }
             }
-        }
-        *found_span = Some(states_span.subspan(found_index * STATE_SIZE, STATE_SIZE));
-        true
-    }
 
-    // =======================================================================
-    // decode_symbol2 (masked context decode during escape)
-    // =======================================================================
-
-    fn decode_symbol2<R: RangeDecoder>(
-        &mut self,
-        rc: &mut R,
-        context_span: ValidatedArenaSpan,
-        context_head: u64,
-        found_span: &mut Option<ValidatedArenaSpan>,
-        validated_suffix: &mut Option<(ValidatedArenaSpan, u64)>,
-    ) -> bool {
-        *validated_suffix = None;
-        let ctx = self.min_context;
-        debug_assert_eq!(context_span.offset(), ctx as usize);
-        let ns = (context_head >> 32) as u16 as u32;
-        let stats = self.span_ctx_stats(context_span);
-        let Some(states_span) = self.validated_states(stats, ns as usize) else {
-            self.model_fault = true;
-            return false;
-        };
-        let suffix = context_head as u32;
-        let suffix_data = if ns != 256 {
-            if suffix == 0 {
-                self.model_fault = true;
-                return false;
+            let stats = self.stats(mc);
+            let ns = self.num_stats(mc);
+            let mut s = stats;
+            let odd = ns & 1;
+            let mut hi_cnt =
+                self.freq(s) & char_mask[self.sym(s) as usize] as u32 & 0u32.wrapping_sub(odd);
+            s += odd * STATE_SIZE;
+            for _ in 0..ns / 2 {
+                let sym0 = self.sym(s);
+                let sym1 = self.sym(s + STATE_SIZE);
+                hi_cnt += self.freq(s) & char_mask[sym0 as usize] as u32;
+                hi_cnt += self.freq(s + STATE_SIZE) & char_mask[sym1 as usize] as u32;
+                s += 2 * STATE_SIZE;
             }
-            let Some(span) = self.validated_context(suffix) else {
-                self.model_fault = true;
-                return false;
-            };
-            Some((span, self.span_context_head(span)))
-        } else {
-            None
-        };
-        let Some(diff) = ns.checked_sub(self.num_masked) else {
-            return false;
-        };
-        if diff == 0 {
-            return false;
-        }
+            self.min_context = mc;
 
-        // makeEscFreq2
-        let suffix_ns = suffix_data.map_or(0, |(_, head)| (head >> 32) as u16 as u32);
-        // `Suffix->NumStats-NumStats` in unrar's model.cpp:474 is signed int arithmetic:
-        // a suffix with fewer stats than this context is not a fault, it just
-        // makes `Diff < Suffix->NumStats-NumStats` false. Only an out-of-range
-        // stat count is rejected.
-        if ns != 256 && suffix_ns > 256 {
-            self.model_fault = true;
-            return false;
-        }
-        let (esc_freq, see_index) = self.make_esc_freq2(context_head, suffix_ns, diff);
-        let n = diff as usize;
+            let (see, esc_freq) = self.make_esc_freq(num_masked);
+            let freq_sum = esc_freq + hi_cnt;
+            let mut count = rc.get_threshold(freq_sum);
 
-        // Two passes, like 7-Zip's Ppmd7: the first only sums the unmasked
-        // frequencies, and the states are walked again only to select the
-        // decoded one or to mask them on escape. The walk has no
-        // data-dependent branch (whether a symbol is masked is close to a
-        // coin flip on escape-heavy input).
-        let mut hi_cnt = 0u32;
-        let esc_count = self.esc_count;
-        let alloc = &self.alloc;
-        let char_mask = &self.char_mask;
-        let mut found = 0usize;
-        for state_index in 0..ns as usize {
-            let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-            let unmasked = char_mask[head as u8 as usize] != esc_count;
-            hi_cnt += u32::from(head >> 8) & 0u32.wrapping_sub(u32::from(unmasked));
-            found += usize::from(unmasked);
-        }
-        // A consistent model has exactly `ns - num_masked` unmasked states.
-        // A corrupt one keeps the reference's shape: too few is a failed
-        // decode, and with too many only the first `n` count, so that case
-        // gathers them into the scratch array.
-        let consistent = found == n;
-        if !consistent {
-            if found < n {
-                return false;
-            }
-            let scratch = &mut self.unmasked_scratch;
-            let mut kept = 0usize;
-            for state_index in 0..ns as usize {
-                let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-                if char_mask[head as u8 as usize] != esc_count {
-                    scratch[kept] = pack_unmasked_state(state_index, head);
-                    kept += 1;
-                    if kept == n {
-                        break;
-                    }
-                }
-            }
-            hi_cnt = scratch[..n]
-                .iter()
-                .map(|&packed| u32::from(unmasked_state_frequency(packed)))
-                .sum();
-        }
-        let scale = esc_freq + hi_cnt;
-        let count = rc.get_threshold(scale);
-        if count >= scale {
-            return false;
-        }
-
-        if count < hi_cnt {
-            // Symbol found among unmasked. `count < hi_cnt` guarantees a
-            // selection: the unmasked frequencies sum to `hi_cnt`.
-            let mut selected = None;
-            if consistent {
-                let mut rest = count;
-                for state_index in 0..ns as usize {
-                    let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-                    let unmasked = char_mask[head as u8 as usize] != esc_count;
-                    let freq = u32::from(head >> 8) & 0u32.wrapping_sub(u32::from(unmasked));
-                    if rest < freq {
-                        selected = Some((state_index, (head >> 8) as u8, count - rest));
-                        break;
-                    }
-                    rest -= freq;
-                }
-            } else {
-                let mut cum = 0u32;
-                for &packed in &self.unmasked_scratch[..n] {
-                    let state_index = unmasked_state_index(packed);
-                    let state_freq = unmasked_state_frequency(packed);
-                    let freq = state_freq as u32;
-                    cum += freq;
-                    if cum > count {
-                        selected = Some((state_index, state_freq, cum - freq));
-                        break;
-                    }
-                }
-            }
-            if let Some((state_index, state_freq, low)) = selected {
-                rc.decode(low, u32::from(state_freq));
-                // SEE update (success).
-                self.see_update_success(see_index);
-                return self.update2(
-                    ctx,
-                    context_span,
-                    states_span,
-                    state_index,
-                    state_freq,
-                    found_span,
-                );
-            }
-        }
-
-        // Escape again.
-        rc.decode(hi_cnt, esc_freq);
-
-        // SEE update (escape): add scale to summ.
-        self.see_update_escape(see_index, scale);
-
-        // Mask remaining unmasked symbols. In a consistent model every state
-        // is either already masked or one of them, so stamping all of them
-        // is the same and needs no mask check.
-        let char_mask = &mut self.char_mask;
-        if consistent {
-            for state_index in 0..ns as usize {
-                let sym = self
-                    .alloc
-                    .span_read_u8(states_span, state_index * STATE_SIZE + STATE_SYM);
-                char_mask[sym as usize] = esc_count;
-            }
-        } else {
-            for &packed in &self.unmasked_scratch[..n] {
-                let sym = unmasked_state_symbol(packed);
-                char_mask[sym as usize] = esc_count;
-            }
-        }
-        self.num_masked = ns;
-        *validated_suffix = suffix_data;
-
-        true // escape: FoundState stays NULL and decode_char continues down the suffix chain
-    }
-
-    #[inline(always)]
-    fn make_esc_freq2(
-        &mut self,
-        context_head: u64,
-        suffix_ns: u32,
-        diff: u32,
-    ) -> (u32, Option<(usize, usize)>) {
-        let ns = (context_head >> 32) as u16 as u32;
-        if ns != 256 {
-            debug_assert!((1..=256).contains(&diff));
-            let sf = (context_head >> 48) as u16 as u32;
-            let idx0 = self.ns2_indx[diff as usize - 1] as usize;
-            // Signed, like model.cpp:474 — `suffix_ns < ns` yields a negative
-            // right-hand side and the comparison is simply false.
-            let suffix_excess = i64::from(suffix_ns) - i64::from(ns);
-            let idx1 = (if i64::from(diff) < suffix_excess {
-                1
-            } else {
-                0
-            }) + (if sf < 11 * ns { 2 } else { 0 })
-                + (if self.num_masked > diff { 4 } else { 0 })
-                + self.hi_bits_flag as usize;
-            let see_ctx = self.see.get(idx0, idx1);
-            (see_ctx.get_mean(), Some((idx0, idx1)))
-        } else {
-            (1, None)
-        }
-    }
-
-    #[inline(always)]
-    fn see_update_success(&mut self, see_index: Option<(usize, usize)>) {
-        if let Some((idx0, idx1)) = see_index {
-            self.see.get(idx0, idx1).update();
-        }
-    }
-
-    #[inline(always)]
-    fn see_update_escape(&mut self, see_index: Option<(usize, usize)>, scale: u32) {
-        if let Some((idx0, idx1)) = see_index {
-            let see = self.see.get(idx0, idx1);
-            see.summ = see.summ.wrapping_add(scale as u16);
-        } else {
-            let dummy = self.see.get_dummy();
-            dummy.summ = dummy.summ.wrapping_add(scale as u16);
-        }
-    }
-
-    /// update2: set FoundState, increase freq, maybe rescale.
-    #[inline(always)]
-    fn update2(
-        &mut self,
-        ctx: u32,
-        context_span: ValidatedArenaSpan,
-        states_span: ValidatedArenaSpan,
-        state_index: usize,
-        freq: u8,
-        found_span: &mut Option<ValidatedArenaSpan>,
-    ) -> bool {
-        debug_assert!(state_index < self.span_ctx_num_stats(context_span) as usize);
-        let p = self.span_ctx_stats(context_span) + state_index as u32 * STATE_SIZE as u32;
-        self.found_state = p;
-        let new_freq = freq.wrapping_add(4);
-        self.span_set_state_freq(states_span, state_index, new_freq);
-
-        let sf = self.span_ctx_summ_freq(context_span);
-        self.span_set_ctx_summ_freq(context_span, sf.wrapping_add(4));
-        if new_freq > MAX_FREQ {
-            if !self.rescale(ctx) {
-                return false;
-            }
-            *found_span = self.validated_state(self.found_state);
-            if found_span.is_none() {
-                self.model_fault = true;
-                return false;
-            }
-        } else {
-            *found_span = Some(states_span.subspan(state_index * STATE_SIZE, STATE_SIZE));
-        }
-        self.esc_count = self.esc_count.wrapping_add(1);
-        self.run_length = self.init_rl;
-        true
-    }
-
-    // =======================================================================
-    // rescale
-    // =======================================================================
-
-    fn rescale(&mut self, ctx: u32) -> bool {
-        let Some(context_span) = self.validated_context(ctx) else {
-            self.model_fault = true;
-            return false;
-        };
-        let old_ns = self.span_ctx_num_stats(context_span) as usize;
-        let stats = self.span_ctx_stats(context_span);
-        let Some(states_span) = self.validated_states(stats, old_ns) else {
-            self.model_fault = true;
-            return false;
-        };
-        let adder: u8 = if self.order_fall != 0 { 1 } else { 0 };
-
-        // Move FoundState to front.
-        let Some(found_delta) = self.found_state.checked_sub(stats) else {
-            self.model_fault = true;
-            return false;
-        };
-        if !(found_delta as usize).is_multiple_of(STATE_SIZE) {
-            self.model_fault = true;
-            return false;
-        }
-        let mut found_index = found_delta as usize / STATE_SIZE;
-        if found_index >= old_ns {
-            self.model_fault = true;
-            return false;
-        }
-        while found_index != 0 {
-            self.span_swap_states(states_span, found_index, found_index - 1);
-            found_index -= 1;
-        }
-
-        // Boost first state.
-        let f0 = self.span_state_freq(states_span, 0);
-        let new_f0 = f0.wrapping_add(4);
-        self.span_set_state_freq(states_span, 0, new_f0);
-        let sf0 = self.span_ctx_summ_freq(context_span);
-        self.span_set_ctx_summ_freq(context_span, sf0.wrapping_add(4));
-
-        // Halve frequencies, accumulate escape frequency.
-        let mut esc_freq = self.span_ctx_summ_freq(context_span) as i32
-            - self.span_state_freq(states_span, 0) as i32;
-        let first_freq = ((self.span_state_freq(states_span, 0) as u16 + adder as u16) >> 1) as u8;
-        self.span_set_state_freq(states_span, 0, first_freq);
-        self.span_set_ctx_summ_freq(context_span, first_freq as u16);
-
-        for state_index in 1..old_ns {
-            esc_freq -= self.span_state_freq(states_span, state_index) as i32;
-            let halved =
-                ((self.span_state_freq(states_span, state_index) as u16 + adder as u16) >> 1) as u8;
-            self.span_set_state_freq(states_span, state_index, halved);
-            let summ = self.span_ctx_summ_freq(context_span);
-            self.span_set_ctx_summ_freq(context_span, summ.wrapping_add(halved as u16));
-
-            // Maintain sorted order.
-            if halved > self.span_state_freq(states_span, state_index - 1) {
-                // Bubble up.
-                let tmp_sym = self.span_state_sym(states_span, state_index);
-                let tmp_freq = halved;
-                let tmp_succ = self.span_state_succ(states_span, state_index);
-                let mut dst = state_index;
+            if count < hi_cnt {
+                let mut s = stats;
+                let hi = count;
                 loop {
-                    self.span_copy_state(states_span, dst, dst - 1);
-                    dst -= 1;
-                    if dst == 0 || tmp_freq <= self.span_state_freq(states_span, dst - 1) {
+                    let f = self.freq(s) & char_mask[self.sym(s) as usize] as u32;
+                    if count < f {
                         break;
                     }
+                    count -= f;
+                    s += STATE_SIZE;
                 }
-                self.span_set_state_sym(states_span, dst, tmp_sym);
-                self.span_set_state_freq(states_span, dst, tmp_freq);
-                self.span_set_state_succ(states_span, dst, tmp_succ);
+                let freq = self.freq(s);
+                rc.decode(hi - count, freq);
+                self.see.get(see).update();
+                self.found_state = s;
+                let sym = self.sym(s);
+                self.update2();
+                return sym as i32;
+            }
+
+            if count >= freq_sum {
+                self.abandon_symbol(entry_order_fall);
+                return crate::SYM_ERROR;
+            }
+
+            rc.decode(hi_cnt, freq_sum - hi_cnt);
+            // `see.summ` grows by every unmasked frequency; it may wrap.
+            let cell = self.see.get(see);
+            cell.summ = cell.summ.wrapping_add(freq_sum as u16);
+
+            let end = stats + ns * STATE_SIZE;
+            let mut s = stats;
+            while s < end {
+                char_mask[self.sym(s) as usize] = 0;
+                s += STATE_SIZE;
             }
         }
-
-        // Remove zero-frequency states.
-        let mut last_index = old_ns - 1;
-        if self.span_state_freq(states_span, last_index) == 0 {
-            let mut zero_count = 0usize;
-            while self.span_state_freq(states_span, last_index) == 0 && last_index > 0 {
-                zero_count += 1;
-                last_index -= 1;
-            }
-            if self.span_state_freq(states_span, last_index) == 0 {
-                zero_count += 1;
-            }
-            esc_freq += zero_count as i32;
-            let new_ns = (old_ns - zero_count) as u16;
-            self.span_set_ctx_num_stats(context_span, new_ns);
-            if new_ns == 0 || esc_freq < 0 {
-                self.model_fault = true;
-                return false;
-            }
-
-            if new_ns == 1 {
-                // Collapse to single-state (OneState) context.
-                let tmp_sym = self.span_state_sym(states_span, 0);
-                let tmp_freq = self.span_state_freq(states_span, 0);
-                let tmp_succ = self.span_state_succ(states_span, 0);
-
-                // Halve freq until escape is small.
-                let mut tf = tmp_freq;
-                let mut ef = esc_freq;
-                loop {
-                    tf -= tf >> 1;
-                    ef >>= 1;
-                    if ef <= 1 {
-                        break;
-                    }
-                }
-
-                // Free the stats array.
-                self.alloc.free_units(off_to_ref(stats), (old_ns + 1) >> 1);
-
-                // Write OneState inline.
-                self.span_set_one_sym(context_span, tmp_sym);
-                self.span_set_one_freq(context_span, tf);
-                self.span_set_one_succ(context_span, tmp_succ);
-                self.found_state = ctx + CTX_ONE_SYM as u32;
-                return true;
-            }
-        }
-
-        if esc_freq < 0 {
-            self.model_fault = true;
-            return false;
-        }
-        let esc_freq = esc_freq as u16;
-        let summ = self.span_ctx_summ_freq(context_span);
-        self.span_set_ctx_summ_freq(
-            context_span,
-            summ.wrapping_add(esc_freq.wrapping_sub(esc_freq >> 1)),
-        );
-
-        // Shrink stats array if needed.
-        let n0 = (old_ns + 1) >> 1;
-        let new_ns = self.span_ctx_num_stats(context_span) as usize;
-        if new_ns == 0 {
-            self.model_fault = true;
-            return false;
-        }
-        let n1 = (new_ns + 1) >> 1;
-        let mut new_stats = stats;
-        if n0 != n1 {
-            new_stats = ref_to_off(self.alloc.shrink_units(off_to_ref(stats), n0, n1));
-            self.span_set_ctx_stats(context_span, new_stats);
-        }
-        self.found_state = new_stats;
-        if self.validated_state(new_stats).is_none() {
-            self.model_fault = true;
-            return false;
-        }
-        true
-    }
-
-    // =======================================================================
-    // UpdateModel
-    // =======================================================================
-
-    #[inline(never)]
-    fn update_model(
-        &mut self,
-        found_span: ValidatedArenaSpan,
-        min_context_span: ValidatedArenaSpan,
-        min_context_head: u64,
-    ) -> bool {
-        debug_assert_eq!(min_context_span.offset(), self.min_context as usize);
-        let fs_sym = self.span_state_sym(found_span, 0);
-        let fs_freq = self.span_state_freq(found_span, 0);
-        let fs_succ = self.span_state_succ(found_span, 0);
-
-        // Update suffix context frequencies.
-        let suffix = min_context_head as u32;
-        if fs_freq < MAX_FREQ / 4 && suffix != 0 {
-            let Some(suffix_span) = self.validated_context(suffix) else {
-                self.model_fault = true;
-                return false;
-            };
-            let sns = self.span_ctx_num_stats(suffix_span);
-            if sns != 1 {
-                // Find fs_sym in suffix stats.
-                let s_stats = self.span_ctx_stats(suffix_span);
-                let Some(suffix_states) = self.validated_states(s_stats, sns as usize) else {
-                    self.model_fault = true;
-                    return false;
-                };
-                let mut state_index = 0usize;
-                if self.span_state_sym(suffix_states, state_index) != fs_sym {
-                    let Some(found_index) =
-                        self.span_find_state_from(suffix_states, 1, sns as usize, fs_sym)
-                    else {
-                        self.model_fault = true;
-                        return false;
-                    };
-                    state_index = found_index;
-                    // Swap with predecessor if freq is higher.
-                    if self.span_state_freq(suffix_states, state_index)
-                        >= self.span_state_freq(suffix_states, state_index - 1)
-                    {
-                        self.span_swap_states(suffix_states, state_index, state_index - 1);
-                        state_index -= 1;
-                    }
-                }
-                if self.span_state_freq(suffix_states, state_index) < MAX_FREQ - 9 {
-                    let f = self.span_state_freq(suffix_states, state_index) + 2;
-                    self.span_set_state_freq(suffix_states, state_index, f);
-                    let sf = self.span_ctx_summ_freq(suffix_span);
-                    self.span_set_ctx_summ_freq(suffix_span, sf.wrapping_add(2));
-                }
-                let p = s_stats + state_index as u32 * STATE_SIZE as u32;
-                self.do_update_model_core(found_span, min_context_span, fs_sym, fs_freq, fs_succ, p)
-            } else {
-                // Suffix is binary context.
-                let f = self.span_one_freq(suffix_span);
-                if f < 32 {
-                    self.span_set_one_freq(suffix_span, f + 1);
-                }
-                self.do_update_model_core(
-                    found_span,
-                    min_context_span,
-                    fs_sym,
-                    fs_freq,
-                    fs_succ,
-                    suffix + CTX_ONE_SYM as u32,
-                )
-            }
-        } else {
-            self.do_update_model_core(found_span, min_context_span, fs_sym, fs_freq, fs_succ, 0)
-        }
-    }
-
-    /// Core of UpdateModel after suffix freq update.
-    /// `p1` is the state offset in the suffix context (0 if none).
-    #[inline(never)]
-    fn do_update_model_core(
-        &mut self,
-        found_span: ValidatedArenaSpan,
-        min_context_span: ValidatedArenaSpan,
-        fs_sym: u8,
-        fs_freq: u8,
-        fs_succ: u32,
-        p1: u32,
-    ) -> bool {
-        let mut next_min_context = fs_succ;
-
-        if self.order_fall == 0 {
-            // No escape: create successors.
-            let new_ctx = self.create_successors(found_span, min_context_span, true, p1);
-            if new_ctx == 0 {
-                if self.model_fault {
-                    return false;
-                }
-                self.restart_model();
-                self.esc_count = 0;
-                return true;
-            }
-            self.min_context = new_ctx;
-            self.max_context = new_ctx;
-            // Update found state's successor.
-            self.span_set_state_succ(found_span, 0, new_ctx);
-            return true;
-        }
-
-        // OrderFall > 0: store symbol in text region and propagate.
-        self.alloc.write_text_byte(fs_sym);
-        let successor = self.alloc.text_position() as u32;
-        if self.alloc.text_exhausted() {
-            self.restart_model();
-            self.esc_count = 0;
-            return true;
-        }
-
-        let final_succ;
-        if fs_succ != 0 {
-            // Existing successor — may need to create real contexts from text chain.
-            if self.is_text_succ(fs_succ) {
-                let new_succ = self.create_successors(found_span, min_context_span, false, p1);
-                if new_succ == 0 {
-                    if self.model_fault {
-                        return false;
-                    }
-                    self.restart_model();
-                    self.esc_count = 0;
-                    return true;
-                }
-                self.span_set_state_succ(found_span, 0, new_succ);
-                next_min_context = new_succ;
-            }
-            self.order_fall -= 1;
-            if self.order_fall == 0 {
-                final_succ = self.span_state_succ(found_span, 0);
-                if self.max_context != self.min_context {
-                    self.alloc.text_dec();
-                }
-            } else {
-                final_succ = successor;
-            }
-        } else {
-            // No successor yet: set text pointer as successor.
-            self.span_set_state_succ(found_span, 0, successor);
-            final_succ = successor;
-            // fs.Successor becomes the current MinContext even though the live
-            // FoundState successor now points into the text buffer.
-            next_min_context = self.min_context;
-        }
-
-        let min_ctx = self.min_context;
-        debug_assert_eq!(min_context_span.offset(), min_ctx as usize);
-        let ns = self.span_ctx_num_stats(min_context_span) as u32;
-        let s0 = (self.span_ctx_summ_freq(min_context_span) as u32)
-            .wrapping_sub(ns)
-            .wrapping_sub(fs_freq as u32)
-            .wrapping_add(1);
-
-        let mut pc = self.max_context;
-        while pc != min_ctx {
-            let Some(context_span) = self.validated_context(pc) else {
-                self.model_fault = true;
-                return false;
-            };
-            let ns1 = self.span_ctx_num_stats(context_span) as u32;
-            if ns1 == 0 || ns1 > 256 {
-                self.model_fault = true;
-                return false;
-            }
-
-            let states_span = if ns1 != 1 {
-                // Multi-symbol context: expand stats array if needed.
-                let old_stats = self.span_ctx_stats(context_span);
-                let stats = if (ns1 & 1) == 0 {
-                    let new_stats = self
-                        .alloc
-                        .expand_units(off_to_ref(old_stats), (ns1 >> 1) as usize);
-                    if new_stats.is_null() {
-                        self.restart_model();
-                        self.esc_count = 0;
-                        return true;
-                    }
-                    let stats = ref_to_off(new_stats);
-                    self.span_set_ctx_stats(context_span, stats);
-                    stats
-                } else {
-                    old_stats
-                };
-                let Some(states_span) = self.validated_states(stats, ns1 as usize + 1) else {
-                    self.model_fault = true;
-                    return false;
-                };
-                // Adjust SummFreq.
-                let sf = self.span_ctx_summ_freq(context_span) as u32;
-                let adj = (if 2 * ns1 < ns { 1u32 } else { 0 })
-                    + 2 * (if 4 * ns1 <= ns && sf <= 8 * ns1 { 1 } else { 0 });
-                self.span_set_ctx_summ_freq(context_span, (sf + adj) as u16);
-                states_span
-            } else {
-                // Single-state: promote to multi-state.
-                let os_sym = self.span_one_sym(context_span);
-                let os_freq = self.span_one_freq(context_span);
-                let os_succ = self.span_one_succ(context_span);
-                let new_stats_ref = self.alloc.alloc_units(1);
-                if new_stats_ref.is_null() {
-                    self.restart_model();
-                    self.esc_count = 0;
-                    return true;
-                }
-                let new_stats = ref_to_off(new_stats_ref);
-                // Copy OneState to the new stats array.
-                let Some(new_states_span) = self.validated_states(new_stats, 2) else {
-                    self.model_fault = true;
-                    return false;
-                };
-                self.span_write_state(new_states_span, 0, os_sym, os_freq, os_succ);
-                self.span_set_ctx_stats(context_span, new_stats);
-                let adj_freq = if os_freq < MAX_FREQ / 4 - 1 {
-                    os_freq * 2
-                } else {
-                    MAX_FREQ - 4
-                };
-                self.span_set_state_freq(new_states_span, 0, adj_freq);
-                self.span_set_ctx_summ_freq(
-                    context_span,
-                    adj_freq as u16 + self.init_esc as u16 + if ns > 3 { 1 } else { 0 },
-                );
-                new_states_span
-            };
-
-            // Compute new state's frequency.
-            let sf_pc = self.span_ctx_summ_freq(context_span) as u32;
-            let cf = 2 * fs_freq as u32 * (sf_pc + 6);
-            let sf = s0 + sf_pc;
-            let new_freq;
-            if cf < 6 * sf {
-                new_freq = 1 + (if cf > sf { 1 } else { 0 }) + (if cf >= 4 * sf { 1 } else { 0 });
-                let new_sf = sf_pc + 3;
-                self.span_set_ctx_summ_freq(context_span, new_sf as u16);
-            } else {
-                new_freq = 4
-                    + (if cf >= 9 * sf { 1 } else { 0 })
-                    + (if cf >= 12 * sf { 1 } else { 0 })
-                    + (if cf >= 15 * sf { 1 } else { 0 });
-                let new_sf = sf_pc + new_freq;
-                self.span_set_ctx_summ_freq(context_span, new_sf as u16);
-            }
-
-            self.span_write_state(
-                states_span,
-                ns1 as usize,
-                fs_sym,
-                new_freq as u8,
-                final_succ,
-            );
-            self.span_set_ctx_num_stats(context_span, (ns1 + 1) as u16);
-
-            pc = self.span_ctx_suffix(context_span);
-        }
-
-        self.max_context = next_min_context;
-        self.min_context = next_min_context;
-        true
-    }
-
-    // =======================================================================
-    // CreateSuccessors
-    // =======================================================================
-
-    #[inline(never)]
-    fn create_successors(
-        &mut self,
-        found_span: ValidatedArenaSpan,
-        min_context_span: ValidatedArenaSpan,
-        skip: bool,
-        p1: u32,
-    ) -> u32 {
-        debug_assert_eq!(min_context_span.offset(), self.min_context as usize);
-        let up_branch = self.span_state_succ(found_span, 0);
-        let found_sym = self.span_state_sym(found_span, 0);
-        let min_suffix = self.span_ctx_suffix(min_context_span);
-
-        let mut pc = self.min_context;
-        let mut ps = [found_span.compact(); MAX_ORDER];
-        let mut ps_len = 0usize;
-
-        if !skip {
-            ps[ps_len] = found_span.compact();
-            ps_len += 1;
-            if min_suffix == 0 {
-                // NO_LOOP
-                return self.finish_create_successors(&ps[..ps_len], pc, up_branch);
-            }
-        }
-
-        if p1 != 0 {
-            // p1 provided: use it and start from suffix.
-            pc = min_suffix;
-            let Some(p1_span) = self.validated_state(p1) else {
-                self.model_fault = true;
-                return 0;
-            };
-            let p1_succ = self.span_state_succ(p1_span, 0);
-            // Check if p1's successor matches up_branch.
-            if p1_succ != up_branch {
-                pc = p1_succ;
-                return self.finish_create_successors(&ps[..ps_len], pc, up_branch);
-            }
-            if ps_len >= MAX_ORDER {
-                return 0;
-            }
-            ps[ps_len] = p1_span.compact();
-            ps_len += 1;
-            // Fall through to suffix walk.
-            let Some(context_span) = self.validated_context(pc) else {
-                self.model_fault = true;
-                return 0;
-            };
-            let suffix = self.span_ctx_suffix(context_span);
-            if suffix == 0 {
-                // No more suffix to walk.
-                return self.finish_create_successors(&ps[..ps_len], pc, up_branch);
-            }
-            pc = suffix;
-        } else {
-            if min_suffix == 0 {
-                return self.finish_create_successors(&ps[..ps_len], pc, up_branch);
-            }
-            pc = min_suffix;
-        }
-
-        // Walk suffix chain.
-        loop {
-            let Some(context_span) = self.validated_context(pc) else {
-                self.model_fault = true;
-                return 0;
-            };
-            let ns = self.span_ctx_num_stats(context_span);
-            let (p_span, p_succ);
-            if ns != 1 {
-                // Multi-symbol: find our symbol.
-                let stats = self.span_ctx_stats(context_span);
-                let Some(states_span) = self.validated_states(stats, ns as usize) else {
-                    self.model_fault = true;
-                    return 0;
-                };
-                let Some(state_index) = self.span_find_state(states_span, ns as usize, found_sym)
-                else {
-                    self.model_fault = true;
-                    return 0;
-                };
-                p_span = states_span.subspan(state_index * STATE_SIZE, STATE_SIZE);
-                p_succ = self.span_state_succ(states_span, state_index);
-            } else {
-                // Binary context.
-                p_span = context_span.subspan(CTX_ONE_SYM, STATE_SIZE);
-                p_succ = self.span_one_succ(context_span);
-            }
-
-            if p_succ != up_branch {
-                pc = p_succ;
-                break;
-            }
-            if ps_len >= MAX_ORDER {
-                return 0;
-            }
-            ps[ps_len] = p_span.compact();
-            ps_len += 1;
-
-            let suffix = self.span_ctx_suffix(context_span);
-            if suffix == 0 {
-                break;
-            }
-            pc = suffix;
-        }
-
-        self.finish_create_successors(&ps[..ps_len], pc, up_branch)
-    }
-
-    #[inline(always)]
-    fn finish_create_successors(
-        &mut self,
-        ps: &[ValidatedArenaOffset],
-        mut pc: u32,
-        up_branch: u32,
-    ) -> u32 {
-        if ps.is_empty() {
-            return pc;
-        }
-
-        // Read the symbol and successor from the text chain (UpBranch).
-        if up_branch == 0 || !self.is_text_succ(up_branch) {
-            self.model_fault = true;
-            return 0;
-        }
-        let up_sym = self.alloc.read_byte_at(up_branch as usize);
-        let up_succ = up_branch + 1;
-
-        // Determine the frequency for the new state.
-        let Some(context_span) = self.validated_context(pc) else {
-            self.model_fault = true;
-            return 0;
-        };
-        let up_freq;
-        let ns_pc = self.span_ctx_num_stats(context_span);
-        if ns_pc != 1 {
-            let stats = self.span_ctx_stats(context_span);
-            let Some(states_span) = self.validated_states(stats, ns_pc as usize) else {
-                self.model_fault = true;
-                return 0;
-            };
-            let Some(state_index) = self.span_find_state(states_span, ns_pc as usize, up_sym)
-            else {
-                self.model_fault = true;
-                return 0;
-            };
-            let Some(cf) = self
-                .span_state_freq(states_span, state_index)
-                .checked_sub(1)
-                .map(u32::from)
-            else {
-                self.model_fault = true;
-                return 0;
-            };
-            let Some(s0) = (self.span_ctx_summ_freq(context_span) as u32)
-                .checked_sub(ns_pc as u32)
-                .and_then(|summ| summ.checked_sub(cf))
-            else {
-                self.model_fault = true;
-                return 0;
-            };
-            up_freq = if 2 * cf <= s0 {
-                1 + u8::from(5 * cf > s0)
-            } else {
-                if s0 == 0 {
-                    self.model_fault = true;
-                    return 0;
-                }
-                (1 + ((2 * cf + 3 * s0 - 1) / (2 * s0))) as u8
-            };
-        } else {
-            up_freq = self.span_one_freq(context_span);
-        }
-
-        // Create child contexts from ps (in reverse order).
-        for &state_offset in ps.iter().rev() {
-            let state_span = state_offset.span(STATE_SIZE);
-            let child_ref = self.alloc.alloc_context();
-            if child_ref.is_null() {
-                return 0;
-            }
-            let child = ref_to_off(child_ref);
-            let Some(child_span) = self.validated_context(child) else {
-                self.model_fault = true;
-                return 0;
-            };
-
-            self.span_set_ctx_num_stats(child_span, 1);
-            self.span_set_one_sym(child_span, up_sym);
-            self.span_set_one_freq(child_span, up_freq);
-            self.span_set_one_succ(child_span, up_succ);
-            self.span_set_ctx_suffix(child_span, pc);
-            self.span_set_state_succ(state_span, 0, child);
-
-            pc = child;
-        }
-
-        pc
-    }
-
-    /// Find a state with the given symbol in a stats array.
-    #[inline(always)]
-    fn span_find_state(
-        &self,
-        states_span: ValidatedArenaSpan,
-        ns: usize,
-        sym: u8,
-    ) -> Option<usize> {
-        self.span_find_state_from(states_span, 0, ns, sym)
-    }
-
-    #[inline(always)]
-    fn span_find_state_from(
-        &self,
-        states_span: ValidatedArenaSpan,
-        start: usize,
-        ns: usize,
-        sym: u8,
-    ) -> Option<usize> {
-        #[cfg(all(target_arch = "aarch64", not(miri)))]
-        let mut index = start;
-        #[cfg(any(not(target_arch = "aarch64"), miri))]
-        let index = start;
-
-        #[cfg(all(target_arch = "x86_64", not(miri)))]
-        if self.use_ssse3_state_batches {
-            // SAFETY: SSSE3 support was detected once when the model was created.
-            return unsafe { self.span_find_state_from_ssse3(states_span, index, ns, sym) };
-        }
-
-        #[cfg(all(target_arch = "aarch64", not(miri)))]
-        while index + 8 <= ns {
-            let heads = self
-                .alloc
-                .span_read_state_heads8(states_span, index * STATE_SIZE);
-            if let Some(lane) = heads.iter().position(|&head| head as u8 == sym) {
-                return Some(index + lane);
-            }
-            index += 8;
-        }
-
-        (index..ns).find(|&state_index| self.span_state_sym(states_span, state_index) == sym)
-    }
-
-    /// Vector symbol search over whole eight-state batches.
-    ///
-    /// `span_read_state_syms8_ssse3` puts the batch's symbols in lanes 0..8 in
-    /// state order and zeroes lanes 8..16, so comparing against a broadcast of
-    /// the wanted symbol and taking the byte mask gives one bit per state, in
-    /// scan order, in bits 0..8. Bits 8..16 can only be set when `sym == 0`
-    /// (the zeroed upper lanes match), and masking with `0xff` drops them, so
-    /// the lowest set bit is always the first matching state — the same state
-    /// the scalar scan below would return.
-    ///
-    /// The batch threshold stays at "eight states remaining": the broadcast and
-    /// the three shuffle constants hoist out of the loop, leaving about twelve
-    /// instructions per eight states against roughly four per state (and eight
-    /// unpredictable branches) in the scalar scan, so a single full batch
-    /// already pays for the setup.
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    #[target_feature(enable = "ssse3")]
-    #[inline]
-    unsafe fn span_find_state_from_ssse3(
-        &self,
-        states_span: ValidatedArenaSpan,
-        mut index: usize,
-        ns: usize,
-        sym: u8,
-    ) -> Option<usize> {
-        use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_movemask_epi8, _mm_set1_epi8};
-
-        let wanted = _mm_set1_epi8(sym as i8);
-        while index + 8 <= ns {
-            // SAFETY: this function requires SSSE3 and the validated span covers
-            // the complete state batch.
-            let matches = unsafe {
-                let syms = self
-                    .alloc
-                    .span_read_state_syms8_ssse3(states_span, index * STATE_SIZE);
-                _mm_movemask_epi8(_mm_cmpeq_epi8(syms, wanted))
-            } & 0xff;
-            if matches != 0 {
-                return Some(index + matches.trailing_zeros() as usize);
-            }
-            index += 8;
-        }
-
-        (index..ns).find(|&state_index| self.span_state_sym(states_span, state_index) == sym)
-    }
-
-    fn clear_mask(&mut self) {
-        self.esc_count = 1;
-        self.char_mask = [0; 256];
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_model_creation() {
-        let model = Model::new(6, 1 << 20).unwrap();
-        assert_ne!(model.min_context, 0);
-        assert_ne!(model.max_context, 0);
-    }
-
-    #[test]
-    fn test_model_restart() {
-        let mut model = Model::new(6, 1 << 20).unwrap();
-        model.restart();
-        assert_ne!(model.min_context, 0);
-    }
-
-    /// `run_length` is only ever compared or shifted, so the reference's C `int`
-    /// overflow never bites there — but `decode_bin_symbol` shifts it into the
-    /// `bin_summ` row index as `((run_length >> 26) as usize) & 0x20`, and a
-    /// wrap from `i32::MAX` to `i32::MIN` flips that bucket. A corrupt stream can
-    /// hold one binary context long enough to reach the boundary.
-    #[test]
-    fn run_length_saturates_instead_of_flipping_the_bin_summ_bucket() {
-        // The index term as `decode_bin_symbol` computes it.
-        let bucket = |run_length: i32| ((run_length >> 26) as usize) & 0x20;
-
-        let mut model = Model::new(6, 1 << 20).unwrap();
-        model.run_length = i32::MAX;
-        let before = bucket(model.run_length);
-
-        for _ in 0..8 {
-            model.run_length = model.run_length.saturating_add(1);
-            model.run_length = model.run_length.saturating_add(model.prev_success as i32);
-        }
-
-        assert_eq!(model.run_length, i32::MAX);
-        assert_eq!(bucket(model.run_length), before);
-        assert!(
-            before < 64,
-            "the index term must stay inside bin_summ's row"
-        );
-
-        // What saturation is buying: the wrapped value lands in the other
-        // bucket, so a release build would silently decode against different
-        // probabilities rather than panicking as the debug build did.
-        assert_ne!(bucket(i32::MAX.wrapping_add(1)), before);
-    }
-
-    #[test]
-    fn see_index_tolerates_a_suffix_with_fewer_stats_like_rar_behavior() {
-        let mut model = Model::new(6, 1 << 20).unwrap();
-        model.num_masked = 0;
-        model.hi_bits_flag = 0;
-        // ns is packed in bits 32..48 of the context head, SummFreq in 48..64.
-        let context_head = (4u64 << 32) | (1u64 << 48);
-        let diff = 2u32;
-
-        // `Suffix->NumStats-NumStats` is signed in unrar's model.cpp:474, so a suffix
-        // with fewer stats makes the comparison false instead of underflowing.
-        let (_, small_suffix) = model.make_esc_freq2(context_head, 1, diff);
-        let (_, large_suffix) = model.make_esc_freq2(context_head, 200, diff);
-
-        let idx0 = model.ns2_indx[diff as usize - 1] as usize;
-        // sf(1) < 11*ns(4) contributes 2 in both cases; only the first term moves.
-        assert_eq!(small_suffix, Some((idx0, 2)));
-        assert_eq!(large_suffix, Some((idx0, 3)));
-    }
+    use crate::rc::RarRangeDecoder;
 
     /// A deterministic stream of coder bytes (xorshift32), standing in for
     /// arbitrary input.
@@ -2072,10 +1036,93 @@ mod tests {
             .collect()
     }
 
+    impl Model {
+        /// Walks the suffix chain from `MaxContext` and checks the
+        /// invariants the module documentation relies on: distinct symbols,
+        /// each context's symbols a subset of its suffix's, frequencies
+        /// nonzero, the order-0 context full, and `MinContext == MaxContext`
+        /// between symbols.
+        fn check_consistency(&self) {
+            assert_eq!(self.min_context, self.max_context);
+            let mut c = self.max_context;
+            let mut child: Option<[bool; 256]> = None;
+            let mut depth = 0;
+            loop {
+                let ns = self.num_stats(c);
+                assert!((1..=256).contains(&ns), "num_stats {ns}");
+                let mut present = [false; 256];
+                if ns == 1 {
+                    let one = c + CTX_ONE_STATE;
+                    assert!(self.freq(one) >= 1 && self.freq(one) <= 128);
+                    present[self.sym(one) as usize] = true;
+                } else {
+                    let stats = self.stats(c);
+                    let mut sum = 0;
+                    for i in 0..ns {
+                        let s = stats + i * STATE_SIZE;
+                        assert!(!present[self.sym(s) as usize], "duplicate symbol");
+                        present[self.sym(s) as usize] = true;
+                        assert!(self.freq(s) >= 1);
+                        sum += self.freq(s);
+                    }
+                    assert!(sum < self.summ_freq(c), "no room for the escape");
+                }
+                if let Some(child) = child {
+                    for sym in 0..256 {
+                        assert!(!child[sym] || present[sym], "child symbol not in suffix");
+                    }
+                }
+                child = Some(present);
+                let suffix = self.suffix(c);
+                if suffix == 0 {
+                    assert_eq!(ns, 256, "the order-0 context holds every symbol");
+                    break;
+                }
+                c = suffix;
+                depth += 1;
+                assert!(depth <= self.max_order);
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_model_has_the_full_order_0_context() {
+        let model = Model::new(6, 1 << 20).unwrap();
+        let mc = model.min_context;
+        assert_eq!(model.num_stats(mc), 256);
+        assert_eq!(model.summ_freq(mc), 257);
+        let stats = model.stats(mc);
+        assert_eq!((model.sym(stats), model.freq(stats)), (0, 1));
+        let last = stats + 255 * STATE_SIZE;
+        assert_eq!((model.sym(last), model.freq(last)), (255, 1));
+        assert_eq!(model.found_state, stats);
+        assert_eq!(model.order_fall, 6);
+        model.check_consistency();
+    }
+
+    #[test]
+    fn lookup_tables_match_ppmd7_construct() {
+        assert_eq!(&NS2INDEX[..8], &[0, 1, 2, 3, 4, 4, 5, 5]);
+        assert_eq!(NS2INDEX[255], 24);
+        assert_eq!(&NS2BS_INDEX[..3], &[0, 2, 4]);
+        assert_eq!((NS2BS_INDEX[10], NS2BS_INDEX[11]), (4, 6));
+    }
+
+    /// `run_length` is a C `int` the reference lets wrap; the wrap moves the
+    /// `BinSumm` column by `0x20`, exactly as 7-Zip and ppmd-rust do.
+    #[test]
+    fn run_length_wraps_as_the_reference_does() {
+        let mut model = Model::new(6, 1 << 20).unwrap();
+        model.run_length = i32::MAX;
+        model.run_length = model.run_length.wrapping_add(1);
+        assert_eq!(model.run_length, i32::MIN);
+        assert_eq!((model.run_length as u32 >> 26) & 0x20, 0x20);
+    }
+
     /// Drives `model` through `data`, restarting it at each end marker, and
-    /// returns how many symbols it decoded. Never panics; a corrupt-stream
-    /// error ends the run.
-    fn decode_noise(model: &mut Model, data: &[u8], symbols: usize) -> usize {
+    /// returns how many symbols it decoded. Checks consistency after every
+    /// symbol when `check` is set.
+    fn decode_noise(model: &mut Model, data: &[u8], symbols: usize, check: bool) -> usize {
         let mut rc = RarRangeDecoder::new(data).unwrap();
         let mut decoded = 0;
         for _ in 0..symbols {
@@ -2084,6 +1131,9 @@ mod tests {
                 Ok(None) => model.restart(),
                 Err(Error::CorruptStream { .. }) => break,
                 Err(other) => panic!("unexpected error {other:?}"),
+            }
+            if check {
+                model.check_consistency();
             }
         }
         decoded
@@ -2097,11 +1147,34 @@ mod tests {
         let mut model = Model::new(PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE).unwrap();
         let arena = model.arena_addr();
         let data = noise(1 << 16, 0x9E37_79B9);
-        let decoded = decode_noise(&mut model, &data, 50_000);
+        let decoded = decode_noise(&mut model, &data, 50_000, false);
         assert!(decoded > 1_000, "decoded {decoded}");
         assert!(model.restarts > 10, "restarted {} times", model.restarts);
         assert_eq!(model.arena_addr(), arena);
         assert_eq!(model.mem_size(), PPMD7_MIN_MEM_SIZE);
+    }
+
+    /// Arbitrary input never makes the model inconsistent, including when
+    /// decoding carries on after the end marker and after counts past the
+    /// total without a restart (the abort paths put the model back).
+    #[test]
+    fn noise_keeps_the_model_consistent_across_aborted_symbols() {
+        for seed in 1..=24u32 {
+            let data = noise(1 << 12, seed.wrapping_mul(0x9E37_79B9));
+            for (order, mem) in [(2, 1 << 11), (6, 1 << 14), (16, 1 << 12), (64, 1 << 11)] {
+                let mut model = Model::new(order, mem).unwrap();
+                let mut rc = RarRangeDecoder::new(&data[..]).unwrap();
+                for _ in 0..3_000 {
+                    let before = model.order_fall;
+                    match model.decode_symbol(&mut rc) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => assert_eq!(model.order_fall, before),
+                        Err(_) => break,
+                    }
+                    model.check_consistency();
+                }
+            }
+        }
     }
 
     /// Restarting between every symbol, and re-starting with alternating
@@ -2120,10 +1193,10 @@ mod tests {
             let mem = if round % 2 == 0 { 1 << 12 } else { 1 << 16 };
             model.start(order, mem).unwrap();
             assert_eq!(model.order(), order);
-            decode_noise(&mut model, &data, 64);
+            decode_noise(&mut model, &data, 64, true);
         }
         model.start(6, 1 << 16).unwrap();
-        assert!(decode_noise(&mut model, &data, 256) > 0);
+        assert!(decode_noise(&mut model, &data, 256, true) > 0);
     }
 
     #[test]
@@ -2152,7 +1225,8 @@ mod tests {
     }
 
     /// A resumed coder whose range is below the root context's frequency
-    /// total would divide by zero; the model reports a corrupt stream.
+    /// total would divide by zero; the model reports a corrupt stream and
+    /// stays consistent.
     #[test]
     fn a_range_below_the_frequency_total_is_a_corrupt_stream() {
         let data = [0u8; 16];
@@ -2171,264 +1245,57 @@ mod tests {
                 ),
                 "range {range}"
             );
-            model.restart();
+            model.check_consistency();
         }
     }
 
     #[test]
-    fn start_reuses_same_sized_allocator_storage() {
+    fn start_reuses_same_sized_arena_storage() {
         let mut model = Model::new(6, 1 << 20).unwrap();
-        let untouched_text_offset = UNIT_SIZE + 100;
-        model.alloc.write_byte_at(untouched_text_offset, 0xA5);
-
+        let untouched = model.a.text + 100;
+        model.a.set_u8(untouched, 0xA5);
         let arena = model.arena_addr();
         model.start(16, 1 << 20).unwrap();
-
         assert_eq!(model.max_order, 16);
         assert_eq!(model.arena_addr(), arena);
-        assert_eq!(model.alloc.read_byte_at(untouched_text_offset), 0xA5);
+        assert_eq!(model.a.u8(untouched), 0xA5);
     }
 
     #[test]
-    fn test_root_has_256_symbols() {
-        let model = Model::new(6, 1 << 20).unwrap();
-        let ns = model.ctx_num_stats(model.min_context);
-        assert_eq!(ns, 256);
-    }
-
-    #[test]
-    fn test_root_summary_freq() {
-        let model = Model::new(6, 1 << 20).unwrap();
-        let sf = model.ctx_summ_freq(model.min_context);
-        assert_eq!(sf, 257);
-    }
-
-    #[test]
-    fn test_root_states() {
-        let model = Model::new(6, 1 << 20).unwrap();
-        let stats = model.ctx_stats(model.min_context);
-        // First state: symbol=0, freq=1.
-        assert_eq!(model.st_sym(stats), 0);
-        assert_eq!(model.st_freq(stats), 1);
-        // Last state: symbol=255, freq=1.
-        let last = stats + 255 * STATE_SIZE as u32;
-        assert_eq!(model.st_sym(last), 255);
-        assert_eq!(model.st_freq(last), 1);
-    }
-
-    #[test]
-    fn test_decode_from_zeros() {
+    fn decoding_zeros_works() {
         let mut model = Model::new(6, 1 << 20).unwrap();
         let data = vec![0u8; 256];
         let mut rc = RarRangeDecoder::new(&data[..]).unwrap();
-        // Should decode symbols without crashing. None is valid (escape/end).
         for _ in 0..5 {
             let _ = model.decode_symbol(&mut rc).unwrap();
+            model.check_consistency();
         }
     }
 
+    /// `Rescale` collapsing a MAX-order context to one state halves the
+    /// surviving frequency once per halving of the escape frequency.
     #[test]
-    fn decode_rejects_context_offset_in_text_region() {
+    fn rescale_single_state_collapse() {
         let mut model = Model::new(6, 1 << 20).unwrap();
-        model.min_context = UNIT_SIZE as u32;
-        let data = vec![0u8; 256];
-        let mut rc = RarRangeDecoder::new(&data[..]).unwrap();
-
-        let result = model.decode_symbol(&mut rc);
-
-        assert!(matches!(result, Err(Error::CorruptStream { .. })));
-    }
-
-    #[test]
-    fn decode_rejects_stats_offset_in_text_region() {
-        let mut model = Model::new(6, 1 << 20).unwrap();
-        model.set_ctx_stats(model.min_context, UNIT_SIZE as u32);
-        let data = vec![0u8; 256];
-        let mut rc = RarRangeDecoder::new(&data[..]).unwrap();
-
-        let result = model.decode_symbol(&mut rc);
-
-        assert!(matches!(result, Err(Error::CorruptStream { .. })));
-    }
-
-    #[test]
-    fn unmasked_scratch_packing_covers_one_and_256_states() {
-        let one = pack_unmasked_state(0, u16::from_le_bytes([17, 23]));
-        assert_eq!(unmasked_state_index(one), 0);
-        assert_eq!(unmasked_state_symbol(one), 17);
-        assert_eq!(unmasked_state_frequency(one), 23);
-
-        let mut scratch = [0u32; 256];
-        for (index, slot) in scratch.iter_mut().enumerate() {
-            *slot = pack_unmasked_state(index, u16::from_le_bytes([index as u8, 1]));
-        }
-        let last = scratch[255];
-        assert_eq!(unmasked_state_index(last), 255);
-        assert_eq!(unmasked_state_symbol(last), 255);
-        assert_eq!(unmasked_state_frequency(last), 1);
-    }
-
-    #[test]
-    fn span_find_state_from_matches_the_scalar_scan_for_every_batch_shape() {
-        // The vector searches compare eight states at a time, so the shapes
-        // that matter are every `ns` across the batch boundary, every start
-        // offset within a batch, a match at every index, and duplicate symbols
-        // (first match must win). Symbol zero is called out separately: it is
-        // the only value that can alias the zeroed upper lanes of the x86-64
-        // symbol gather.
-        fn assert_find_agrees_with_scan(model: &Model, span: ValidatedArenaSpan, syms: &[u8]) {
-            let ns = syms.len();
-            for start in 0..=ns {
-                for target in [0u8, 1, 7, 200, 255] {
-                    let expected = (start..ns).find(|&index| syms[index] == target);
-                    assert_eq!(
-                        model.span_find_state_from(span, start, ns, target),
-                        expected,
-                        "ns={ns} start={start} target={target} syms={syms:?}"
-                    );
-                }
-            }
-        }
-
-        fn assert_find_agrees_on_every_path(
-            model: &mut Model,
-            span: ValidatedArenaSpan,
-            syms: &[u8],
-        ) {
-            for (index, &sym) in syms.iter().enumerate() {
-                model.span_write_state(span, index, sym, 1, 0);
-            }
-            assert_find_agrees_with_scan(model, span, syms);
-
-            // Re-run the same oracle with the batch search disabled so the
-            // vector path and the scalar path are checked against each other.
-            #[cfg(all(target_arch = "x86_64", not(miri)))]
-            {
-                let detected = std::mem::replace(&mut model.use_ssse3_state_batches, false);
-                assert_find_agrees_with_scan(model, span, syms);
-                model.use_ssse3_state_batches = detected;
-            }
-        }
-
-        let mut model = Model::new(6, 1 << 20).unwrap();
-        let context_span = model.validated_context(model.min_context).unwrap();
-        let stats = model.span_ctx_stats(context_span);
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-
-        // 1..=24 walks both batch boundaries of the eight-wide kernels; the
-        // explicit tail adds the 15/16/17, 31/32/33 and 63/64/65 edge lengths,
-        // where several full-width passes and a scalar straggler have to agree
-        // with the scan.
-        let state_counts = (1..=24usize)
-            .chain([31, 32, 33, 47, 48, 49, 63, 64, 65])
-            .collect::<Vec<_>>();
-        for ns in state_counts {
-            let span = model
-                .alloc
-                .validated_tail_span(stats, ns * STATE_SIZE)
-                .expect("the root stats block covers every tested state count");
-
-            // A single match walked across every index, for a normal symbol and
-            // for symbol zero.
-            for target in [0u8, 200] {
-                for hit in 0..ns {
-                    let syms = (0..ns)
-                        .map(|index| {
-                            if index == hit {
-                                target
-                            } else {
-                                100 + index as u8
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    assert_find_agrees_on_every_path(&mut model, span, &syms);
-                }
-            }
-
-            // Randomized symbols over a four-value alphabet, so every array has
-            // duplicates and usually several matches per target.
-            for _ in 0..8 {
-                let syms = (0..ns)
-                    .map(|_| {
-                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                        ((seed >> 33) % 4) as u8
-                    })
-                    .collect::<Vec<_>>();
-                assert_find_agrees_on_every_path(&mut model, span, &syms);
-            }
-        }
-    }
-
-    #[test]
-    fn decode_rejects_zero_state_context() {
-        let mut model = Model::new(6, 1 << 20).unwrap();
-        let context_span = model.validated_context(model.min_context).unwrap();
-        model.span_set_ctx_num_stats(context_span, 0);
-        let mut rc = RarRangeDecoder::new(&[0u8; 256][..]).unwrap();
-
-        let result = model.decode_symbol(&mut rc);
-
-        assert!(matches!(result, Err(Error::CorruptStream { .. })));
-    }
-
-    #[test]
-    fn decode_rejects_truncated_state_span() {
-        let mut model = Model::new(6, 1 << 20).unwrap();
-        model.set_ctx_stats(model.min_context, model.alloc.heap_end_bytes() as u32);
-        let mut rc = RarRangeDecoder::new(&[0u8; 256][..]).unwrap();
-
-        let result = model.decode_symbol(&mut rc);
-
-        assert!(matches!(result, Err(Error::CorruptStream { .. })));
-    }
-
-    #[test]
-    fn decode_rejects_suffix_in_text_region() {
-        let mut model = Model::new(6, 1 << 20).unwrap();
-        let context_span = model.validated_context(model.min_context).unwrap();
-        model.span_set_ctx_num_stats(context_span, 2);
-        model.span_set_ctx_summ_freq(context_span, 3);
-        model.span_set_ctx_suffix(context_span, UNIT_SIZE as u32);
-        let mut rc = RarRangeDecoder::new(&[0u8; 256][..]).unwrap();
-
-        let result = model.decode_symbol(&mut rc);
-
-        assert!(matches!(result, Err(Error::CorruptStream { .. })));
-    }
-
-    #[test]
-    fn decode_rejects_invalid_successor_before_dereference() {
-        let mut model = Model::new(6, 1 << 20).unwrap();
-        let context_span = model.validated_context(model.min_context).unwrap();
-        let stats = model.span_ctx_stats(context_span);
-        let states_span = model.validated_states(stats, 256).unwrap();
-        model.span_set_state_succ(states_span, 0, u32::MAX);
-        model.order_fall = 0;
-        let mut rc = RarRangeDecoder::new(&[0u8; 256][..]).unwrap();
-
-        assert_eq!(model.decode_symbol(&mut rc).unwrap(), Some(0));
-        let result = model.decode_symbol(&mut rc);
-
-        assert!(matches!(result, Err(Error::CorruptStream { .. })));
-    }
-
-    #[test]
-    fn rescale_single_state_collapse_always_halves_once() {
-        let mut model = Model::new(6, 1 << 20).unwrap();
-        let context_span = model.validated_context(model.min_context).unwrap();
-        let stats = model.span_ctx_stats(context_span);
-        let states_span = model.validated_states(stats, 2).unwrap();
-
-        model.span_set_ctx_num_stats(context_span, 2);
-        model.span_set_ctx_summ_freq(context_span, 3);
-        model.span_write_state(states_span, 0, 10, 2, 0);
-        model.span_write_state(states_span, 1, 11, 1, 0);
+        // A two-state context in a fresh unit block, with one state that
+        // rescales to zero.
+        let c = model.a.alloc_context().unwrap();
+        let stats = model.a.alloc_units(0).unwrap();
+        model.set_num_stats(c, 2);
+        model.set_summ_freq(c, 3);
+        model.set_stats(c, stats);
+        model.set_suffix(c, model.max_context);
+        model.a.write6(stats, [10, 2, 0, 0, 0, 0]);
+        model.a.write6(stats + STATE_SIZE, [11, 1, 0, 0, 0, 0]);
+        model.min_context = c;
         model.found_state = stats;
         model.order_fall = 0;
 
-        assert!(model.rescale(model.min_context));
-        assert_eq!(model.span_ctx_num_stats(context_span), 1);
-        assert_eq!(model.span_one_sym(context_span), 10);
-        assert_eq!(model.span_one_freq(context_span), 2);
+        model.rescale();
+        assert_eq!(model.num_stats(c), 1);
+        assert_eq!(model.sym(c + CTX_ONE_STATE), 10);
+        // freq (2 + 4) >> 1 = 3, then esc_freq 0 + 1 halves once: (3 + 1) >> 1.
+        assert_eq!(model.freq(c + CTX_ONE_STATE), 2);
+        assert_eq!(model.found_state, c + CTX_ONE_STATE);
     }
 }

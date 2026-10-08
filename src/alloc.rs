@@ -1,1082 +1,449 @@
 //! The sub-allocator.
 //!
-//! Variant H's unit allocator, part of Dmitry Shkarin's PPMd design, laid out
-//! as RAR's PPMd blocks and 7-Zip's `Ppmd7.c` (Igor Pavlov) lay it out: one
-//! contiguous arena addressed by 32-bit offsets, made of 12-byte units.
+//! Variant H's unit allocator (Dmitry Shkarin's design), translated from
+//! ppmd-rust 1.5.0's `internal/ppmd7.rs` (CC0-1.0 / MIT-0), which is itself a
+//! translation of Igor Pavlov's `C/Ppmd7.c` in 7-Zip (public domain). The
+//! layout, the free lists, the glue pass and the rare-allocation fallback are
+//! the reference's line for line; only the representation differs (32-bit
+//! offsets from the arena base instead of pointers).
 //!
-//! - The **text region** (the lower eighth) grows up from the first unit and
-//!   holds raw symbols the model has not yet turned into contexts.
-//! - The **unit region** (the upper seven eighths) holds contexts and state
-//!   arrays. `lo_unit` grows up for state arrays, `hi_unit` grows down for
-//!   contexts, and freed blocks go to indexed free lists.
+//! One contiguous arena of `align_offset + size` bytes, where
+//! `align_offset = (4 - size) & 3`:
+//!
+//! - the **text region** starts at `align_offset` and grows up; it holds the
+//!   raw symbols the model has not yet turned into contexts;
+//! - the **unit region** is the upper seven eighths, in 12-byte units, from
+//!   `units_start` to the end. `lo_unit` grows up for state arrays, `hi_unit`
+//!   grows down for contexts, and freed blocks go to 38 indexed free lists.
+//!   The order-0 context is always the arena's last unit.
 //!
 //! The layout is part of the format: when the arena fills, the model restarts,
-//! and the point at which it fills depends on every allocation and free list
-//! order below. It is reproduced exactly.
+//! and the point at which it fills depends on every allocation and on the
+//! free lists' order. RAR's unrar reaches the same restart points through its
+//! "fake" 12-byte unit accounting, so one layout serves both framings.
 //!
-//! The arena is allocated once, when the model is created or its size
-//! changes, and never grows. Its length is the requested size rounded down to
-//! whole units plus three units: the null unit at offset 0 and the two
-//! trailing units the RAR layout reserves.
-//!
-//! All unchecked arena access is confined to this module, behind
-//! [`ValidatedArenaSpan`] tokens that are only minted after a bounds check.
+//! **Safety.** The arena is addressed without bounds checks in release
+//! builds. Every offset the model hands to the accessors here comes from the
+//! model's own records: the allocator only returns blocks inside the unit
+//! region, the text pointer stays below `units_start`, and the model's
+//! structure is consistent whatever the input (see the proof in
+//! `docs/algorithms.md`, "Model consistency"). Debug builds, Miri and the fuzz
+//! targets check every access against the arena with `debug_assert!`.
 
-use std::cell::Cell;
-use std::num::NonZeroU32;
+use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
+use std::ptr::NonNull;
 
 /// Size of one allocation unit in bytes.
-pub(crate) const UNIT_SIZE: usize = 12;
+pub(crate) const UNIT_SIZE: u32 = 12;
 
-/// Index-to-units mapping for the free list bins.
-static INDEX_TO_UNITS: [u8; 38] = [
-    1, 2, 3, 4, 6, 8, 10, 12, 15, 18, 21, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76,
-    80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128,
-];
+/// Number of free lists (`PPMD_NUM_INDEXES`).
+pub(crate) const NUM_INDEXES: usize = 38;
 
-/// Number of distinct free-list bin sizes.
-const NUM_INDEXES: usize = 38;
-
-/// Units-to-bin lookup: entry `u - 1` is the first bin whose size is >= `u`.
-static UNITS_TO_INDEX: [u8; 128] = {
-    let mut table = [0u8; 128];
-    let mut i = 0usize;
+/// `Index2Units` and `Units2Index`, as `Ppmd7_Construct` builds them.
+const fn unit_tables() -> ([u8; NUM_INDEXES], [u8; 128]) {
+    let mut index2units = [0u8; NUM_INDEXES];
+    let mut units2index = [0u8; 128];
     let mut k = 0usize;
-    while k < 128 {
-        if (INDEX_TO_UNITS[i] as usize) < k + 1 {
-            i += 1;
+    let mut i = 0usize;
+    while i < NUM_INDEXES {
+        let step = if i >= 12 { 4 } else { (i >> 2) + 1 };
+        let mut s = 0;
+        while s < step {
+            units2index[k] = i as u8;
+            k += 1;
+            s += 1;
         }
-        table[k] = i as u8;
-        k += 1;
+        index2units[i] = k as u8;
+        i += 1;
     }
-    table
-};
+    (index2units, units2index)
+}
 
-const GLUE_COUNT_RESET: u8 = 255;
-const HEAP_BASE_BYTES: usize = UNIT_SIZE;
+const TABLES: ([u8; NUM_INDEXES], [u8; 128]) = unit_tables();
 
-// Temporary intrusive free-block header (`RARPPM_MEM_BLK` in RAR's layout,
-// `CPpmd7_Node` in 7-Zip's) used only while gluing free
-// blocks. `insert_node` later overwrites the first four bytes with the normal
-// free-list link.
-const GLUE_STAMP: usize = 0;
-const GLUE_UNITS: usize = 2;
-const GLUE_NEXT: usize = 4;
-const GLUE_PREV: usize = 8;
-const GLUE_FREE_STAMP: u16 = 0xffff;
+/// Units in the blocks of each free list.
+pub(crate) static INDEX2UNITS: [u8; NUM_INDEXES] = TABLES.0;
 
-/// A reference to an allocated unit block in the arena.
-/// Stored as a unit index (byte offset = index * UNIT_SIZE).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NodeRef(pub(crate) u32);
+/// Entry `nu - 1` is the first free list whose blocks hold `nu` units or more.
+pub(crate) static UNITS2INDEX: [u8; 128] = TABLES.1;
 
-impl NodeRef {
-    pub(crate) const NULL: NodeRef = NodeRef(0);
+/// `I2U`.
+#[inline(always)]
+pub(crate) fn i2u(index: u32) -> u32 {
+    INDEX2UNITS[index as usize] as u32
+}
 
-    #[inline(always)]
-    pub(crate) fn is_null(self) -> bool {
-        self.0 == 0
-    }
+/// `U2I`: the free list for a block of `nu` units (`1..=128`).
+#[inline(always)]
+pub(crate) fn u2i(nu: u32) -> u32 {
+    UNITS2INDEX[nu as usize - 1] as u32
+}
 
-    /// Byte offset into the arena.
-    ///
-    /// Both accessors are one instruction and sit under every node-relative
-    /// arena read and write, so they are always inlined: an outlined copy shows
-    /// up as its own call-bound frame in the decode profile. The saturating
-    /// multiply stays — it cannot trigger on a 64-bit target (a `u32` index
-    /// times `UNIT_SIZE` never leaves `usize` range, so the check folds away),
-    /// and where it can, saturating past the arena is what makes the callers'
-    /// bounds checks reject the offset instead of aliasing another node.
-    #[inline(always)]
-    pub(crate) fn offset(self) -> usize {
-        (self.0 as usize).saturating_mul(UNIT_SIZE)
+/// The glue pass's block header (`CPpmd7_Node`): `stamp` (u16) at 0, `nu`
+/// (u16) at 2, `next` (u32) at 4. A free-list entry keeps only its link, at 0.
+const NODE_STAMP: u32 = 0;
+const NODE_NU: u32 = 2;
+const NODE_NEXT: u32 = 4;
+const EMPTY_NODE: u16 = 0;
+
+/// The model's arena and the allocator state over it.
+pub(crate) struct Arena {
+    base: NonNull<u8>,
+    layout: Layout,
+    /// The size requested (`p->Size`).
+    size: u32,
+    align_offset: u32,
+    pub(crate) lo_unit: u32,
+    pub(crate) hi_unit: u32,
+    pub(crate) text: u32,
+    pub(crate) units_start: u32,
+    glue_count: u32,
+    free_list: [u32; NUM_INDEXES],
+}
+
+// SAFETY: the arena is an owned heap allocation reached only through
+// `&self`/`&mut self`; nothing else holds the pointer, so moving the owner to
+// another thread moves sole access with it, and shared references only read.
+unsafe impl Send for Arena {}
+// SAFETY: as above; `&Arena` exposes reads only.
+unsafe impl Sync for Arena {}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        // SAFETY: `base` came from `alloc_zeroed(self.layout)` and is freed
+        // only here.
+        unsafe { dealloc(self.base.as_ptr(), self.layout) };
     }
 }
 
-/// A model-arena range checked against the current text/heap boundaries.
-///
-/// Tokens are crate-private, contain no pointer or reference, and are used
-/// only as short-lived capabilities by the context model. All unchecked memory
-/// operations remain confined to `SubAllocator`.
-#[derive(Clone, Copy)]
-pub(crate) struct ValidatedArenaSpan {
-    offset: NonZeroU32,
-    len: u16,
-}
-
-/// Compact form of an already validated arena span when the caller knows its
-/// fixed record width. This keeps hot fixed-capacity stacks at one word per
-/// entry without weakening the original range validation.
-#[derive(Clone, Copy)]
-pub(crate) struct ValidatedArenaOffset(NonZeroU32);
-
-impl ValidatedArenaSpan {
-    #[inline(always)]
-    pub(crate) const fn offset(self) -> usize {
-        self.offset.get() as usize
-    }
-
-    #[inline(always)]
-    pub(crate) const fn len(self) -> usize {
-        self.len as usize
-    }
-
-    #[inline(always)]
-    pub(crate) const fn compact(self) -> ValidatedArenaOffset {
-        ValidatedArenaOffset(self.offset)
-    }
-
-    #[inline(always)]
-    pub(crate) fn subspan(self, relative: usize, len: usize) -> Self {
-        debug_assert!(
-            relative
-                .checked_add(len)
-                .is_some_and(|end| end <= self.len())
-        );
-        Self {
-            offset: NonZeroU32::new(self.offset.get() + relative as u32)
-                .expect("validated arena subspan offset is non-zero"),
-            len: u16::try_from(len).expect("validated PPMd span length fits u16"),
-        }
-    }
-}
-
-impl ValidatedArenaOffset {
-    #[inline(always)]
-    pub(crate) fn span(self, len: usize) -> ValidatedArenaSpan {
-        debug_assert!(len != 0 && u16::try_from(len).is_ok());
-        ValidatedArenaSpan {
-            offset: self.0,
-            len: len as u16,
-        }
-    }
-}
-
-/// A free-list node stored in-place in unused arena blocks.
-#[derive(Clone, Copy)]
-struct FreeNode {
-    next: NodeRef,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AllocatorLayout {
-    allocated_size: usize,
-    units_start_bytes: usize,
-    fake_units_start_bytes: usize,
-    lo_unit: u32,
-    hi_unit: u32,
-    total_units: u32,
-}
-
-/// The variant H sub-allocator over one fixed arena.
-#[cfg_attr(test, derive(Clone))]
-pub(crate) struct SubAllocator {
-    /// The memory arena.
-    arena: Vec<u8>,
-    /// Original sub-allocator size requested by the stream.
-    sub_allocator_size: usize,
-    /// Set when a checked arena access would have gone out of bounds.
-    arena_fault: Cell<bool>,
-    /// Free lists indexed by bin size.
-    free_lists: [NodeRef; NUM_INDEXES],
-
-    // --- Text region (grows upward from byte UNIT_SIZE) ---
-    /// Current text write position (byte offset in arena).
-    p_text: usize,
-    /// Byte offset where the real unit allocation region starts.
-    units_start_bytes: usize,
-    /// Byte offset where the original algorithm expects unit space to begin.
-    /// Text exhaustion is checked against this boundary.
-    fake_units_start_bytes: usize,
-
-    // --- Unit allocation region ---
-    /// Next available unit from the low end (unit index, grows up).
-    lo_unit: u32,
-    /// Next available unit from the high end (unit index, grows down).
-    hi_unit: u32,
-    /// Total number of units in the arena.
-    total_units: u32,
-    /// Rare-allocation glue countdown.
-    glue_count: u8,
-}
-
-impl SubAllocator {
-    fn layout_for(requested_size: usize) -> AllocatorLayout {
-        let requested_size = requested_size.max(UNIT_SIZE * 8);
-        let rar_allocated_size = (requested_size / UNIT_SIZE) * UNIT_SIZE + 2 * UNIT_SIZE;
-        let allocated_size = HEAP_BASE_BYTES + rar_allocated_size;
-
-        let size2 = UNIT_SIZE * ((requested_size / 8 / UNIT_SIZE) * 7);
-        let real_size2 = (size2 / UNIT_SIZE) * UNIT_SIZE;
-        let size1 = requested_size.saturating_sub(size2);
-        let real_size1 = (size1 / UNIT_SIZE) * UNIT_SIZE + UNIT_SIZE;
-
-        let units_start_bytes = HEAP_BASE_BYTES + real_size1;
-        let fake_units_start_bytes = HEAP_BASE_BYTES + size1;
-        let lo_unit = (units_start_bytes / UNIT_SIZE) as u32;
-        let hi_unit = ((units_start_bytes + real_size2) / UNIT_SIZE) as u32;
-        let total_units = (allocated_size / UNIT_SIZE) as u32;
-
-        AllocatorLayout {
-            allocated_size,
-            units_start_bytes,
-            fake_units_start_bytes,
-            lo_unit,
-            hi_unit,
-            total_units,
-        }
-    }
-
-    /// Create a new sub-allocator with the given arena size in bytes.
-    pub(crate) fn new(arena_size: usize) -> Self {
-        let layout = Self::layout_for(arena_size);
-
-        Self {
-            arena: vec![0u8; layout.allocated_size],
-            sub_allocator_size: arena_size.max(UNIT_SIZE * 8),
-            arena_fault: Cell::new(false),
-            free_lists: [NodeRef::NULL; NUM_INDEXES],
-            p_text: HEAP_BASE_BYTES,
-            units_start_bytes: layout.units_start_bytes,
-            fake_units_start_bytes: layout.fake_units_start_bytes,
-            lo_unit: layout.lo_unit,
-            hi_unit: layout.hi_unit,
-            total_units: layout.total_units,
+impl Arena {
+    /// `Ppmd7_Alloc`: an arena of `align_offset + size` bytes. Zeroed so no
+    /// byte is ever read uninitialized; the model never relies on the zeros.
+    pub(crate) fn new(size: u32) -> Self {
+        debug_assert!(size >= crate::PPMD7_MIN_MEM_SIZE);
+        let align_offset = 4u32.wrapping_sub(size) & 3;
+        let total = align_offset as usize + size as usize;
+        let layout = Layout::from_size_align(total, 8).expect("arena size fits a layout");
+        // SAFETY: `total` is nonzero (`size` is at least `PPMD7_MIN_MEM_SIZE`).
+        let ptr = unsafe { alloc_zeroed(layout) };
+        let Some(base) = NonNull::new(ptr) else {
+            handle_alloc_error(layout)
+        };
+        let mut arena = Self {
+            base,
+            layout,
+            size,
+            align_offset,
+            lo_unit: 0,
+            hi_unit: 0,
+            text: 0,
+            units_start: 0,
             glue_count: 0,
-        }
+            free_list: [0; NUM_INDEXES],
+        };
+        arena.reset();
+        arena
     }
 
-    /// Reset the allocator, freeing all allocations.
-    pub(crate) fn reset(&mut self) {
-        self.free_lists = [NodeRef::NULL; NUM_INDEXES];
-        self.clear_arena_fault();
+    /// The size the arena was created with.
+    #[inline]
+    pub(crate) fn size(&self) -> u32 {
+        self.size
+    }
 
-        let layout = Self::layout_for(self.sub_allocator_size);
-        debug_assert_eq!(layout.allocated_size, self.arena.len());
-        self.lo_unit = layout.lo_unit;
-        self.units_start_bytes = layout.units_start_bytes;
-        self.fake_units_start_bytes = layout.fake_units_start_bytes;
-        self.hi_unit = layout.hi_unit;
-        self.total_units = layout.total_units;
-        self.p_text = HEAP_BASE_BYTES;
+    /// Address of the arena allocation, for tests that check a same-size
+    /// restart keeps it.
+    #[cfg(test)]
+    pub(crate) fn arena_addr(&self) -> usize {
+        self.base.as_ptr() as usize
+    }
+
+    /// The layout part of `RestartModel`: empty free lists, the text pointer
+    /// at the start, and the unit region at the upper seven eighths. The
+    /// arena's bytes are left as they are.
+    pub(crate) fn reset(&mut self) {
+        self.free_list = [0; NUM_INDEXES];
+        self.text = self.align_offset;
+        self.hi_unit = self.text + self.size;
+        self.units_start = self.hi_unit - self.size / 8 / UNIT_SIZE * 7 * UNIT_SIZE;
+        self.lo_unit = self.units_start;
         self.glue_count = 0;
     }
 
-    #[inline]
-    pub(crate) fn allocated_size(&self) -> usize {
-        self.sub_allocator_size
-    }
-
-    /// Address of the arena allocation.
-    ///
-    /// Tests use this to prove that a same-size restart reuses the existing
-    /// arena instead of faulting in a fresh one; a replacement allocation is
-    /// made while the old arena is still live, so the address always moves.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn arena_addr(&self) -> usize {
-        self.arena.as_ptr() as usize
-    }
-
-    // ---- Text region methods ----
-
-    /// Write a byte to the text region and advance the text pointer.
-    /// Returns the byte offset where the byte was stored.
-    pub(crate) fn write_text_byte(&mut self, b: u8) -> usize {
-        let pos = self.p_text;
-        if pos < self.fake_units_start_bytes {
-            self.arena[pos] = b;
-            self.p_text += 1;
-        }
-        pos
-    }
-
-    /// Current text write position (byte offset in arena).
-    #[inline]
-    pub(crate) fn text_position(&self) -> usize {
-        self.p_text
-    }
-
-    /// Decrement text position (undo a write).
-    pub(crate) fn text_dec(&mut self) {
-        if self.p_text > HEAP_BASE_BYTES {
-            self.p_text -= 1;
-        }
-    }
-
-    /// Check if the text region is exhausted.
-    #[inline]
-    pub(crate) fn text_exhausted(&self) -> bool {
-        self.p_text >= self.fake_units_start_bytes
-    }
-
-    /// Highest byte offset that can begin an arena object.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn heap_end_bytes(&self) -> usize {
-        self.total_units.saturating_sub(1) as usize * UNIT_SIZE
-    }
+    // ---- raw access --------------------------------------------------------
 
     #[inline(always)]
-    pub(crate) fn model_range_valid(&self, off: u32, len: usize) -> bool {
-        debug_assert!(len >= UNIT_SIZE);
-        let off = off as usize;
-        let arena_len = self.arena.len();
-        off > self.p_text && off <= arena_len.saturating_sub(len)
-    }
-
-    #[inline(always)]
-    pub(crate) fn validated_model_span(&self, off: u32, len: usize) -> Option<ValidatedArenaSpan> {
-        if !self.model_range_valid(off, len) {
-            return None;
-        }
-        Some(ValidatedArenaSpan {
-            offset: NonZeroU32::new(off)?,
-            len: u16::try_from(len).ok()?,
-        })
-    }
-
-    #[inline(always)]
-    pub(crate) fn validated_tail_span(&self, off: u32, len: usize) -> Option<ValidatedArenaSpan> {
-        let start = off as usize;
-        let end = start.checked_add(len)?;
-        if start <= self.p_text || end > self.arena.len() {
-            return None;
-        }
-        Some(ValidatedArenaSpan {
-            offset: NonZeroU32::new(off)?,
-            len: u16::try_from(len).ok()?,
-        })
-    }
-
-    #[inline(always)]
-    pub(crate) fn span_read_u8(&self, span: ValidatedArenaSpan, relative: usize) -> u8 {
-        debug_assert!(relative < span.len());
-        // SAFETY: `validated_model_span` proves the entire span is inside the
-        // fixed-size arena. The debug assertion documents the field bound, and
-        // no pointer or reference escapes this expression.
-        unsafe { *self.arena.as_ptr().add(span.offset() + relative) }
-    }
-
-    #[inline(always)]
-    pub(crate) fn span_read_u16(&self, span: ValidatedArenaSpan, relative: usize) -> u16 {
-        debug_assert!(relative.checked_add(2).is_some_and(|end| end <= span.len()));
-        // SAFETY: the checked token covers both bytes. PPMd records are packed,
-        // so the load is explicitly unaligned and the raw pointer stays local.
-        let value = unsafe {
-            self.arena
-                .as_ptr()
-                .add(span.offset() + relative)
-                .cast::<u16>()
-                .read_unaligned()
-        };
-        u16::from_le(value)
-    }
-
-    #[cfg(all(target_arch = "aarch64", not(miri)))]
-    #[inline(always)]
-    pub(crate) fn span_read_state_heads8(
-        &self,
-        span: ValidatedArenaSpan,
-        relative: usize,
-    ) -> [u16; 8] {
-        use std::arch::aarch64::{vld3q_u16, vst1q_u16};
-
-        const STATE_BATCH_BYTES: usize = 8 * 6;
+    fn at(&self, off: u32, len: usize) -> *mut u8 {
         debug_assert!(
-            relative
-                .checked_add(STATE_BATCH_BYTES)
-                .is_some_and(|end| end <= span.len())
+            off as usize + len <= self.layout.size(),
+            "arena access {off}+{len} past {}",
+            self.layout.size()
         );
-
-        let mut heads = [0u16; 8];
-        // SAFETY: the validated span covers all 48 bytes loaded by `vld3q_u16`.
-        // AArch64 permits unaligned vector loads, and neither raw pointer escapes.
-        unsafe {
-            let states = vld3q_u16(
-                self.arena
-                    .as_ptr()
-                    .add(span.offset() + relative)
-                    .cast::<u16>(),
-            );
-            vst1q_u16(heads.as_mut_ptr(), states.0);
-        }
-        heads.map(u16::from_le)
+        // SAFETY: `off + len` lies inside the allocation (module invariant,
+        // checked above in debug builds), so the offset stays in bounds.
+        unsafe { self.base.as_ptr().add(off as usize) }
     }
 
-    /// Gather the symbol bytes of eight consecutive states into one vector,
-    /// lane `i` holding the symbol of state `i` of the batch and lanes 8..16
-    /// zeroed.
-    ///
-    /// States are six bytes wide and the symbol is field 0, so the eight
-    /// symbols of a batch sit at byte offsets 0, 6, 12, 18, 24, 30, 36 and 42.
-    /// `pshufb` only selects within its own 16-byte operand, so the batch is
-    /// covered by three loads and the symbol offsets split across them as:
-    ///
-    /// * `chunk0` (bytes 0..16): states 0, 1, 2 at chunk offsets 0, 6, 12
-    /// * `chunk1` (bytes 16..32): states 3, 4, 5 at chunk offsets 2, 8, 14
-    /// * `chunk2` (bytes 32..48): states 6, 7 at chunk offsets 4, 10
-    ///
-    /// Each mask writes its symbols into the lanes matching those state
-    /// positions and sets the high bit (`-128`) in every other lane, which
-    /// makes `pshufb` zero that lane. The three shuffles therefore have
-    /// disjoint non-zero lanes and their `OR` is exactly the batch in state
-    /// order, with lanes 8..16 zero because no mask claims them.
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    #[target_feature(enable = "ssse3")]
+    #[inline(always)]
+    pub(crate) fn u8(&self, off: u32) -> u8 {
+        // SAFETY: in bounds (see `at`); every byte is initialized.
+        unsafe { *self.at(off, 1) }
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_u8(&mut self, off: u32, v: u8) {
+        // SAFETY: in bounds (see `at`); `&mut self` is the only access.
+        unsafe { *self.at(off, 1) = v }
+    }
+
+    #[inline(always)]
+    pub(crate) fn u16(&self, off: u32) -> u16 {
+        // SAFETY: in bounds (see `at`); unaligned read of initialized bytes.
+        unsafe { self.at(off, 2).cast::<u16>().read_unaligned() }
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_u16(&mut self, off: u32, v: u16) {
+        // SAFETY: in bounds (see `at`); `&mut self` is the only access.
+        unsafe { self.at(off, 2).cast::<u16>().write_unaligned(v) }
+    }
+
+    #[inline(always)]
+    pub(crate) fn u32(&self, off: u32) -> u32 {
+        // SAFETY: in bounds (see `at`); unaligned read of initialized bytes.
+        unsafe { self.at(off, 4).cast::<u32>().read_unaligned() }
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_u32(&mut self, off: u32, v: u32) {
+        // SAFETY: in bounds (see `at`); `&mut self` is the only access.
+        unsafe { self.at(off, 4).cast::<u32>().write_unaligned(v) }
+    }
+
+    /// `memmove` of `len` bytes from `src` to `dst`.
     #[inline]
-    pub(crate) unsafe fn span_read_state_syms8_ssse3(
-        &self,
-        span: ValidatedArenaSpan,
-        relative: usize,
-    ) -> std::arch::x86_64::__m128i {
-        use std::arch::x86_64::{_mm_loadu_si128, _mm_or_si128, _mm_setr_epi8, _mm_shuffle_epi8};
-
-        const STATE_BATCH_BYTES: usize = 8 * 6;
-        debug_assert!(
-            relative
-                .checked_add(STATE_BATCH_BYTES)
-                .is_some_and(|end| end <= span.len())
-        );
-
-        // SAFETY: the validated span covers the three contiguous 16-byte loads.
-        // SSSE3 availability is checked once by `Model`, and the shuffle masks
-        // select only the one-byte symbol at the start of each six-byte state.
-        unsafe {
-            let ptr = self.arena.as_ptr().add(span.offset() + relative);
-            let chunk0 = _mm_loadu_si128(ptr.cast());
-            let chunk1 = _mm_loadu_si128(ptr.add(16).cast());
-            let chunk2 = _mm_loadu_si128(ptr.add(32).cast());
-
-            let mask0 = _mm_setr_epi8(
-                0, 6, 12, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128, -128,
-                -128,
-            );
-            let mask1 = _mm_setr_epi8(
-                -128, -128, -128, 2, 8, 14, -128, -128, -128, -128, -128, -128, -128, -128, -128,
-                -128,
-            );
-            let mask2 = _mm_setr_epi8(
-                -128, -128, -128, -128, -128, -128, 4, 10, -128, -128, -128, -128, -128, -128,
-                -128, -128,
-            );
-            _mm_or_si128(
-                _mm_or_si128(
-                    _mm_shuffle_epi8(chunk0, mask0),
-                    _mm_shuffle_epi8(chunk1, mask1),
-                ),
-                _mm_shuffle_epi8(chunk2, mask2),
-            )
-        }
+    pub(crate) fn copy(&mut self, src: u32, dst: u32, len: u32) {
+        let s = self.at(src, len as usize);
+        let d = self.at(dst, len as usize);
+        // SAFETY: both ranges are inside the allocation (see `at`);
+        // `ptr::copy` allows overlap.
+        unsafe { std::ptr::copy(s, d, len as usize) }
     }
 
+    /// Swaps the 6-byte records at `a` and `b`.
     #[inline(always)]
-    pub(crate) fn span_read_u32(&self, span: ValidatedArenaSpan, relative: usize) -> u32 {
-        debug_assert!(relative.checked_add(4).is_some_and(|end| end <= span.len()));
-        // SAFETY: the checked token covers all four bytes. The unaligned value
-        // is copied out immediately; no reference into the arena is produced.
-        let value = unsafe {
-            self.arena
-                .as_ptr()
-                .add(span.offset() + relative)
-                .cast::<u32>()
-                .read_unaligned()
-        };
-        u32::from_le(value)
+    pub(crate) fn swap6(&mut self, a: u32, b: u32) {
+        let pa = self.at(a, 6);
+        let pb = self.at(b, 6);
+        // SAFETY: both records are in bounds (see `at`); `ptr::swap` allows
+        // the ranges to overlap.
+        unsafe { std::ptr::swap(pa.cast::<[u8; 6]>(), pb.cast::<[u8; 6]>()) }
     }
 
+    /// Reads the 6-byte record at `off`.
     #[inline(always)]
-    pub(crate) fn span_read_u64(&self, span: ValidatedArenaSpan, relative: usize) -> u64 {
-        debug_assert!(relative.checked_add(8).is_some_and(|end| end <= span.len()));
-        // SAFETY: the validated token covers all eight bytes. Context records
-        // are packed, so the value is copied with an unaligned load and no
-        // pointer or reference escapes.
-        let value = unsafe {
-            self.arena
-                .as_ptr()
-                .add(span.offset() + relative)
-                .cast::<u64>()
-                .read_unaligned()
-        };
-        u64::from_le(value)
+    pub(crate) fn read6(&self, off: u32) -> [u8; 6] {
+        // SAFETY: in bounds (see `at`); `[u8; 6]` has alignment 1.
+        unsafe { self.at(off, 6).cast::<[u8; 6]>().read() }
     }
 
+    /// Writes the 6-byte record at `off`.
     #[inline(always)]
-    pub(crate) fn span_write_u8(&mut self, span: ValidatedArenaSpan, relative: usize, value: u8) {
-        debug_assert!(relative < span.len());
-        // SAFETY: the checked token covers this byte and `&mut self` provides
-        // exclusive access for the duration of the write.
-        unsafe { *self.arena.as_mut_ptr().add(span.offset() + relative) = value };
+    pub(crate) fn write6(&mut self, off: u32, v: [u8; 6]) {
+        // SAFETY: in bounds (see `at`); `[u8; 6]` has alignment 1.
+        unsafe { self.at(off, 6).cast::<[u8; 6]>().write(v) }
     }
 
+    // ---- the allocator (`Ppmd7.c`) ------------------------------------------
+
+    /// `InsertNode`.
     #[inline(always)]
-    pub(crate) fn span_write_u16(&mut self, span: ValidatedArenaSpan, relative: usize, value: u16) {
-        debug_assert!(relative.checked_add(2).is_some_and(|end| end <= span.len()));
-        // SAFETY: the checked token covers both bytes and the packed field is
-        // written unaligned without constructing a reference.
-        unsafe {
-            self.arena
-                .as_mut_ptr()
-                .add(span.offset() + relative)
-                .cast::<u16>()
-                .write_unaligned(value.to_le());
-        }
+    pub(crate) fn insert_node(&mut self, node: u32, index: u32) {
+        let head = self.free_list[index as usize];
+        self.set_u32(node, head);
+        self.free_list[index as usize] = node;
     }
 
+    /// `RemoveNode`: the list must be non-empty.
     #[inline(always)]
-    pub(crate) fn span_write_u32(&mut self, span: ValidatedArenaSpan, relative: usize, value: u32) {
-        debug_assert!(relative.checked_add(4).is_some_and(|end| end <= span.len()));
-        // SAFETY: the checked token covers all four bytes and the packed field
-        // is written unaligned without constructing a reference.
-        unsafe {
-            self.arena
-                .as_mut_ptr()
-                .add(span.offset() + relative)
-                .cast::<u32>()
-                .write_unaligned(value.to_le());
-        }
-    }
-
-    // ---- Unit allocation ----
-
-    /// Map a requested number of units to a free-list bin index.
-    #[inline(always)]
-    fn units_to_index(units: usize) -> usize {
-        debug_assert!((1..=128).contains(&units));
-        UNITS_TO_INDEX[units - 1] as usize
-    }
-
-    #[inline]
-    fn insert_node(&mut self, node: NodeRef, idx: usize) {
-        self.write_free_node(
-            node,
-            FreeNode {
-                next: self.free_lists[idx],
-            },
-        );
-        self.free_lists[idx] = node;
-    }
-
-    #[inline]
-    fn remove_node(&mut self, idx: usize) -> NodeRef {
-        let node = self.free_lists[idx];
-        let free_node = self.read_free_node(node);
-        self.free_lists[idx] = free_node.next;
+    pub(crate) fn remove_node(&mut self, index: u32) -> u32 {
+        let node = self.free_list[index as usize];
+        debug_assert_ne!(node, 0);
+        self.free_list[index as usize] = self.u32(node);
         node
     }
 
-    fn split_block(&mut self, node: NodeRef, old_idx: usize, new_idx: usize) {
-        let old_units = INDEX_TO_UNITS[old_idx] as usize;
-        let new_units = INDEX_TO_UNITS[new_idx] as usize;
-        let mut u_diff = old_units.saturating_sub(new_units);
-        let mut p = NodeRef(node.0 + new_units as u32);
+    /// Whether free list `index` holds a block.
+    #[inline(always)]
+    pub(crate) fn has_free(&self, index: u32) -> bool {
+        self.free_list[index as usize] != 0
+    }
 
-        let mut rem_idx = Self::units_to_index(u_diff);
-        if INDEX_TO_UNITS[rem_idx] as usize != u_diff {
-            rem_idx -= 1;
-            self.insert_node(p, rem_idx);
-            let rem_units = INDEX_TO_UNITS[rem_idx] as usize;
-            p = NodeRef(p.0 + rem_units as u32);
-            u_diff -= rem_units;
+    /// `SplitBlock`: keeps the first `I2U(new_index)` units of the block and
+    /// frees the rest.
+    pub(crate) fn split_block(&mut self, ptr: u32, old_index: u32, new_index: u32) {
+        let nu = i2u(old_index) - i2u(new_index);
+        let ptr = ptr + i2u(new_index) * UNIT_SIZE;
+        let mut i = u2i(nu);
+        if i2u(i) != nu {
+            i -= 1;
+            let k = i2u(i);
+            self.insert_node(ptr + k * UNIT_SIZE, nu - k - 1);
         }
-
-        let tail_idx = Self::units_to_index(u_diff);
-        self.insert_node(p, tail_idx);
+        self.insert_node(ptr, i);
     }
 
-    #[inline]
-    fn glue_next(&self, node: NodeRef) -> NodeRef {
-        NodeRef(self.read_u32(node, GLUE_NEXT))
-    }
-
-    #[inline]
-    fn glue_prev(&self, node: NodeRef) -> NodeRef {
-        NodeRef(self.read_u32(node, GLUE_PREV))
-    }
-
-    #[inline]
-    fn glue_insert_head(&mut self, node: NodeRef, head: &mut NodeRef, tail: &mut NodeRef) {
-        let old_head = *head;
-        self.write_u32(node, GLUE_NEXT, old_head.0);
-        self.write_u32(node, GLUE_PREV, NodeRef::NULL.0);
-        if old_head.is_null() {
-            *tail = node;
-        } else {
-            self.write_u32(old_head, GLUE_PREV, node.0);
-        }
-        *head = node;
-    }
-
-    #[inline]
-    fn glue_remove(&mut self, node: NodeRef, head: &mut NodeRef, tail: &mut NodeRef) {
-        let prev = self.glue_prev(node);
-        let next = self.glue_next(node);
-        if prev.is_null() {
-            *head = next;
-        } else {
-            self.write_u32(prev, GLUE_NEXT, next.0);
-        }
-        if next.is_null() {
-            *tail = prev;
-        } else {
-            self.write_u32(next, GLUE_PREV, prev.0);
-        }
-    }
-
-    /// Merge physically adjacent free blocks. Free lists are LIFO stacks, so
-    /// the collection order, merge order, and reinsertion order all determine
-    /// which block a later allocation returns — and through that the
-    /// fragmentation pattern and the model-restart point, which must stay in
-    /// lockstep with the encoder.
+    /// `GlueFreeBlocks`. The first u16 of every 12-byte record is its type
+    /// stamp: a state array's first state has a nonzero frequency, a context
+    /// a nonzero `NumStats`, a free block 0, and the guard at `lo_unit` 1.
+    /// The arena's last record is always the order-0 context.
     fn glue_free_blocks(&mut self) {
-        // Prevent a block ending at LoUnit from seeing a stale free stamp.
+        let mut n = 0u32;
+        self.glue_count = 255;
+
         if self.lo_unit != self.hi_unit {
-            self.write_byte_at(NodeRef(self.lo_unit).offset(), 0);
+            self.set_u16(self.lo_unit + NODE_STAMP, 1);
         }
 
-        // Overlay a 12-byte doubly linked block on every free block and insert
-        // each removal at the sentinel head. A null link represents the
-        // sentinel in the offset-based arena.
-        let mut head = NodeRef::NULL;
-        let mut tail = NodeRef::NULL;
-        for (idx, &units) in INDEX_TO_UNITS.iter().enumerate().take(NUM_INDEXES) {
-            let units = units as u16;
-            while !self.free_lists[idx].is_null() {
-                let node = self.remove_node(idx);
-                self.glue_insert_head(node, &mut head, &mut tail);
-                self.write_u16(node, GLUE_STAMP, GLUE_FREE_STAMP);
-                self.write_u16(node, GLUE_UNITS, units);
+        // One list of every free block, last list first.
+        for (i, &units) in INDEX2UNITS.iter().enumerate() {
+            let nu = units as u16;
+            let mut next = self.free_list[i];
+            self.free_list[i] = 0;
+            while next != 0 {
+                let node = next;
+                next = self.u32(node);
+                self.set_u16(node + NODE_STAMP, EMPTY_NODE);
+                self.set_u16(node + NODE_NU, nu);
+                self.set_u32(node + NODE_NEXT, n);
+                n = node;
             }
         }
 
-        // Walk in reverse collection order and absorb the physical successor
-        // whenever it is another member of the temporary free chain.
-        let mut node = head;
-        while !node.is_null() {
-            loop {
-                let units = self.read_u16(node, GLUE_UNITS);
-                let successor = NodeRef(node.0 + units as u32);
-                if self.read_u16(successor, GLUE_STAMP) != GLUE_FREE_STAMP {
-                    break;
+        // Glue and fill walk the list in the same direction.
+        let head = self.glue_blocks(n);
+        self.fill_list(head);
+    }
+
+    /// The glue half of `GlueFreeBlocks`: merges each block with the free
+    /// blocks that follow it, unlinking empty headers. Returns the new head.
+    fn glue_blocks(&mut self, first: u32) -> u32 {
+        let mut head = first;
+        // The link to rewrite when a header is dropped: `None` for `head`,
+        // `Some(node)` for that node's `next` field.
+        let mut prev: Option<u32> = None;
+        let mut n = first;
+        while n != 0 {
+            let node = n;
+            let mut nu = self.u16(node + NODE_NU) as u32;
+            n = self.u32(node + NODE_NEXT);
+            if nu == 0 {
+                match prev {
+                    None => head = n,
+                    Some(p) => self.set_u32(p + NODE_NEXT, n),
                 }
-                let successor_units = self.read_u16(successor, GLUE_UNITS);
-                let merged_units = units as u32 + successor_units as u32;
-                if merged_units >= 0x10000 {
-                    break;
+            } else {
+                prev = Some(node);
+                loop {
+                    let node2 = node + nu * UNIT_SIZE;
+                    nu += self.u16(node2 + NODE_NU) as u32;
+                    if self.u16(node2 + NODE_STAMP) != EMPTY_NODE || nu >= 0x10000 {
+                        break;
+                    }
+                    self.set_u16(node + NODE_NU, nu as u16);
+                    self.set_u16(node2 + NODE_NU, 0);
                 }
-                self.glue_remove(successor, &mut head, &mut tail);
-                self.write_u16(node, GLUE_UNITS, merged_units as u16);
             }
-            node = self.glue_next(node);
         }
+        head
+    }
 
-        // Reinsert from the temporary head. Leading 128-unit blocks and the
-        // tail-before-head split preserve canonical LIFO allocation order.
-        while !head.is_null() {
-            let mut node = head;
-            self.glue_remove(node, &mut head, &mut tail);
-            let mut sz = self.read_u16(node, GLUE_UNITS) as u32;
-            while sz > 128 {
-                self.insert_node(node, NUM_INDEXES - 1);
-                node = NodeRef(node.0 + 128);
-                sz -= 128;
+    /// The fill half of `GlueFreeBlocks`: puts every glued block back on the
+    /// free lists, in 128-unit pieces and a remainder.
+    fn fill_list(&mut self, head: u32) {
+        let mut n = head;
+        while n != 0 {
+            let mut node = n;
+            let mut nu = self.u16(node + NODE_NU) as u32;
+            n = self.u32(node + NODE_NEXT);
+            if nu == 0 {
+                continue;
             }
-            let mut idx = Self::units_to_index(sz as usize);
-            if INDEX_TO_UNITS[idx] as u32 != sz {
-                idx -= 1;
-                let tail = sz - INDEX_TO_UNITS[idx] as u32;
-                self.insert_node(NodeRef(node.0 + (sz - tail)), (tail - 1) as usize);
+            while nu > 128 {
+                self.insert_node(node, NUM_INDEXES as u32 - 1);
+                nu -= 128;
+                node += 128 * UNIT_SIZE;
             }
-            self.insert_node(node, idx);
+            let mut index = u2i(nu);
+            if i2u(index) != nu {
+                index -= 1;
+                let k = i2u(index);
+                self.insert_node(node + k * UNIT_SIZE, nu - k - 1);
+            }
+            self.insert_node(node, index);
         }
     }
 
-    /// Previous allocation/sort implementation retained only as an ordering
-    /// oracle for the intrusive glue tests.
-    #[cfg(test)]
-    fn glue_free_blocks_reference(&mut self) {
-        let mut chain: Vec<(NodeRef, u32)> = Vec::new();
-        let mut removed: Vec<bool> = Vec::new();
-        for (idx, &bin_units) in INDEX_TO_UNITS.iter().enumerate().take(NUM_INDEXES) {
-            let units = bin_units as u32;
-            while !self.free_lists[idx].is_null() {
-                let node = self.remove_node(idx);
-                chain.push((node, units));
-                removed.push(false);
-            }
-        }
-
-        let mut by_start: Vec<(u32, usize)> =
-            chain.iter().enumerate().map(|(i, e)| (e.0.0, i)).collect();
-        by_start.sort_unstable_by_key(|&(start, _)| start);
-        for i in (0..chain.len()).rev() {
-            if removed[i] {
-                continue;
-            }
-            loop {
-                let (node, units) = chain[i];
-                let Ok(pos) = by_start.binary_search_by_key(&(node.0 + units), |&(start, _)| start)
-                else {
-                    break;
-                };
-                let successor = by_start[pos].1;
-                if removed[successor] || units + chain[successor].1 >= 0x10000 {
-                    break;
-                }
-                chain[i].1 += chain[successor].1;
-                removed[successor] = true;
-            }
-        }
-
-        for i in (0..chain.len()).rev() {
-            if removed[i] {
-                continue;
-            }
-            let (mut node, mut sz) = chain[i];
-            while sz > 128 {
-                self.insert_node(node, NUM_INDEXES - 1);
-                node = NodeRef(node.0 + 128);
-                sz -= 128;
-            }
-            let mut idx = Self::units_to_index(sz as usize);
-            if INDEX_TO_UNITS[idx] as u32 != sz {
-                idx -= 1;
-                let tail = sz - INDEX_TO_UNITS[idx] as u32;
-                self.insert_node(NodeRef(node.0 + (sz - tail)), (tail - 1) as usize);
-            }
-            self.insert_node(node, idx);
-        }
-    }
-
-    fn alloc_units_rare(&mut self, idx: usize) -> NodeRef {
+    /// `AllocUnitsRare`: glue once per 255 calls, then a larger block split
+    /// down, then units stolen from the top of the text region. `None` when
+    /// the arena is full (the model restarts).
+    #[inline(never)]
+    pub(crate) fn alloc_units_rare(&mut self, index: u32) -> Option<u32> {
         if self.glue_count == 0 {
-            self.glue_count = GLUE_COUNT_RESET;
             self.glue_free_blocks();
-            if !self.free_lists[idx].is_null() {
-                return self.remove_node(idx);
+            if self.has_free(index) {
+                return Some(self.remove_node(index));
             }
         }
-
-        #[allow(clippy::needless_range_loop)]
-        for i in idx + 1..NUM_INDEXES {
-            if !self.free_lists[i].is_null() {
-                let node = self.remove_node(i);
-                self.split_block(node, i, idx);
-                return node;
+        let mut i = index;
+        loop {
+            i += 1;
+            if i == NUM_INDEXES as u32 {
+                let num_bytes = i2u(index) * UNIT_SIZE;
+                let us = self.units_start;
+                self.glue_count -= 1;
+                return if us - self.text > num_bytes {
+                    self.units_start = us - num_bytes;
+                    Some(self.units_start)
+                } else {
+                    None
+                };
+            }
+            if self.has_free(i) {
+                break;
             }
         }
-
-        self.glue_count = self.glue_count.saturating_sub(1);
-        self.steal_from_text_region(idx)
+        let block = self.remove_node(i);
+        self.split_block(block, i, index);
+        Some(block)
     }
 
-    fn steal_from_text_region(&mut self, idx: usize) -> NodeRef {
-        let units = INDEX_TO_UNITS[idx] as usize;
-        let bytes = units * UNIT_SIZE;
-        if self.fake_units_start_bytes.saturating_sub(self.p_text) <= bytes {
-            return NodeRef::NULL;
+    /// `AllocUnits`.
+    #[inline(always)]
+    pub(crate) fn alloc_units(&mut self, index: u32) -> Option<u32> {
+        if self.has_free(index) {
+            return Some(self.remove_node(index));
         }
-
-        let Some(fake_start) = self.fake_units_start_bytes.checked_sub(bytes) else {
-            return NodeRef::NULL;
-        };
-        let Some(units_start) = self.units_start_bytes.checked_sub(bytes) else {
-            return NodeRef::NULL;
-        };
-        self.fake_units_start_bytes = fake_start;
-        self.units_start_bytes = units_start;
-        NodeRef((units_start / UNIT_SIZE) as u32)
-    }
-
-    /// Allocate a block of `units` contiguous units from lo_unit or free lists.
-    /// Used for state arrays.
-    pub(crate) fn alloc_units(&mut self, units: usize) -> NodeRef {
-        let idx = Self::units_to_index(units);
-        let bin_units = INDEX_TO_UNITS[idx] as usize;
-
-        if !self.free_lists[idx].is_null() {
-            return self.remove_node(idx);
+        let num_bytes = i2u(index) * UNIT_SIZE;
+        let lo = self.lo_unit;
+        if self.hi_unit - lo >= num_bytes {
+            self.lo_unit = lo + num_bytes;
+            return Some(lo);
         }
+        self.alloc_units_rare(index)
+    }
 
-        if self.lo_unit + bin_units as u32 <= self.hi_unit {
-            let node = NodeRef(self.lo_unit);
-            self.lo_unit += bin_units as u32;
-            return node;
+    /// One unit for a context, from `hi_unit` first (`CreateSuccessors`).
+    #[inline(always)]
+    pub(crate) fn alloc_context(&mut self) -> Option<u32> {
+        if self.hi_unit != self.lo_unit {
+            self.hi_unit -= UNIT_SIZE;
+            Some(self.hi_unit)
+        } else if self.has_free(0) {
+            Some(self.remove_node(0))
+        } else {
+            self.alloc_units_rare(0)
         }
-
-        self.alloc_units_rare(idx)
-    }
-
-    /// Allocate exactly 1 unit from lo_unit or free lists.
-    #[cfg(test)]
-    pub(crate) fn alloc_one(&mut self) -> NodeRef {
-        self.alloc_units(1)
-    }
-
-    /// Allocate a context node from hi_unit (growing downward).
-    pub(crate) fn alloc_context(&mut self) -> NodeRef {
-        if self.hi_unit > self.lo_unit {
-            self.hi_unit -= 1;
-            return NodeRef(self.hi_unit);
-        }
-        // Fallback to free list.
-        if !self.free_lists[0].is_null() {
-            let node = self.free_lists[0];
-            let free_node = self.read_free_node(node);
-            self.free_lists[0] = free_node.next;
-            return node;
-        }
-        self.alloc_units_rare(0)
-    }
-
-    /// Expand a block from `old_nu` to `old_nu + 1` units.
-    /// Returns the (possibly relocated) NodeRef, or NULL if out of memory.
-    pub(crate) fn expand_units(&mut self, node: NodeRef, old_nu: usize) -> NodeRef {
-        let old_idx = Self::units_to_index(old_nu);
-        let new_idx = Self::units_to_index(old_nu + 1);
-        if old_idx == new_idx {
-            return node; // already fits in the same bin
-        }
-        let new_node = self.alloc_units(old_nu + 1);
-        if new_node.is_null() {
-            return NodeRef::NULL;
-        }
-        // Copy data.
-        let src = node.offset();
-        let dst = new_node.offset();
-        let len = old_nu * UNIT_SIZE;
-        self.copy_checked(src, dst, len);
-        self.insert_node(node, old_idx);
-        new_node
-    }
-
-    /// Shrink a block from `old_nu` to `new_nu` units.
-    /// Returns the (possibly relocated) NodeRef.
-    pub(crate) fn shrink_units(&mut self, node: NodeRef, old_nu: usize, new_nu: usize) -> NodeRef {
-        let old_idx = Self::units_to_index(old_nu);
-        let new_idx = Self::units_to_index(new_nu);
-        if old_idx == new_idx {
-            return node;
-        }
-        if !self.free_lists[new_idx].is_null() {
-            let new_node = self.remove_node(new_idx);
-            let src = node.offset();
-            let dst = new_node.offset();
-            let len = new_nu * UNIT_SIZE;
-            self.copy_checked(src, dst, len);
-            self.insert_node(node, old_idx);
-            return new_node;
-        }
-        self.split_block(node, old_idx, new_idx);
-        node
-    }
-
-    /// Free a block of `units` contiguous units back to the appropriate free list.
-    pub(crate) fn free_units(&mut self, node: NodeRef, units: usize) {
-        let idx = Self::units_to_index(units);
-        self.insert_node(node, idx);
-    }
-
-    /// Free exactly 1 unit.
-    #[cfg(test)]
-    pub(crate) fn free_one(&mut self, node: NodeRef) {
-        self.insert_node(node, 0);
-    }
-
-    // ---- Arena access via NodeRef (unit-aligned) ----
-
-    /// Read a u8 at a specific byte offset within a node.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn read_u8(&self, node: NodeRef, field_offset: usize) -> u8 {
-        self.node_field_offset(node, field_offset, 1)
-            .and_then(|off| self.arena.get(off).copied())
-            .unwrap_or_else(|| {
-                self.mark_arena_fault();
-                0
-            })
-    }
-
-    /// Write a u8 at a specific byte offset within a node.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn write_u8(&mut self, node: NodeRef, field_offset: usize, val: u8) {
-        let Some(off) = self.node_field_offset(node, field_offset, 1) else {
-            self.mark_arena_fault();
-            return;
-        };
-        self.arena[off] = val;
-    }
-
-    /// Read a u16 LE at a specific byte offset within a node.
-    #[inline]
-    pub(crate) fn read_u16(&self, node: NodeRef, field_offset: usize) -> u16 {
-        let Some(off) = self.node_field_offset(node, field_offset, 2) else {
-            self.mark_arena_fault();
-            return 0;
-        };
-        u16::from_le_bytes([self.arena[off], self.arena[off + 1]])
-    }
-
-    /// Write a u16 LE at a specific byte offset within a node.
-    #[inline]
-    pub(crate) fn write_u16(&mut self, node: NodeRef, field_offset: usize, val: u16) {
-        let Some(off) = self.node_field_offset(node, field_offset, 2) else {
-            self.mark_arena_fault();
-            return;
-        };
-        let bytes = val.to_le_bytes();
-        self.arena[off] = bytes[0];
-        self.arena[off + 1] = bytes[1];
-    }
-
-    /// Read a u32 LE at a specific byte offset within a node.
-    #[inline]
-    pub(crate) fn read_u32(&self, node: NodeRef, field_offset: usize) -> u32 {
-        let Some(off) = self.node_field_offset(node, field_offset, 4) else {
-            self.mark_arena_fault();
-            return 0;
-        };
-        u32::from_le_bytes([
-            self.arena[off],
-            self.arena[off + 1],
-            self.arena[off + 2],
-            self.arena[off + 3],
-        ])
-    }
-
-    /// Write a u32 LE at a specific byte offset within a node.
-    #[inline]
-    pub(crate) fn write_u32(&mut self, node: NodeRef, field_offset: usize, val: u32) {
-        let Some(off) = self.node_field_offset(node, field_offset, 4) else {
-            self.mark_arena_fault();
-            return;
-        };
-        let bytes = val.to_le_bytes();
-        self.arena[off..off + 4].copy_from_slice(&bytes);
-    }
-
-    // ---- Direct byte-offset arena access (for state records) ----
-
-    /// Read a byte at an arbitrary byte offset in the arena.
-    #[inline]
-    pub(crate) fn read_byte_at(&self, off: usize) -> u8 {
-        self.checked_offset(off, 1)
-            .and_then(|off| self.arena.get(off).copied())
-            .unwrap_or_else(|| {
-                self.mark_arena_fault();
-                0
-            })
-    }
-
-    /// Write a byte at an arbitrary byte offset.
-    #[inline]
-    pub(crate) fn write_byte_at(&mut self, off: usize, val: u8) {
-        let Some(off) = self.checked_offset(off, 1) else {
-            self.mark_arena_fault();
-            return;
-        };
-        self.arena[off] = val;
-    }
-
-    /// Read u16 LE at an arbitrary byte offset.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn read_u16_at(&self, off: usize) -> u16 {
-        let Some(off) = self.checked_offset(off, 2) else {
-            self.mark_arena_fault();
-            return 0;
-        };
-        u16::from_le_bytes([self.arena[off], self.arena[off + 1]])
-    }
-
-    /// Read u32 LE at an arbitrary byte offset.
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn read_u32_at(&self, off: usize) -> u32 {
-        let Some(off) = self.checked_offset(off, 4) else {
-            self.mark_arena_fault();
-            return 0;
-        };
-        u32::from_le_bytes([
-            self.arena[off],
-            self.arena[off + 1],
-            self.arena[off + 2],
-            self.arena[off + 3],
-        ])
-    }
-
-    /// Write u32 LE at an arbitrary byte offset.
-    #[inline]
-    pub(crate) fn write_u32_at(&mut self, off: usize, val: u32) {
-        let Some(off) = self.checked_offset(off, 4) else {
-            self.mark_arena_fault();
-            return;
-        };
-        self.arena[off..off + 4].copy_from_slice(&val.to_le_bytes());
-    }
-
-    /// Copy bytes within the arena.
-    #[cfg(test)]
-    pub(crate) fn copy_within(&mut self, src: usize, dst: usize, len: usize) {
-        self.copy_checked(src, dst, len);
-    }
-
-    /// Clear the recorded arena fault.
-    pub(crate) fn clear_arena_fault(&self) {
-        self.arena_fault.set(false);
-    }
-
-    /// Return and clear the recorded arena fault.
-    #[cfg(test)]
-    pub(crate) fn take_arena_fault(&self) -> bool {
-        let faulted = self.arena_fault.get();
-        self.arena_fault.set(false);
-        faulted
-    }
-
-    // ---- Internal ----
-
-    fn mark_arena_fault(&self) {
-        self.arena_fault.set(true);
-    }
-
-    fn checked_offset(&self, off: usize, len: usize) -> Option<usize> {
-        off.checked_add(len)
-            .filter(|end| *end <= self.arena.len())
-            .map(|_| off)
-    }
-
-    fn node_field_offset(&self, node: NodeRef, field_offset: usize, len: usize) -> Option<usize> {
-        node.offset()
-            .checked_add(field_offset)
-            .and_then(|off| self.checked_offset(off, len))
-    }
-
-    fn copy_checked(&mut self, src: usize, dst: usize, len: usize) {
-        if self.checked_offset(src, len).is_none() || self.checked_offset(dst, len).is_none() {
-            self.mark_arena_fault();
-            return;
-        }
-        self.arena.copy_within(src..src + len, dst);
-    }
-
-    fn read_free_node(&self, node: NodeRef) -> FreeNode {
-        FreeNode {
-            next: NodeRef(self.read_u32(node, 0)),
-        }
-    }
-
-    fn write_free_node(&mut self, node: NodeRef, free_node: FreeNode) {
-        self.write_u32(node, 0, free_node.next.0);
-    }
-
-    /// Check if the allocator has available memory.
-    #[cfg(test)]
-    pub(crate) fn has_memory(&self) -> bool {
-        self.lo_unit < self.hi_unit
-            || self.free_lists.iter().any(|n| !n.is_null())
-            || self.fake_units_start_bytes.saturating_sub(self.p_text) > UNIT_SIZE
     }
 }
 
@@ -1084,368 +451,103 @@ impl SubAllocator {
 mod tests {
     use super::*;
 
-    fn rar_layout_values(requested_size: usize) -> (usize, usize, usize, usize) {
-        let allocated_size = (requested_size / UNIT_SIZE) * UNIT_SIZE + 2 * UNIT_SIZE;
-        let size2 = UNIT_SIZE * ((requested_size / 8 / UNIT_SIZE) * 7);
-        let size1 = requested_size - size2;
-        let real_size1 = (size1 / UNIT_SIZE) * UNIT_SIZE + UNIT_SIZE;
-        let real_size2 = (size2 / UNIT_SIZE) * UNIT_SIZE;
-        (allocated_size, size1, real_size1, real_size2)
-    }
+    const SIZE: u32 = 1 << 16;
 
     #[test]
-    fn allocator_layout_matches_rar_suballocator_formula() {
-        for mib in [1usize, 2, 4, 8, 17] {
-            let requested_size = mib * 1024 * 1024;
-            let layout = SubAllocator::layout_for(requested_size);
-            let (allocated_size, size1, real_size1, real_size2) = rar_layout_values(requested_size);
-
-            assert_eq!(layout.allocated_size, HEAP_BASE_BYTES + allocated_size);
-            assert_eq!(layout.fake_units_start_bytes, HEAP_BASE_BYTES + size1);
-            assert_eq!(layout.units_start_bytes, HEAP_BASE_BYTES + real_size1);
-            assert_eq!(
-                layout.lo_unit as usize * UNIT_SIZE,
-                HEAP_BASE_BYTES + real_size1
-            );
-            assert_eq!(
-                layout.hi_unit as usize * UNIT_SIZE,
-                HEAP_BASE_BYTES + real_size1 + real_size2
-            );
-            assert_eq!(
-                layout.total_units as usize * UNIT_SIZE,
-                HEAP_BASE_BYTES + allocated_size
-            );
-            assert_eq!(layout.fake_units_start_bytes - HEAP_BASE_BYTES, size1);
-            assert!(layout.fake_units_start_bytes < layout.units_start_bytes);
+    fn tables_match_7zip() {
+        assert_eq!(
+            INDEX2UNITS,
+            [
+                1, 2, 3, 4, 6, 8, 10, 12, 15, 18, 21, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64,
+                68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128
+            ]
+        );
+        for nu in 1..=128u32 {
+            let i = u2i(nu);
+            assert!(i2u(i) >= nu);
+            assert!(i == 0 || i2u(i - 1) < nu);
         }
     }
 
     #[test]
-    fn text_region_preserves_full_rar_size1_capacity() {
-        let requested_size = 4 * 1024 * 1024;
-        let (_, size1, _, _) = rar_layout_values(requested_size);
-        let alloc = SubAllocator::new(requested_size);
-
-        assert_eq!(alloc.text_position(), HEAP_BASE_BYTES);
-        assert_eq!(alloc.fake_units_start_bytes - alloc.text_position(), size1);
-    }
-
-    #[test]
-    fn text_exhaustion_occurs_after_full_rar_text_capacity() {
-        let requested_size = 96;
-        let (_, size1, _, _) = rar_layout_values(requested_size);
-        let mut alloc = SubAllocator::new(requested_size);
-
-        for _ in 0..size1 {
-            assert!(!alloc.text_exhausted());
-            alloc.write_text_byte(0x41);
-        }
-
-        assert_eq!(alloc.text_position(), HEAP_BASE_BYTES + size1);
-        assert!(alloc.text_exhausted());
-    }
-
-    #[test]
-    fn reset_restores_rar_layout_boundaries() {
-        let requested_size = 4 * 1024 * 1024;
-        let mut alloc = SubAllocator::new(requested_size);
-        let original_fake_start = alloc.fake_units_start_bytes;
-        let original_units_start = alloc.units_start_bytes;
-
-        alloc.lo_unit = alloc.hi_unit;
-        alloc.fake_units_start_bytes -= UNIT_SIZE;
-        alloc.units_start_bytes -= UNIT_SIZE;
-        alloc.reset();
-
-        assert_eq!(alloc.fake_units_start_bytes, original_fake_start);
-        assert_eq!(alloc.units_start_bytes, original_units_start);
-        assert!(alloc.fake_units_start_bytes < alloc.units_start_bytes);
-    }
-
-    #[test]
-    fn test_alloc_one() {
-        let mut alloc = SubAllocator::new(4096);
-        let n = alloc.alloc_one();
-        assert!(!n.is_null());
-    }
-
-    #[test]
-    fn test_alloc_free_reuse() {
-        let mut alloc = SubAllocator::new(4096);
-        let n1 = alloc.alloc_one();
-        alloc.free_one(n1);
-        let n2 = alloc.alloc_one();
-        assert_eq!(n1, n2);
-    }
-
-    #[test]
-    fn test_alloc_multiple_units() {
-        let mut alloc = SubAllocator::new(4096);
-        let n = alloc.alloc_units(4);
-        assert!(!n.is_null());
-    }
-
-    #[test]
-    fn test_alloc_context() {
-        let mut alloc = SubAllocator::new(4096);
-        let c1 = alloc.alloc_context();
-        let c2 = alloc.alloc_context();
-        assert!(!c1.is_null());
-        assert!(!c2.is_null());
-        // Contexts are allocated from hi_unit (descending).
-        assert!(c1.0 > c2.0);
-    }
-
-    #[test]
-    fn test_read_write() {
-        let mut alloc = SubAllocator::new(4096);
-        let n = alloc.alloc_one();
-        alloc.write_u8(n, 0, 0xAA);
-        alloc.write_u16(n, 2, 0xBBCC);
-        alloc.write_u32(n, 4, 0xDDEEFF00);
-        assert_eq!(alloc.read_u8(n, 0), 0xAA);
-        assert_eq!(alloc.read_u16(n, 2), 0xBBCC);
-        assert_eq!(alloc.read_u32(n, 4), 0xDDEEFF00);
-    }
-
-    #[test]
-    fn test_text_region() {
-        let mut alloc = SubAllocator::new(4096);
-        let pos = alloc.write_text_byte(0x42);
-        assert_eq!(pos, HEAP_BASE_BYTES); // first text byte after NULL unit
-        assert_eq!(alloc.read_byte_at(pos), 0x42);
-        assert_eq!(alloc.text_position(), HEAP_BASE_BYTES + 1);
-    }
-
-    #[test]
-    fn test_expand_units() {
-        let mut alloc = SubAllocator::new(4096);
-        let n = alloc.alloc_units(1);
-        alloc.write_u32(n, 0, 0xDEADBEEF);
-        let expanded = alloc.expand_units(n, 1);
-        assert!(!expanded.is_null());
-        // Data should be preserved.
-        assert_eq!(alloc.read_u32(expanded, 0), 0xDEADBEEF);
-    }
-
-    #[test]
-    fn test_shrink_units() {
-        let mut alloc = SubAllocator::new(4096);
-        let n = alloc.alloc_units(4);
-        alloc.write_u32(n, 0, 0xCAFEBABE);
-        let shrunk = alloc.shrink_units(n, 4, 1);
-        assert!(!shrunk.is_null());
-        assert_eq!(alloc.read_u32(shrunk, 0), 0xCAFEBABE);
-    }
-
-    #[test]
-    fn test_reset() {
-        let mut alloc = SubAllocator::new(4096);
-        let _n1 = alloc.alloc_one();
-        let _n2 = alloc.alloc_one();
-        alloc.reset();
-        assert!(alloc.has_memory());
-    }
-
-    #[test]
-    fn reset_reuses_arena_without_clearing_payload_bytes() {
-        let mut alloc = SubAllocator::new(4096);
-        let node = alloc.alloc_one();
-        alloc.write_u32(node, 0, 0xDEAD_BEEF);
-
-        alloc.reset();
-        let reused = alloc.alloc_one();
-
-        assert_eq!(reused, node);
-        assert_eq!(alloc.read_u32(reused, 0), 0xDEAD_BEEF);
-    }
-
-    #[test]
-    fn test_direct_byte_access() {
-        let mut alloc = SubAllocator::new(4096);
-        let n = alloc.alloc_one();
-        let off = n.offset();
-        alloc.write_byte_at(off + 3, 0x77);
-        assert_eq!(alloc.read_byte_at(off + 3), 0x77);
-        alloc.write_u32_at(off + 4, 0x12345678);
-        assert_eq!(alloc.read_u32_at(off + 4), 0x12345678);
-    }
-
-    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(miri)))]
-    #[test]
-    fn state_batch_gather_matches_scalar_across_arena_alignments() {
-        const STATE_SIZE: usize = 6;
-        const STATE_COUNT: usize = 8;
-        const BATCH_BYTES: usize = STATE_SIZE * STATE_COUNT;
-
-        let mut alloc = SubAllocator::new(4096);
-        for batch in 0..4u16 {
-            let states = alloc.alloc_units(BATCH_BYTES / UNIT_SIZE);
-            assert!(!states.is_null());
-
-            for lane in 0..STATE_COUNT {
-                let head = (batch << 12) | ((lane as u16) << 8) | (0x80 + lane as u16);
-                alloc.write_u16(states, lane * STATE_SIZE, head);
-            }
-
-            let span = alloc
-                .validated_model_span(states.offset() as u32, BATCH_BYTES)
-                .expect("allocated state batch is a valid model span");
-
-            #[cfg(target_arch = "aarch64")]
-            {
-                let expected: [u16; 8] =
-                    std::array::from_fn(|lane| alloc.span_read_u16(span, lane * STATE_SIZE));
-                assert_eq!(alloc.span_read_state_heads8(span, 0), expected);
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            {
-                let expected: [u8; 8] =
-                    std::array::from_fn(|lane| alloc.span_read_u8(span, lane * STATE_SIZE));
-                assert!(std::arch::is_x86_feature_detected!("ssse3"));
-                let mut lanes = [0u8; 16];
-                // SAFETY: SSSE3 was detected and the validated span covers the
-                // batch; the store target is exactly one 16-byte vector wide.
-                unsafe {
-                    let gathered = alloc.span_read_state_syms8_ssse3(span, 0);
-                    std::arch::x86_64::_mm_storeu_si128(lanes.as_mut_ptr().cast(), gathered);
-                }
-                assert_eq!(&lanes[..8], &expected[..], "lane order must be state order");
-                assert_eq!(&lanes[8..], &[0u8; 8], "upper lanes must gather as zero");
-            }
-
-            assert!(!alloc.alloc_one().is_null());
+    fn layout_matches_ppmd7_restart_model() {
+        for size in [2048u32, 2049, 2050, 2051, 1 << 20, (1 << 20) + 7] {
+            let a = Arena::new(size);
+            let align = (4 - size % 4) % 4;
+            assert_eq!(a.text, align);
+            assert_eq!((a.text + size) % 4, 0);
+            assert_eq!(a.hi_unit, align + size);
+            assert_eq!(a.units_start, align + size - size / 8 / 12 * 7 * 12);
+            assert_eq!(a.lo_unit, a.units_start);
         }
     }
 
     #[test]
-    fn adjacent_freed_blocks_are_glued_for_larger_allocation() {
-        let mut alloc = SubAllocator::new(4096);
-        let first = alloc.alloc_units(1);
-        let second = alloc.alloc_units(1);
-        assert_eq!(second.0, first.0 + 1);
-
-        alloc.free_units(first, 1);
-        alloc.free_units(second, 1);
-        alloc.lo_unit = alloc.hi_unit;
-        alloc.glue_count = 0;
-
-        let merged = alloc.alloc_units(2);
-
-        assert_eq!(merged, first);
-    }
-
-    fn free_list_snapshot(alloc: &SubAllocator) -> Vec<Vec<u32>> {
-        alloc
-            .free_lists
-            .iter()
-            .map(|&head| {
-                let mut nodes = Vec::new();
-                let mut node = head;
-                while !node.is_null() {
-                    assert!(nodes.len() < 4096, "free-list cycle at bin head {head:?}");
-                    nodes.push(node.0);
-                    node = alloc.read_free_node(node).next;
-                }
-                nodes
-            })
-            .collect()
+    fn freed_blocks_are_reused_last_in_first_out() {
+        let mut a = Arena::new(SIZE);
+        let x = a.alloc_units(1).unwrap();
+        let y = a.alloc_units(1).unwrap();
+        assert_eq!(y, x + 2 * UNIT_SIZE);
+        a.insert_node(x, 1);
+        a.insert_node(y, 1);
+        assert_eq!(a.alloc_units(1), Some(y));
+        assert_eq!(a.alloc_units(1), Some(x));
     }
 
     #[test]
-    fn intrusive_glue_matches_reference_order_for_every_size_class() {
-        for seed in [1u64, 0x5eed, 0xdead_beef, u32::MAX as u64] {
-            let mut alloc = SubAllocator::new(256 * 1024);
-            let blocks = INDEX_TO_UNITS
-                .iter()
-                .map(|&units| (alloc.alloc_units(units as usize), units as usize))
-                .collect::<Vec<_>>();
-            assert!(blocks.iter().all(|(node, _)| !node.is_null()));
+    fn split_frees_the_tail_in_list_sizes() {
+        let mut a = Arena::new(SIZE);
+        let block = a.alloc_units(NUM_INDEXES as u32 - 1).unwrap(); // 128 units
+        a.split_block(block, NUM_INDEXES as u32 - 1, 0);
+        // 127 units left over: a 124-unit block and a 3-unit block.
+        assert!(a.has_free(u2i(124)));
+        assert!(a.has_free(u2i(3)));
+    }
 
-            let mut order = (0..blocks.len()).collect::<Vec<_>>();
-            let mut state = seed;
-            for index in (1..order.len()).rev() {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                order.swap(index, state as usize % (index + 1));
-            }
-            for index in order {
-                let (node, units) = blocks[index];
-                alloc.free_units(node, units);
-            }
-
-            let mut reference = alloc.clone();
-            alloc.glue_free_blocks();
-            reference.glue_free_blocks_reference();
-
-            assert_eq!(
-                free_list_snapshot(&alloc),
-                free_list_snapshot(&reference),
-                "free-list ordering diverged for seed {seed:#x}"
-            );
-            assert!(!alloc.take_arena_fault());
+    #[test]
+    fn glue_merges_adjacent_free_blocks() {
+        let mut a = Arena::new(SIZE);
+        // Fill the gap between lo_unit and hi_unit so allocations must come
+        // from the free lists.
+        let first = a.alloc_units(0).unwrap();
+        let second = a.alloc_units(0).unwrap();
+        let gap = (a.hi_unit - a.lo_unit) / UNIT_SIZE;
+        for _ in 0..gap {
+            // A live context's first u16 (NumStats) is nonzero.
+            let c = a.alloc_context().unwrap();
+            a.set_u16(c, 1);
         }
+        assert_eq!(a.lo_unit, a.hi_unit);
+        a.insert_node(first, 0);
+        a.insert_node(second, 0);
+        a.glue_count = 0;
+        // A two-unit request finds no two-unit block until the glue pass
+        // merges the neighbours.
+        assert_eq!(a.alloc_units(1), Some(first));
     }
 
     #[test]
-    fn rare_allocation_escalates_to_larger_bin_and_splits() {
-        let mut alloc = SubAllocator::new(4096);
-        let block = alloc.alloc_units(4);
-        alloc.free_units(block, 4);
-        alloc.lo_unit = alloc.hi_unit;
-        alloc.glue_count = 1;
-
-        let head = alloc.alloc_units(1);
-        let tail = alloc.alloc_units(3);
-
-        assert_eq!(head, block);
-        assert_eq!(tail.0, block.0 + 1);
+    fn rare_allocation_steals_from_the_text_region_then_fails() {
+        let mut a = Arena::new(SIZE);
+        a.lo_unit = a.hi_unit;
+        a.glue_count = 1;
+        let us = a.units_start;
+        assert_eq!(a.alloc_units_rare(0), Some(us - UNIT_SIZE));
+        assert_eq!(a.units_start, us - UNIT_SIZE);
+        a.text = a.units_start - UNIT_SIZE;
+        a.glue_count = 1;
+        assert_eq!(a.alloc_units_rare(0), None);
     }
 
     #[test]
-    fn rare_allocation_steals_from_text_region_before_null() {
-        let mut alloc = SubAllocator::new(4096);
-        let old_units_start = alloc.units_start_bytes;
-        let old_fake_start = alloc.fake_units_start_bytes;
-        alloc.lo_unit = alloc.hi_unit;
-        alloc.glue_count = 1;
-
-        let stolen = alloc.alloc_units(1);
-
-        assert!(!stolen.is_null());
-        assert_eq!(stolen.offset(), old_units_start - UNIT_SIZE);
-        assert_eq!(alloc.units_start_bytes, old_units_start - UNIT_SIZE);
-        assert_eq!(alloc.fake_units_start_bytes, old_fake_start - UNIT_SIZE);
-    }
-
-    #[test]
-    fn rare_allocation_returns_null_after_glue_escalation_and_steal_fail() {
-        let mut alloc = SubAllocator::new(4096);
-        alloc.lo_unit = alloc.hi_unit;
-        alloc.glue_count = 1;
-        alloc.p_text = alloc.fake_units_start_bytes - UNIT_SIZE;
-
-        let node = alloc.alloc_units(1);
-
-        assert!(node.is_null());
-    }
-
-    #[test]
-    fn out_of_bounds_arena_access_records_fault_instead_of_panicking() {
-        let mut alloc = SubAllocator::new(96);
-        let past_end = 10_000;
-
-        assert_eq!(alloc.read_byte_at(past_end), 0);
-        assert!(alloc.take_arena_fault());
-
-        alloc.write_u32_at(past_end, 0x12345678);
-        assert!(alloc.take_arena_fault());
-
-        alloc.copy_within(past_end, 0, 4);
-        assert!(alloc.take_arena_fault());
-
-        let bogus_node = NodeRef(u32::MAX);
-        assert_eq!(alloc.read_u32(bogus_node, 0), 0);
-        assert!(alloc.take_arena_fault());
+    fn reset_keeps_the_arena_and_its_bytes() {
+        let mut a = Arena::new(SIZE);
+        let addr = a.arena_addr();
+        a.set_u8(a.text + 100, 0xA5);
+        a.alloc_units(3).unwrap();
+        a.reset();
+        assert_eq!(a.arena_addr(), addr);
+        assert_eq!(a.u8(a.text + 100), 0xA5);
+        assert_eq!(a.lo_unit, a.units_start);
     }
 }
