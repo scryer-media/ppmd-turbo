@@ -454,7 +454,7 @@
   "schema": "ppmd-turbo-corpus/conformance/1",
   "sevenzip": {
     "banner": "7-Zip (z) 26.01 (arm64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-04-27",
-    "version": "7-Zip"
+    "version": "26.01"
   },
   "streams": [
     {

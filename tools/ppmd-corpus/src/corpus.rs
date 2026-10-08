@@ -54,6 +54,7 @@ impl SevenZip {
             .to_string();
         let version = banner
             .split_whitespace()
+            .skip(1)
             .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
             .unwrap_or("")
             .to_string();
