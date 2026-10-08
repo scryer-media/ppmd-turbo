@@ -325,12 +325,13 @@ under the invariant the bound is never hit, but it costs one compare.
 Sources: `PpmdDecoder.cpp:31-47`, `PpmdEncoder.cpp:72-128`, `unpack30.cpp`
 DecodeInit (`model.cpp:571-599`).
 
-**In ppmd-turbo.** `Model::new` and `Model::start` accept the 7z decode
-ranges and return `InvalidParameters` for anything else. Both encoders
+**In ppmd-turbo.** `Params::new` accepts the 7z decode ranges and returns
+`ErrorKind::InvalidParameters` for anything else; every codec takes a
+`Params`, so nothing re-validates. Both encoders
 take the same ranges, as ppmd-rust's do: 7-Zip's `PpmdEncoder.cpp` refuses
 orders above 32 and arenas below 64 KiB, but 7-Zip extracts such streams.
-`RarDecoder::init_model` takes the order and the size in MiB and rejects
-orders outside 2..64 and sizes outside 1..256 MiB. The unrar-rs seed clamped
+`Params::rar` takes the order and the size in MiB and rejects orders
+outside 2..64 and sizes outside 1..256 MiB. The unrar-rs seed clamped
 out-of-range values instead of rejecting them.
 
 ---
@@ -590,7 +591,7 @@ The 7z method writes no end marker (`PpmdEncoder.cpp:166`).
   - ppmd-turbo must treat both conditions as corrupt data on every carry-less
     path.
   - **In ppmd-turbo** the RAR decoder faults when `Range / total` (or the
-    binary `Range / 2^14`) is 0, and the model reports `CorruptStream`. It
+    binary `Range / 2^14`) is 0, and the model reports `ErrorKind::Corrupt`. It
     also faults when a decode leaves Range at 0, which the normalisation
     loop above would never leave. A count of `total` or more is corrupt, as
     in unrar. None of these checks fires on well-formed input.
@@ -609,20 +610,29 @@ correctness only and is never benchmarked (see the licensing note in 5.1).
   (`RangeInput`) or output (`RangeOutput`), and the model is generic over the
   coder (`RangeDecoder`, `RangeEncoder`). After monomorphization there is no
   call through a trait object anywhere on the per-symbol or per-byte path.
-- **Input buffering.** A normalization step reads one byte with a single
-  comparison against the end of the current buffer. Refills are `#[cold]`
-  and out of line. There are three backings:
-  - `SliceInput` borrows the whole stream and never refills;
-  - `ReadInput` owns a refill buffer (64 KiB by default) over
-    `std::io::Read`, so an unbuffered file costs one `read` per refill;
-  - `SourceInput` copies a 256-byte window out of a `ByteSource` shared
-    with another reader (RAR's LZ bit stream). On drop it consumes exactly
-    the bytes the coder took.
+- **Input and output are caller slices.** The step codecs never own an
+  input buffer and never keep caller bytes between calls. A decoder reads
+  through `SliceInput` over the slice it was handed, with a single
+  comparison against the end per byte, and saves its registers when the
+  call returns; the next call restores them over the next slice. The
+  encoders write into the caller's output slice and keep only the bytes
+  that did not fit (at most a few per symbol) in a small pending queue,
+  which the next call drains before it codes anything.
 
-  No `unsafe` is needed. The slice and `Vec` lookups use `get(pos)`, whose
-  bounds check is the end-of-buffer test, and the window index is masked
-  to its power-of-two size.
-- **Past the end of the input** every backing feeds zeros and counts them,
+  A non-final call decodes only while a whole symbol's input remains: the
+  per-symbol margin is `2 * (order + 2)` bytes for the 7z coder and
+  `4 * (order + 2)` for the carry-less coder (264 bytes at most,
+  `MAX_INPUT_PER_SYMBOL`), so the fast loop needs no end-of-input check
+  that could split a symbol. Short of the margin the call returns
+  `NeedInput` with an exact consumed count. Only a call that says its input
+  is the last decodes up to and past the end. No `unsafe` is needed: the
+  slice lookups use `get(pos)`, whose bounds check is the end-of-buffer
+  test.
+- **Streams.** `io::SevenZReader` drives the 7z decoder from a `BufRead`,
+  copying at most `2 * MAX_INPUT_PER_SYMBOL` bytes to stitch a symbol that
+  straddles two of the reader's buffers, and consumes exactly the bytes the
+  coder took. `io::SevenZWriter` drives the encoder into a `Write`.
+- **Past the end of the last input** the decoders feed zeros and count them,
   as unrar (`read_byte_or_zero`) and 7-Zip (its `Extra` flag) do. The
   framing reads the count: RAR tolerates a little padding mid-block, 7z
   none. A prefix of a valid stream therefore decodes exactly as the prefix
@@ -630,8 +640,8 @@ correctness only and is never benchmarked (see the licensing note in 5.1).
 - **Inlined per-symbol path.** The coder registers are plain fields and
   every operation is `#[inline(always)]`. The framings decode symbol after
   symbol into the caller's buffer through the model's `decode_symbol`, and
-  the coder leaves the inlined path only to refill its input, once per
-  buffer.
+  the fast loop leaves the inlined path only at the margin or a full output
+  slice.
 - **Normalization schedule.** The 7z coder applies exactly the reference's
   step counts: two after a decode and after a binary miss, one after a
   binary hit. The step at the top of the escape loop is applied eagerly at
@@ -642,7 +652,7 @@ correctness only and is never benchmarked (see the licensing note in 5.1).
   a zero total or a zero symbol size. Either decoder records it as a sticky
   fault instead of dividing by zero, or, for the carry-less coder, instead
   of normalizing forever. It leaves `range = 1` so later arithmetic stays
-  defined, and the model reports `CorruptStream`. The carry-less coder's
+  defined, and the model reports `ErrorKind::Corrupt`. The carry-less coder's
   RAR-style `get_current_count` returns the error directly. The encoders
   fault on the same conditions, and `finish` reports the fault.
 - **Initialization.**
@@ -652,9 +662,10 @@ correctness only and is never benchmarked (see the licensing note in 5.1).
     `Ppmd7a_RangeDec_Init`'s `0xFFFFFFFF` check.
   - Either decoder returns `Truncated` when the input is shorter than its
     initialization.
-- **Resuming.** `RangeCoderState` saves and restores the carry-less
-  registers across RAR solid members, without re-reading the four
-  initialization bytes.
+- **Resuming.** Every decoder saves its registers at the end of a call and
+  restores them on the next. `RarPpmd` keeps the carry-less registers across
+  blocks and RAR solid members, reading the four initialization bytes only
+  at a block that starts the coder (`start_block`).
 
 ---
 
@@ -710,15 +721,17 @@ are raw.
 decoding switches back to LZ tables. Reaching this path means the data is
 corrupt.
 
-**In ppmd-turbo** `RarDecoder::decode_symbol` returns `Ok(None)` for the -1
-and `RarDecoder::cleanup` performs CleanUp, so a caller can reproduce
-unrar's recovery output exactly; the unrar-rs RAR3 unpacker does. Coder or
-model faults (section 4.2, pointer checks) are `Err(CorruptStream)` instead.
+**In ppmd-turbo** `RarPpmd::decode` returns `RarStatus::ModelEnd` (and
+`next_symbol` `Symbol::ModelEnd`) for the -1, and `RarPpmd::cleanup`
+performs CleanUp, so a caller can reproduce unrar's recovery output exactly;
+the unrar-rs RAR3 unpacker does. Coder or model faults (section 4.2, pointer
+checks) are `ErrorKind::Corrupt` instead, and poison the decoder until the
+next `start_block` with parameters.
 
 **Solid archives.** The model and coder continue across file boundaries,
-mid-block. ppmd-turbo's `RarDecoder` holds the model across blocks and
-members; the coder's registers are saved with `RarRangeDecoder::state` and
-restored with `from_state`, which reads no init bytes.
+mid-block. ppmd-turbo's `RarPpmd` holds the model and the coder's registers
+across blocks and members; `start_block(None)` continues them without
+reading init bytes.
 
 **Licensing.** The unRAR licence forbids using unrar source to build a
 RAR-compatible compressor. No RARLAB source text is copied into this crate

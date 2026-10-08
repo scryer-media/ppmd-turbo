@@ -10,7 +10,7 @@ iteration counts, no sleeps and no clocks.
 | unit and conformance tests | `src/`, `tests/conformance_*.rs`, `tests/fixtures/` | `cargo test`, every platform |
 | encoder tests | `tests/encode_7z.rs`, `tests/encode_carryless.rs` | `cargo test`, every platform; Miri runs the small cases |
 | hostile-input tests | `tests/hostile_decode.rs`, `tests/hostile_memory.rs`, `tests/hostile_fixtures/` | `cargo test`, Miri, ASan |
-| fuzzing, seven targets | `fuzz/` | six in the `fuzz` CI lane (short) and `fuzz-extended.yml` (long); `range_coders` on demand |
+| fuzzing, eight targets | `fuzz/` | six in the `fuzz` CI lane (short) and `fuzz-extended.yml` (long); `range_coders` and `chunking_invariance` on demand |
 | in-process differential | the fuzz targets, against ppmd-rust 1.5.0 | with fuzzing |
 | out-of-process oracles | `tools/ppmd-oracle/`, `tests/differential_binaries.rs`, `tests/encode_oracle_7zz.rs` | on demand, against `7zz` and `unrar` |
 | Miri | `cargo miri nextest run` | the `miri-x86_64` CI lane |
@@ -36,9 +36,17 @@ offending input in hex. The cases are:
   unknown size, a marker before the known size, data after the marker, and
   no marker with an unknown size.
 
-`tests/hostile_memory.rs` installs a counting global allocator and bounds
-peak live heap to the arena plus a fixed slack. That covers long garbage
-into a tiny arena and the restart storm reusing its arena.
+`tests/hostile_memory.rs` installs a counting global allocator, tallied per
+thread so the test harness's own threads cannot move a count. It bounds
+peak live heap to the arena plus a fixed slack for long garbage into a tiny
+arena and for the restart storm reusing its arena, checks that every codec
+allocates exactly `Params::memory_footprint` and reports it, and that an
+arena handed on with `into_arena` and `with_arena` is not allocated again.
+
+Every suite reaches the codecs through `tests/common/api.rs`, which feeds
+the step API uneven input and output pieces (from one byte to 64 KiB, and
+pieces just around the per-symbol margin), so each conformance and hostile
+case also exercises the step contract.
 
 The fixtures in `tests/hostile_fixtures/` are generated, with invented
 payloads, by `fuzz/src/seeds.rs`. Do not edit them by hand.
@@ -65,11 +73,14 @@ agreement rule, so every target stays a few lines long.
 | `roundtrip_carryless` | 3-byte header + payload | ppmd-turbo's raw carry-less stream decodes to the payload through the RAR block API and through ppmd-rust's `7a` decoder; ppmd-rust's `7a` stream decodes through the RAR block API |
 | `structure_7z` | parameters, a payload generator and up to 8 edits (flip, truncate, insert, delete, append) applied to a valid stream | an unedited stream decodes to its payload; an edited one agrees with ppmd-rust |
 | `range_coders` | 9-byte operations (a kind and two `u32`s) | both range coders on their own: decoding arbitrary bytes never panics, loops or divides by zero; clamped operations round-trip through each encoder and decoder |
+| `chunking_invariance` | 12-byte header (codec, order, memory, flags, split seed) + payload | for 7z, carry-less and RAR (with `next_symbol` after each escape), encoded or raw streams decode to the same bytes, verdict and error position in arbitrary input and output pieces as in one; the encoders write the same stream either way; `NeedInput` only short of one symbol's input, `OutputFull` only on a full slice, errors repeat |
 
 Every target reaches ppmd-turbo through the shim in `fuzz/src/api.rs`, which
-routes each decoder and encoder entry to the crate. `range_coders` calls the
-coders in `ppmd_turbo::rc` directly. It has no committed seeds and is not in
-the CI matrices; run it by hand.
+drives each step codec through input and output pieces chosen by a seeded
+generator, so a failing input reproduces its own split points.
+`range_coders` calls the coders through `ppmd_turbo::internals` directly.
+It and `chunking_invariance` have no committed seeds and are not in the CI
+matrices; run them by hand.
 
 Memory per iteration is bounded: decode arenas cap at 64 MiB, round-trip
 arenas at 16 MiB, RAR arenas at 16 MiB, generated payloads at 16 KiB and
@@ -179,64 +190,46 @@ test or the fuzz agreement rule (`fuzz/src/outcome.rs`, `agree`) records it.
 Decoding:
 
 - **7z input ends before the data does.** ppmd-turbo returns
-  `Error::Truncated` (`UnexpectedEof` through `Read`), as 7-Zip does when it
+  `ErrorKind::Truncated` (`UnexpectedEof` through `io`), as 7-Zip does when it
   reads past the input. ppmd-rust treats the end of input as the end of the
   data and returns what it has. `decode_differential_7z` and `structure_7z`
   allow for this.
 - **Error classes.** Where both fail, the agreement rule compares only that
   both failed and the common prefix of the output; ppmd-turbo's error kinds
-  (`Truncated`, `CorruptStream`, `InvalidParameters`) do not map one to one
+  (`Truncated`, `Corrupt`, `InvalidParameters`) do not map one to one
   onto ppmd-rust's.
-- **7z end marker before a known size.** The streaming decoder returns
-  `Ok(0)` there, as ppmd-rust does, so a caller that knows the size sees a
-  short read. The in-memory decoder reports it as a corrupt stream. With
-  7-Zip's FinishStream mode (opt-in, as in 7-Zip) the streaming path
-  reports it too and also requires the coder's code to be zero at the size.
-- **Input read-ahead.** The streaming 7z decoder reads its input through a
-  64 KiB buffer, where ppmd-rust reads a byte at a time; bytes buffered but
-  not consumed are lost when the reader is unwrapped. The consumed count is
-  reported separately for the container's packed-size check.
+- **7z end marker before a known size.** The decoder returns
+  `SevenZStatus::EndMarker` there, as ppmd-rust ends its output, and the
+  caller decides what a short stream means. With 7-Zip's FinishStream mode
+  (opt-in, as in 7-Zip) it is a corrupt stream, and the coder's code must
+  also be zero at the size.
+- **Input consumption.** The decoders consume exactly the stream's bytes and
+  report the count, where ppmd-rust reads a byte at a time from a reader.
+  `io::SevenZReader` consumes from its `BufRead` only what the coder took,
+  so the bytes after the stream stay in the reader.
 - **RAR end marker reached on padding.** A PPMd end marker decoded after the
-  coder has run past the end of its input is `Error::Truncated`. Without
+  coder has run past the end of its input is `ErrorKind::Truncated`. Without
   this check a member cut short could decode to `Ok` on the zeros the coder
   feeds past the end.
-- **RAR block of zero bytes.** A block with empty coder input returns
-  `Ok(0)`, as documented: there is nothing to decode. The conformance cut at
-  length 0 expects that, and every later cut expects an error.
+- **RAR block of zero bytes.** The test shim's `decode_block` returns
+  `Ok(0)` for empty coder input without starting a block: there is nothing
+  to decode. The conformance cut at length 0 expects that, and every later
+  cut expects an error.
 
 Encoding (the coded bytes are identical; the differences are in the
-`Write` adapters around them):
+`Write` adapter around them):
 
 - **`flush` mid-stream.** ppmd-rust's `flush` flushes the range coder,
   writing its final bytes, so a stream flushed before `finish` no longer
-  matches 7-Zip's. ppmd-turbo's `flush` only hands the bytes the coder has
-  settled to the writer; the coder's pending bytes stay until `finish`.
-  `tests/encode_7z.rs` and `tests/encode_carryless.rs` flush before
-  `finish` and check the output matches the in-memory encoder's.
+  matches 7-Zip's. `io::SevenZWriter::flush` only hands the bytes the coder
+  has settled to the writer; the coder's pending bytes stay until `finish`.
+  `tests/encode_7z.rs` writes through the adapter in pieces, finishes twice
+  and checks the output matches the one-call encoder's.
 - **Writer errors.** ppmd-rust writes each coded byte to the writer as it
-  settles and reports a failure from that `write`. ppmd-turbo batches coded
-  bytes (64 KiB) and reports the writer's error from the next `flush` or
-  from `finish`.
+  settles and reports a failure from that `write`. `io::SevenZWriter`
+  batches coded bytes (64 KiB) and reports the writer's error from the
+  `write`, `flush` or `finish` that hands the batch over.
 - **Parameters.** Both accept orders 2..=64 and arenas from 2 KiB, wider
   than 7-Zip's encoder (orders up to 32, arenas from 64 KiB, multiples of
   4). Streams outside 7-Zip's encoder window are checked by 7-Zip
   extracting them (`tests/encode_oracle_7zz.rs`).
-
-## Encoder wiring still owed
-
-Every fuzz target already runs ppmd-turbo's encoders through
-`fuzz/src/api.rs`. Three places still wait on the encoder and run the
-reference or skip:
-
-- **Coder differential.** The two encoder tests in
-  `tests/coder_differential.rs` are `#[ignore = "awaiting encoder"]` and
-  their `api` bodies are not filled in. `tests/encode_7z.rs` and
-  `tests/encode_carryless.rs` cover the same comparisons in the meantime.
-- **Oracles.** `TURBO_ENCODER` is `false` and `turbo_encode_7z` is
-  unimplemented in `tests/differential_binaries.rs`; the `Codec::Turbo`
-  encode arm in `tools/ppmd-oracle/src/codec.rs` reports itself
-  unavailable. `tests/encode_oracle_7zz.rs` covers the encoder against
-  `7zz` in the meantime.
-- **Bench.** `ENCODE_7Z` is `false` in `tools/ppmd-bench/src/turbo.rs`, so
-  `ppmd-bench` has no ppmd-turbo `encode-7z` and the harness plans no
-  ppmd-turbo 7z encode rows.

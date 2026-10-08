@@ -24,9 +24,11 @@ carry-less encode row and `ppmd-bench` has no `encode-rar`.
 
 ppmd-turbo rows appear only for the operations the crate provides:
 `ppmd-bench info` reports them, and the harness plans from that. Both
-decoders are wired. The crate's 7z encoder is not wired into `ppmd-bench`
-yet (`ENCODE_7Z` in `tools/ppmd-bench/src/turbo.rs`), so 7z encode rows
-measure ppmd-rust against 7zz, the baseline ppmd-turbo is then held to.
+decoders and the 7z encoder are wired (`tools/ppmd-bench/src/turbo.rs`).
+ppmd-bench drives the step API the way a container does: for 7z decode,
+the whole stream as the last input, drained into fixed output buffers; for
+RAR, `RarPpmd::decode` with `next_symbol` after each escape; for 7z encode,
+the encoder into fixed output buffers.
 
 ## Corpora
 
