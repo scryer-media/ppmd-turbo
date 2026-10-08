@@ -307,6 +307,24 @@ Every item below lists the same fields:
   symbol gather) and `decode_symbol2` (`model.rs:1063`).
 - **Measure:** per-architecture A/B on order-2 and order-4 text and binary
   corpora; keep only per-arch wins.
+- **Stance:** the earlier x86 attempts in the seed are not the last word. The
+  seed could only retrofit vectors onto a layout chosen for scalar code; this
+  crate can choose its layouts. Revisit with an open mind once the scalar
+  plumbing (D1 to D3) is in and profiles are fresh, in particular:
+  - layouts that make the gather free: a structure-of-arrays shadow of the
+    Symbol and Freq bytes for wide contexts (kept in step on update), so the
+    search is a plain byte compare and a prefix sum over contiguous bytes
+    instead of a stride-6 gather;
+  - a SIMD escape pass over the mask of seen symbols (256-bit test on the
+    `charMask` bytes), which is independent of the State layout;
+  - the x86 ISA tiers the seed never tried: AVX2 compare plus `movemask` for
+    the symbol search, AVX-512 VBMI for the gather, and the 128-bit-only
+    path on Zen 2 and Denverton class cores;
+  - SVE2 and NEON `tbl` on Arm beyond the `vld3` heads;
+  - rescale and model restart as the clearest vector candidates (contiguous
+    byte halving and arena clearing).
+  Each tier lives behind runtime dispatch and is kept only on a measured win
+  on that architecture; a loss or wash is removed, not left behind a flag.
 
 ### D12. Restart cost and restart storms
 
