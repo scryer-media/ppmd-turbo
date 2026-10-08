@@ -2079,6 +2079,36 @@ impl Model {
             return unsafe { self.span_find_state_from_ssse3(states_span, index, ns, sym) };
         }
 
+        // D11 C3: compare sixteen symbols in one vector and reduce the match
+        // lanes to a 64-bit nibble mask (`shrn #4`), instead of storing the
+        // heads and testing them one by one.
+        #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
+        {
+            use std::arch::aarch64::*;
+            // SAFETY: register-only NEON intrinsics; NEON is part of every
+            // AArch64 target's baseline.
+            let wanted = unsafe { vdupq_n_u8(sym) };
+            while index + 16 <= ns {
+                let h0 = self
+                    .alloc
+                    .span_state_heads8_neon(states_span, index * STATE_SIZE);
+                let h1 = self
+                    .alloc
+                    .span_state_heads8_neon(states_span, (index + 8) * STATE_SIZE);
+                // SAFETY: as above.
+                let bits = unsafe {
+                    let syms = vmovn_high_u16(vmovn_u16(h0), h1);
+                    let eq = vceqq_u8(syms, wanted);
+                    vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(
+                        eq,
+                    ))))
+                };
+                if bits != 0 {
+                    return Some(index + (bits.trailing_zeros() / 4) as usize);
+                }
+                index += 16;
+            }
+        }
         #[cfg(all(target_arch = "aarch64", not(miri)))]
         while index + 8 <= ns {
             let heads = self
