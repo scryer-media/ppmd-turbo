@@ -8,10 +8,8 @@
 //! - `ppmd_turbo::rar::RarDecoder::new()` and
 //!   `decode_block(reset, order, mem_mb, rc_data, unpacked_remaining, out)`
 //!   returning the bytes of `rc_data` consumed;
-//! - the 7z and carry-less encoders, which do not exist yet: their
-//!   functions return `None` and the targets skip the ppmd-turbo half of the
-//!   iteration. To switch one on, replace its body with the call in its doc
-//!   comment; `docs/testing.md` keeps the list.
+//! - `ppmd_turbo::Ppmd7Encoder` and `ppmd_turbo::carryless::CarrylessEncoder`,
+//!   fed the whole payload and finished with or without the end marker.
 
 use crate::outcome::{ErrKind, Outcome, classify, drain};
 
@@ -63,38 +61,33 @@ impl RarSession {
     }
 }
 
-/// Encodes with ppmd-turbo's 7z encoder.
-///
-/// Intended body:
-///
-/// ```ignore
-/// use std::io::Write;
-/// let run = || -> ppmd_turbo::Result<Vec<u8>> {
-///     let mut enc = ppmd_turbo::ppmd7::Ppmd7Encoder::new(Vec::new(), order, mem)?;
-///     enc.write_all(payload)?;
-///     Ok(enc.finish(end_marker)?)
-/// };
-/// Some(run().map_err(|e| crate::outcome::classify(&e)))
-/// ```
+/// Encodes with ppmd-turbo's 7z encoder, through `Ppmd7Encoder`.
 pub fn encode_7z(
     payload: &[u8],
     order: u32,
     mem: u32,
     end_marker: bool,
 ) -> Option<Result<Vec<u8>, ErrKind>> {
-    let _ = (payload, order, mem, end_marker);
-    None
+    let run = || -> ppmd_turbo::Result<Vec<u8>> {
+        let mut enc = ppmd_turbo::Ppmd7Encoder::new(Vec::new(), order, mem)?;
+        enc.encode(payload)?;
+        enc.finish(end_marker)
+    };
+    Some(run().map_err(|e| classify(&e)))
 }
 
-/// Encodes with ppmd-turbo's carry-less encoder (`mem` in bytes).
-///
-/// Intended body: as [`encode_7z`], with the carry-less encoder type.
+/// Encodes with ppmd-turbo's carry-less encoder (`mem` in bytes), through
+/// `carryless::CarrylessEncoder`.
 pub fn encode_carryless(
     payload: &[u8],
     order: u32,
     mem: u32,
     end_marker: bool,
 ) -> Option<Result<Vec<u8>, ErrKind>> {
-    let _ = (payload, order, mem, end_marker);
-    None
+    let run = || -> ppmd_turbo::Result<Vec<u8>> {
+        let mut enc = ppmd_turbo::carryless::CarrylessEncoder::new(Vec::new(), order, mem)?;
+        enc.encode(payload)?;
+        enc.finish(end_marker)
+    };
+    Some(run().map_err(|e| classify(&e)))
 }

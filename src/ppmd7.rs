@@ -371,9 +371,9 @@ impl<W: Write> Ppmd7Encoder<W> {
     /// arena of `mem_size` bytes.
     ///
     /// Errors: [`Error::InvalidParameters`] for an order outside
-    /// [`PPMD7_MIN_ORDER`](crate::PPMD7_MIN_ORDER)`..=`[`PPMD7_MAX_ORDER`](crate::PPMD7_MAX_ORDER)
+    /// [`PPMD7_MIN_ORDER`]`..=`[`PPMD7_MAX_ORDER`]
     /// or a size outside
-    /// [`PPMD7_MIN_MEM_SIZE`](crate::PPMD7_MIN_MEM_SIZE)`..=`[`PPMD7_MAX_MEM_SIZE`](crate::PPMD7_MAX_MEM_SIZE).
+    /// [`PPMD7_MIN_MEM_SIZE`]`..=`[`PPMD7_MAX_MEM_SIZE`].
     pub fn new(writer: W, order: u32, mem_size: u32) -> Result<Self> {
         Ok(Self {
             model: Model::new(order, mem_size)?,
