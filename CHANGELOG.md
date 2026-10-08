@@ -65,3 +65,6 @@ is a released version.
   decoders.
 - CI: a deterministic fuzz run of every target, the hostile tests under
   AddressSanitizer, and a dispatch-only `fuzz-extended` workflow.
+- Decode: the escape decode gathers the unmasked states without a branch
+  per state, 1.2-1.35x faster on binary and mixed input (7z binary order 6:
+  1293M to 911M cycles) and unchanged on text.

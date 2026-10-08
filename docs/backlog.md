@@ -250,6 +250,11 @@ Every item below lists the same fields:
   `clear_mask` (`model.rs:2227`).
 - **Measure:** cycles in the escape loop on binary or high-entropy data
   (escape-heavy) vs text.
+- **Done (scalar part), 0.1.0:** the stamps and the packed scratch came
+  over from unrar-rs; the gather is now branch-free (each state is stored
+  and kept by adding its unmasked bit to the index), which was 47% of the
+  samples on binary input. 7z binary order 6, 1 MiB: 1293M to 911M cycles
+  (ppmd-rust 811M); carry-less binary order 6: 1.33x, mixed: 1.21x.
 
 ### D9. Wide loads for context heads and successors
 
