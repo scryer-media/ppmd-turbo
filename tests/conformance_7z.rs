@@ -32,8 +32,10 @@ fn manifest_matches_the_committed_streams() {
     let manifest = common::manifest();
     let streams = sevenz_streams(&manifest);
     let mut failures = Vec::new();
+    let mut checked = 0;
     for s in &streams {
-        let data = read(s);
+        let Some(data) = read(s) else { continue };
+        checked += 1;
         let name = s["name"].as_str().unwrap();
         if data.len() as u64 != u64_of(s, "stream_len") || sha256(&data) != s["stream_sha256"] {
             failures.push(format!("{name}: bytes differ from the manifest"));
@@ -51,7 +53,7 @@ fn manifest_matches_the_committed_streams() {
             ));
         }
     }
-    report(&failures, streams.len());
+    report(&failures, checked);
 }
 
 #[test]
@@ -59,9 +61,11 @@ fn every_stream_decodes_to_its_payload() {
     let manifest = common::manifest();
     let streams = sevenz_streams(&manifest);
     let mut failures = Vec::new();
+    let mut checked = 0;
     for s in &streams {
         let name = s["name"].as_str().unwrap();
-        let data = read(s);
+        let Some(data) = read(s) else { continue };
+        checked += 1;
         let len = (s["end_marker"] != true).then(|| u64_of(s, "payload_len"));
         let decoded = no_panic(name, || {
             decode_7z(
@@ -87,7 +91,7 @@ fn every_stream_decodes_to_its_payload() {
             Ok(Ok(_)) => {}
         }
     }
-    report(&failures, streams.len());
+    report(&failures, checked);
 }
 
 /// An end-marker stream read with its known length gives the same bytes:
@@ -100,9 +104,11 @@ fn end_marker_streams_also_decode_by_length() {
         .filter(|s| s["end_marker"] == true)
         .collect();
     let mut failures = Vec::new();
+    let mut checked = 0;
     for s in &streams {
         let name = s["name"].as_str().unwrap();
-        let data = read(s);
+        let Some(data) = read(s) else { continue };
+        checked += 1;
         let len = Some(u64_of(s, "payload_len"));
         match decode_7z(
             &data,
@@ -115,7 +121,7 @@ fn end_marker_streams_also_decode_by_length() {
             Err(e) => failures.push(format!("{name}: {e}")),
         }
     }
-    report(&failures, streams.len());
+    report(&failures, checked);
 }
 
 #[test]
@@ -128,9 +134,12 @@ fn corrupted_streams_fail_as_their_recipes_say() {
         if base["coder"] != "7z" {
             continue;
         }
+        let Some(base_data) = read(base) else {
+            continue;
+        };
         checked += 1;
         let name = c["name"].as_str().unwrap();
-        let bad = common::corrupt(c["op"].as_str().unwrap(), &read(base));
+        let bad = common::corrupt(c["op"].as_str().unwrap(), &base_data);
         let len = Some(u64_of(base, "payload_len"));
         match no_panic(name, || {
             decode_7z(
@@ -157,7 +166,7 @@ fn corrupted_streams_fail_as_their_recipes_say() {
 fn every_truncation_of_a_small_stream_is_clean() {
     let manifest = common::manifest();
     let s = common::stream(&manifest, &"text-1k.o6.m64k.7zz.ppmd".into());
-    let data = read(s);
+    let Some(data) = read(s) else { return };
     let want = payload_sha256(&manifest, s);
     let mut failures = Vec::new();
     for cut in 0..data.len() {
@@ -178,7 +187,7 @@ fn every_truncation_of_a_small_stream_is_clean() {
 fn out_of_range_parameters_are_rejected() {
     let manifest = common::manifest();
     let s = common::stream(&manifest, &"text-1k.o6.m64k.7zz.ppmd".into());
-    let data = read(s);
+    let Some(data) = read(s) else { return };
     let len = Some(u64_of(s, "payload_len"));
     let min_mem = ppmd_turbo::Params::MIN_MEM;
     let max_mem = ppmd_turbo::Params::MAX_MEM;

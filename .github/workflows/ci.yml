@@ -87,10 +87,50 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - run: cargo doc --locked --no-deps --all-features
 
+  # Every generated fixture, written once from the committed recipes and
+  # handed to the lanes that read them. None is committed. The job fails if
+  # any oracle is missing or any file differs from
+  # tools/ppmd-corpus/fixtures.sha256, so no row is silently skipped.
+  fixtures:
+    name: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install 7-Zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends 7zip
+          sevenzip="$(command -v 7zz || command -v 7z)"
+          "$sevenzip" | head -n 3
+          echo "SEVENZIP=$sevenzip" >> "$GITHUB_ENV"
+      - name: Regenerate every fixture
+        run: cargo run --locked --release -p ppmd-corpus -- fixtures --require-all --sevenzip "$SEVENZIP"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fixtures
+          path: |
+            tests/fixtures/7z/
+            tests/fixtures/rar/
+            tests/hostile_fixtures/
+            fuzz/seeds/
+            fuzz/regressions/
+          if-no-files-found: error
+          retention-days: 7
+
   test:
     name: test-${{ matrix.platform }}
+    needs: fixtures
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    env:
+      # A missing fixture fails the suite instead of being skipped.
+      PPMD_TURBO_REQUIRE_FIXTURES: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -114,6 +154,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fixtures
       - name: Test all features
         run: cargo test --locked --workspace --all-features --no-fail-fast
       - name: Test default features
@@ -138,8 +181,8 @@ jobs:
         run: cargo "+$NIGHTLY_TOOLCHAIN" miri setup
       - name: Miri
         env:
-          # The hostile and conformance tests read their fixtures from
-          # tests/; nothing in the suite reads a clock or the environment.
+          # Isolation stays off as before; the lanes Miri runs read no
+          # fixture files and no clock.
           MIRIFLAGS: -Zmiri-disable-isolation
         # Miri runs the unit tests, which cover every unsafe path in the
         # model and the coders, plus the two small coder suites. The corpus,
@@ -147,8 +190,8 @@ jobs:
         # the two-hour job limit under Miri; the native lanes run them.
         run: cargo "+" miri nextest run --locked --all-features -j "$(nproc)" -E 'kind(lib) | binary(coder_differential) | binary(encode_carryless)'
 
-  # The fuzz harness library and its committed seeds: the seeds must match
-  # what fuzz/src/seeds.rs generates, so a format change regenerates them.
+  # The fuzz harness library, including the seed generator's own checks
+  # (the fixtures job checks the generated seeds against their digests).
   fuzz-harness:
     name: fuzz-harness
     runs-on: ubuntu-24.04
@@ -163,16 +206,17 @@ jobs:
           components: clippy
       - name: Clippy
         run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
-      - name: Harness tests and seed freshness
+      - name: Harness tests
         run: cargo test --locked --manifest-path fuzz/Cargo.toml --lib
 
   # A short, deterministic run of every target on both 64-bit Linux
   # architectures: a fixed libFuzzer seed and a fixed iteration count per
-  # target, starting from the committed seeds. cargo-fuzz builds with
+  # target, starting from the generated seeds. cargo-fuzz builds with
   # AddressSanitizer. A crash fails the lane; the input is kept as an
   # artifact.
   fuzz:
     name: fuzz-${{ matrix.platform }}-${{ matrix.target }}
+    needs: fixtures
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -222,6 +266,9 @@ jobs:
           toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fixtures
       - name: Fuzz
         env:
           TARGET: ${{ matrix.target }}
@@ -302,7 +349,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [fmt, clippy, docs, test, miri, fuzz-harness, fuzz, asan, msrv, package]
+    needs: [fmt, clippy, docs, fixtures, test, miri, fuzz-harness, fuzz, asan, msrv, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

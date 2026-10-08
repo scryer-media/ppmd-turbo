@@ -68,7 +68,13 @@ is a released version.
 - `ppmd-corpus` generates the conformance and bench corpora: seeded
   payloads, 7z PPMd streams from ppmd-rust and 7-Zip, and RAR PPMd members,
   each recorded in a manifest with its parameters and digests.
-- Conformance fixtures under `tests/fixtures`, with 7z and RAR conformance
+- No binary file is committed. `cargo run --locked --release -p ppmd-corpus
+  -- fixtures` regenerates every fixture, fuzz seed and fuzz regression from
+  the committed recipes and checks each against
+  `tools/ppmd-corpus/fixtures.sha256`; CI runs it before the tests. The
+  ppmd-rust and hostile fixtures are also built in memory by `cargo test`.
+- Conformance fixtures under `tests/fixtures` (a committed manifest, generated
+  streams), with 7z and RAR conformance
   suites over them; encoder suites and an opt-in `7zz` oracle.
 - Hostile-input tests (truncation, bit flips, parameter range, restart
   storms, size lies, end-marker cases, an exact heap footprint) with
@@ -76,7 +82,7 @@ is a released version.
   and output splits.
 - Eight cargo-fuzz targets with bounded memory: `decode_7z`, `decode_rar`,
   `decode_differential_7z`, `roundtrip_7z`, `roundtrip_carryless` and
-  `structure_7z` with committed seed corpora, `range_coders` for the coders
+  `structure_7z` with generated seed corpora, `range_coders` for the coders
   on their own, and `chunking_invariance`, which checks that arbitrary input
   and output splits give the same bytes, verdict and error position as one
   piece.

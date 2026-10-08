@@ -3,7 +3,7 @@ name: fuzz-extended
 # Long fuzz campaigns and the binary oracles, on demand only. Never runs on
 # pull requests or pushes. Each target gets its own job; a crash keeps the
 # failing input, and every run keeps the corpus it grew so it can be
-# minimised and folded back into fuzz/seeds.
+# minimised and folded back into fuzz/src/seeds.rs.
 
 on:
   workflow_dispatch:
@@ -67,6 +67,9 @@ jobs:
           toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      # The seeds and regressions are generated, never committed.
+      - name: Generate the seeds
+        run: cargo "+$NIGHTLY_TOOLCHAIN" run --locked --release -p ppmd-corpus -- fixtures --only seeds
       - name: Fuzz
         env:
           TARGET: ${{ matrix.target }}

@@ -1,6 +1,7 @@
 //! `ppmd-corpus`: generates ppmd-turbo's corpora.
 //!
 //! ```text
+//! ppmd-corpus fixtures [--root .] [--sevenzip 7zz] [--rar-source DIR] [--require-all] [--only conformance,seeds] [--write-digests]
 //! ppmd-corpus conformance [--dir tests/fixtures] [--sevenzip 7zz] --rar-source <unrar-rs>/tests/fixtures/rar4
 //! ppmd-corpus bench --profile quick|full --dir bench/fixtures/<profile> [--sevenzip 7zz] [--only SUBSTR,...]
 //! ppmd-corpus payload --name fixture-text-1m.bin --out FILE
@@ -11,9 +12,10 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use ppmd_corpus::{corpus, payload};
+use ppmd_corpus::{corpus, fixtures, payload};
 
 const USAGE: &str = "usage:
+  ppmd-corpus fixtures [--root .] [--sevenzip 7zz] [--rar-source DIR] [--require-all] [--only conformance,seeds] [--write-digests]
   ppmd-corpus conformance [--dir tests/fixtures] [--sevenzip 7zz] --rar-source DIR
   ppmd-corpus bench --profile quick|full [--dir bench/fixtures/<profile>] [--sevenzip 7zz] [--only SUBSTR,...]
   ppmd-corpus payload --name fixture-<kind>-<size>.bin --out FILE";
@@ -27,6 +29,9 @@ struct Args {
     only: Vec<String>,
     name: Option<String>,
     out: Option<PathBuf>,
+    root: Option<PathBuf>,
+    require_all: bool,
+    write_digests: bool,
 }
 
 fn parse() -> Result<Args, String> {
@@ -41,6 +46,9 @@ fn parse() -> Result<Args, String> {
         only: Vec::new(),
         name: None,
         out: None,
+        root: None,
+        require_all: false,
+        write_digests: false,
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -58,6 +66,9 @@ fn parse() -> Result<Args, String> {
             }
             "--name" => args.name = Some(value()?),
             "--out" => args.out = Some(value()?.into()),
+            "--root" => args.root = Some(value()?.into()),
+            "--require-all" => args.require_all = true,
+            "--write-digests" => args.write_digests = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown flag {other}")),
         }
@@ -77,6 +88,35 @@ fn main() -> ExitCode {
         }
     };
     let result = match args.command.as_str() {
+        "fixtures" => (|| -> Result<(), String> {
+            let root = match args.root.clone() {
+                Some(r) => r,
+                None => std::env::current_dir().map_err(|e| e.to_string())?,
+            };
+            let root = root
+                .canonicalize()
+                .map_err(|e| format!("{}: {e}", root.display()))?;
+            let summary = fixtures::run(&fixtures::Options {
+                root: root.clone(),
+                sevenzip: args.sevenzip.clone(),
+                rar_source: args.rar_source.clone(),
+                require_all: args.require_all,
+                only: args.only.clone(),
+                write_digests: args.write_digests,
+            })?;
+            println!(
+                "{}: {} fixtures written and checked against {}{}",
+                root.display(),
+                summary.written.len(),
+                fixtures::DIGESTS,
+                if summary.skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!("; skipped: {}", summary.skipped.join("; "))
+                }
+            );
+            Ok(())
+        })(),
         "conformance" => (|| -> Result<(), String> {
             let rar = args
                 .rar_source

@@ -10,9 +10,9 @@
 //!   below the context total (7-Zip's `Ppmd7aDec.c` checks first), so the
 //!   harness never hands it hostile carry-less input.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 
-use ppmd_rust::{Ppmd7Decoder, Ppmd7Encoder, Ppmd7aDecoder, Ppmd7aEncoder};
+use ppmd_rust::{Ppmd7Decoder, Ppmd7aDecoder};
 
 use crate::outcome::{ErrKind, Outcome, Reference, drain};
 
@@ -113,21 +113,7 @@ pub fn decode_carryless_trusted(
     }
 }
 
-/// Encodes with ppmd-rust's 7z coder. The parameters must be legal.
-pub fn encode_7z(payload: &[u8], order: u32, mem: u32, end_marker: bool) -> Vec<u8> {
-    let mut enc = Ppmd7Encoder::new(Vec::new(), order, mem).expect("legal 7z encoder parameters");
-    enc.write_all(payload).expect("encoding into a Vec");
-    enc.finish(end_marker).expect("finishing into a Vec")
-}
-
-/// Encodes with ppmd-rust's carry-less (`7a`) coder, the coder RAR's PPMd
-/// blocks use. The parameters must be legal.
-pub fn encode_carryless(payload: &[u8], order: u32, mem: u32, end_marker: bool) -> Vec<u8> {
-    let mut enc =
-        Ppmd7aEncoder::new(Vec::new(), order, mem).expect("legal carry-less encoder parameters");
-    enc.write_all(payload).expect("encoding into a Vec");
-    enc.finish(end_marker).expect("finishing into a Vec")
-}
+pub use crate::synth::{encode_7z, encode_carryless};
 
 #[cfg(test)]
 mod tests {

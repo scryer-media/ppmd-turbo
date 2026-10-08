@@ -6,8 +6,8 @@
 //! Every decode runs inside [`no_panic`], so a panic fails the test with the
 //! input in hex. Expected errors follow `docs/algorithms.md` (sections 4.2,
 //! 5.1 and 5.2) where it fixes them; where it does not, the accepted set is
-//! spelled out at the assertion. All inputs are the generated fixtures in
-//! `tests/hostile_fixtures` or derived from them deterministically.
+//! spelled out at the assertion. All inputs are the hostile fixtures, built
+//! in memory by `fuzz/src/synth.rs`, or derived from them deterministically.
 
 mod hostile_support;
 
