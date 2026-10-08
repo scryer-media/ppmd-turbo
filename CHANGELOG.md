@@ -65,6 +65,10 @@ is a released version.
   walks as ppmd-rust's do: 7z decode of binary input 1.09x and encode of
   binary input 1.17x faster than the plain translation (i5-1240P), with
   text unchanged.
+- The decode loop tests the input margin once per batch of symbols rather
+  than once per symbol: the symbols decoded and the stopping point are
+  unchanged, and text decode retires 1-4% fewer instructions (Apple M5
+  Max), the most at low orders.
 - `ppmd-corpus` generates the conformance and bench corpora: seeded
   payloads, 7z PPMd streams from ppmd-rust and 7-Zip, and RAR PPMd members,
   each recorded in a manifest with its parameters and digests.

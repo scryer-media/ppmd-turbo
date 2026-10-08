@@ -279,7 +279,9 @@ impl<C: DecodeCoder> StreamDecoder<C> {
         let margin = C::margin(self.params.order_u8());
         let mut rc = C::resume(rest, self.regs);
         let (mut produced, mut stop) = match rest.len().checked_sub(margin) {
-            Some(fast_end) => run::fast::<_, false>(&mut self.model, &mut rc, out, fast_end, 0),
+            Some(fast_end) => {
+                run::fast::<_, false>(&mut self.model, &mut rc, out, fast_end, margin, 0)
+            }
             None => (0, Ok(Stop::Margin)),
         };
         if input_is_last && stop == Ok(Stop::Margin) {
