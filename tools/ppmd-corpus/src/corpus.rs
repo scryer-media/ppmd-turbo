@@ -304,24 +304,22 @@ impl Conformance<'_> {
         for op in ops {
             let bad = corrupt(op, &data);
             let result = oracle::decode(coder, &bad, order, mem, Some(len));
-            let expect = if *op == "truncate-half"
-                || (*op == "flip-first" && coder == Coder::SevenZ)
-            {
-                if result.is_ok() {
-                    return Err(format!(
-                        "{base} {op}: ppmd-rust accepted it; the expectation is wrong"
-                    ));
-                }
-                "error"
-            } else {
-                if matches!(&result, Ok(out) if Value::from(oracle::sha256_hex(out)) == payload_sha)
-                {
-                    return Err(format!(
-                        "{base} {op}: ppmd-rust still decodes the payload; pick another offset"
-                    ));
-                }
-                "not-payload"
-            };
+            let expect =
+                if *op == "truncate-half" || (*op == "flip-first" && coder == Coder::SevenZ) {
+                    if result.is_ok() {
+                        return Err(format!(
+                            "{base} {op}: ppmd-rust accepted it; the expectation is wrong"
+                        ));
+                    }
+                    "error"
+                } else {
+                    if matches!(&result, Ok(out) if oracle::sha256_hex(out) == payload_sha) {
+                        return Err(format!(
+                            "{base} {op}: ppmd-rust still decodes the payload; pick another offset"
+                        ));
+                    }
+                    "not-payload"
+                };
             self.corruptions.push(json!({
                 "name": format!("{base}+{op}"), "base": base, "op": op, "expect": expect,
                 "ppmd_rust": outcome(&result),
