@@ -50,6 +50,7 @@ const BAD_STREAM: &[Kind] = &[Kind::Truncated, Kind::Corrupt];
 // Harness checks: these run now.
 
 #[test]
+#[cfg_attr(miri, ignore = "reads fixture files; Miri isolates the file system")]
 fn fixtures_are_consistent() {
     let all = fixtures();
     assert!(all.iter().any(|f| f.coder == Coder::SevenZ));

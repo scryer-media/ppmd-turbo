@@ -420,6 +420,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "no unsafe code; slow under Miri")]
     fn reader_rejects_damage_without_panicking() {
         let archive = write_archive(6, 1 << 20, &[0, 9, 9], b"kith", "kith.txt").expect("writes");
         for i in 0..archive.len() {

@@ -1,8 +1,9 @@
 name: ci
 
-# fmt, clippy, tests on every desktop platform, Miri, a short fuzz run of
-# every target, docs, MSRV and packaging. `ci-complete` is the one required
-# check: it fails when any lane does.
+# fmt, clippy, tests on every desktop platform, Miri, a short deterministic
+# fuzz run of every target, the hostile tests under AddressSanitizer, docs,
+# MSRV and packaging. fuzz-extended.yml runs the long campaigns on demand.
+# `ci-complete` is the one required check: it fails when any lane does.
 
 on:
   pull_request:
@@ -138,8 +139,30 @@ jobs:
       - name: Miri
         run: cargo "+$NIGHTLY_TOOLCHAIN" miri nextest run --locked --all-features -j "$(nproc)"
 
-  # A short run of every target on both 64-bit Linux architectures. A crash
-  # fails the lane; the input is kept as an artifact.
+  # The fuzz harness library and its committed seeds: the seeds must match
+  # what fuzz/src/seeds.rs generates, so a format change regenerates them.
+  fuzz-harness:
+    name: fuzz-harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+      - name: Harness tests and seed freshness
+        run: cargo test --locked --manifest-path fuzz/Cargo.toml --lib
+
+  # A short, deterministic run of every target on both 64-bit Linux
+  # architectures: a fixed libFuzzer seed and a fixed iteration count per
+  # target, starting from the committed seeds. cargo-fuzz builds with
+  # AddressSanitizer. A crash fails the lane; the input is kept as an
+  # artifact.
   fuzz:
     name: fuzz-${{ matrix.platform }}-${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
@@ -150,11 +173,29 @@ jobs:
         platform: [linux-x86_64, linux-aarch64]
         target:
           - decode_7z
+          - decode_rar
+          - decode_differential_7z
+          - roundtrip_7z
+          - roundtrip_carryless
+          - structure_7z
         include:
           - platform: linux-x86_64
             runner: ubuntu-24.04
           - platform: linux-aarch64
             runner: ubuntu-24.04-arm
+          # Iterations sized to about a minute each on a hosted runner.
+          - target: decode_7z
+            runs: 20000
+          - target: decode_rar
+            runs: 20000
+          - target: decode_differential_7z
+            runs: 20000
+          - target: roundtrip_7z
+            runs: 5000
+          - target: roundtrip_carryless
+            runs: 5000
+          - target: structure_7z
+            runs: 2000
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -167,9 +208,12 @@ jobs:
       - name: Fuzz
         env:
           TARGET: ${{ matrix.target }}
+          RUNS: ${{ matrix.runs }}
         run: |
-          cargo "+$NIGHTLY_TOOLCHAIN" fuzz run "$TARGET" -- \
-            -max_total_time=60 -rss_limit_mb=2048 -print_final_stats=1
+          mkdir -p "fuzz/corpus/$TARGET"
+          cargo "+$NIGHTLY_TOOLCHAIN" fuzz run "$TARGET" \
+            "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- \
+            -runs="$RUNS" -seed=1 -rss_limit_mb=2048 -print_final_stats=1
       - name: Keep the failing input
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -177,6 +221,28 @@ jobs:
           name: fuzz-findings-${{ matrix.platform }}-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
+
+  # The hostile-input tests under AddressSanitizer. Only the test crate is
+  # instrumented (`--target` keeps build scripts and proc macros plain).
+  asan:
+    name: asan-linux-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+      - name: Hostile tests under ASan
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+        run: |
+          cargo "+$NIGHTLY_TOOLCHAIN" test --locked --all-features \
+            --target x86_64-unknown-linux-gnu \
+            --test hostile_decode --test hostile_memory
 
   msrv:
     name: msrv
@@ -215,7 +281,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [fmt, clippy, docs, test, miri, fuzz, msrv, package]
+    needs: [fmt, clippy, docs, test, miri, fuzz-harness, fuzz, asan, msrv, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

@@ -104,6 +104,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "no unsafe code; slow under Miri")]
     fn deterministic_and_exact() {
         for (name, data) in default_corpus() {
             let len: usize = name
