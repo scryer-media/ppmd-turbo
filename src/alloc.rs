@@ -293,6 +293,16 @@ impl Arena {
         unsafe { *self.base.as_ptr().add(off) }
     }
 
+    /// A read pointer to `len` bytes at `off`, for the vector passes.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
+    #[inline(always)]
+    pub(crate) fn ptr(&self, off: usize, len: usize) -> *const u8 {
+        debug_assert!(off + len <= self.len);
+        // SAFETY: `off + len` lies inside the allocation (module invariant,
+        // checked above in debug builds).
+        unsafe { self.base.as_ptr().add(off) }
+    }
+
     #[inline(always)]
     pub(crate) fn set_u8(&mut self, off: u32, v: u8) {
         // SAFETY: in bounds (see `at`); `&mut self` is the only access.

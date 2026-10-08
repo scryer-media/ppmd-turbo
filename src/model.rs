@@ -37,6 +37,7 @@ use crate::see::{DUMMY, SeeTable};
 use crate::{PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER};
 
 mod encode;
+mod simd;
 
 // --- Constants (`Ppmd.h`, `Ppmd7.c`) ---
 
@@ -881,6 +882,85 @@ impl Model {
         }
     }
 
+    /// The unmasked frequency total of the `ns` states from `stats`: two
+    /// states per step, the odd one first.
+    #[inline(always)]
+    fn masked_sum(&self, char_mask: &[u8; 256], stats: usize, ns: u32) -> u32 {
+        let end = stats + ns as usize * SS;
+        let mut s = stats;
+        let odd = ns & 1;
+        let mut sum =
+            self.freq_at(s) & char_mask[self.sym_at(s) as usize] as u32 & 0u32.wrapping_sub(odd);
+        s += odd as usize * SS;
+        while s < end {
+            let sym0 = self.sym_at(s);
+            let sym1 = self.sym_at(s + SS);
+            sum += self.freq_at(s) & char_mask[sym0 as usize] as u32;
+            sum += self.freq_at(s + SS) & char_mask[sym1 as usize] as u32;
+            s += 2 * SS;
+        }
+        sum
+    }
+
+    /// [`masked_sum`](Self::masked_sum) over a wide context's states in
+    /// `from..to`, 16 at a time through NEON and the rest one by one. Out
+    /// of line, so the narrow contexts' code stays as it was.
+    #[inline(never)]
+    fn masked_sum_wide(&self, char_mask: &[u8; 256], from: usize, to: usize) -> u32 {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
+        {
+            let l = simd::neon::Lookup::new(char_mask);
+            let batches = (to - from) / simd::neon::BATCH_BYTES;
+            let bytes = batches * simd::neon::BATCH_BYTES;
+            // SAFETY: the `batches` runs lie inside `from..to`, inside the
+            // state array.
+            let mut sum = unsafe { l.sum(self.a.ptr(from, bytes), batches) };
+            let mut s = from + bytes;
+            while s < to {
+                sum += self.freq_at(s) & char_mask[self.sym_at(s) as usize] as u32;
+                s += SS;
+            }
+            sum
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_endian = "little", not(miri))))]
+        {
+            let mut sum = 0;
+            let mut s = from;
+            while s < to {
+                sum += self.freq_at(s) & char_mask[self.sym_at(s) as usize] as u32;
+                s += SS;
+            }
+            sum
+        }
+    }
+
+    /// The escape decode's selection over a wide context: skips the whole
+    /// batches of 16 states whose unmasked total `count` reaches, taking
+    /// it off `count`, and returns the first state left to walk.
+    #[inline(never)]
+    fn skip_wide(&self, char_mask: &[u8; 256], from: usize, to: usize, count: &mut u32) -> usize {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
+        {
+            let l = simd::neon::Lookup::new(char_mask);
+            let mut s = from;
+            while s + simd::neon::BATCH_BYTES <= to {
+                // SAFETY: the batch lies inside the state array.
+                let b = unsafe { l.batch_sum(self.a.ptr(s, simd::neon::BATCH_BYTES)) };
+                if *count < b {
+                    break;
+                }
+                *count -= b;
+                s += simd::neon::BATCH_BYTES;
+            }
+            s
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_endian = "little", not(miri))))]
+        {
+            let _ = (char_mask, to, count);
+            from
+        }
+    }
+
     /// Puts the model back as it was when the symbol began, after the
     /// symbol was abandoned part way down the escape chain (see the module
     /// documentation).
@@ -1001,19 +1081,15 @@ impl Model {
             let stats = self.stats(mc) as usize;
             let ns = self.num_stats(mc);
             let end = stats + ns as usize * SS;
-            let mut s = stats;
-            let odd = ns & 1;
-            let mut hi_cnt = self.freq_at(s)
-                & char_mask[self.sym_at(s) as usize] as u32
-                & 0u32.wrapping_sub(odd);
-            s += odd as usize * SS;
-            while s < end {
-                let sym0 = self.sym_at(s);
-                let sym1 = self.sym_at(s + SS);
-                hi_cnt += self.freq_at(s) & char_mask[sym0 as usize] as u32;
-                hi_cnt += self.freq_at(s + SS) & char_mask[sym1 as usize] as u32;
-                s += 2 * SS;
-            }
+            #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
+            let wide = ns >= simd::neon::MIN_STATES;
+            #[cfg(not(all(target_arch = "aarch64", target_endian = "little", not(miri))))]
+            let wide = false;
+            let hi_cnt = if wide {
+                self.masked_sum_wide(&char_mask, stats, end)
+            } else {
+                self.masked_sum(&char_mask, stats, ns)
+            };
             self.min_context = mc;
 
             let (see, esc_freq) = self.make_esc_freq(num_masked);
@@ -1023,6 +1099,9 @@ impl Model {
             if count < hi_cnt {
                 let mut s = stats;
                 let hi = count;
+                if wide {
+                    s = self.skip_wide(&char_mask, stats, end, &mut count);
+                }
                 loop {
                     let f = self.freq_at(s) & char_mask[self.sym_at(s) as usize] as u32;
                     if count < f {
