@@ -1,0 +1,1721 @@
+{
+  "corruptions": [
+    {
+      "base": "text-64k.o6.m1m.7zz.ppmd",
+      "expect": "error",
+      "name": "text-64k.o6.m1m.7zz.ppmd+truncate-half",
+      "op": "truncate-half",
+      "ppmd_rust": {
+        "error": "failed to fill whole buffer",
+        "ok": false
+      }
+    },
+    {
+      "base": "text-64k.o6.m1m.7zz.ppmd",
+      "expect": "error",
+      "name": "text-64k.o6.m1m.7zz.ppmd+flip-first",
+      "op": "flip-first",
+      "ppmd_rust": {
+        "error": "ppmd-rust: Could not initialize the range decoder",
+        "ok": false
+      }
+    },
+    {
+      "base": "text-64k.o6.m1m.7zz.ppmd",
+      "expect": "not-payload",
+      "name": "text-64k.o6.m1m.7zz.ppmd+flip-third",
+      "op": "flip-third",
+      "ppmd_rust": {
+        "error": "Error during PPMd decoding",
+        "ok": false
+      }
+    },
+    {
+      "base": "text-64k.o6.m1m.7zz.ppmd",
+      "expect": "not-payload",
+      "name": "text-64k.o6.m1m.7zz.ppmd+flip-mid",
+      "op": "flip-mid",
+      "ppmd_rust": {
+        "error": "failed to fill whole buffer",
+        "ok": false
+      }
+    },
+    {
+      "base": "binary-64k.o6.m1m.7zz.ppmd",
+      "expect": "error",
+      "name": "binary-64k.o6.m1m.7zz.ppmd+truncate-half",
+      "op": "truncate-half",
+      "ppmd_rust": {
+        "error": "failed to fill whole buffer",
+        "ok": false
+      }
+    },
+    {
+      "base": "binary-64k.o6.m1m.7zz.ppmd",
+      "expect": "error",
+      "name": "binary-64k.o6.m1m.7zz.ppmd+flip-first",
+      "op": "flip-first",
+      "ppmd_rust": {
+        "error": "ppmd-rust: Could not initialize the range decoder",
+        "ok": false
+      }
+    },
+    {
+      "base": "binary-64k.o6.m1m.7zz.ppmd",
+      "expect": "not-payload",
+      "name": "binary-64k.o6.m1m.7zz.ppmd+flip-third",
+      "op": "flip-third",
+      "ppmd_rust": {
+        "error": "Error during PPMd decoding",
+        "ok": false
+      }
+    },
+    {
+      "base": "binary-64k.o6.m1m.7zz.ppmd",
+      "expect": "not-payload",
+      "name": "binary-64k.o6.m1m.7zz.ppmd+flip-mid",
+      "op": "flip-mid",
+      "ppmd_rust": {
+        "error": "Error during PPMd decoding",
+        "ok": false
+      }
+    },
+    {
+      "base": "random-64k.o6.m16m.ppmd-rust.ppmd",
+      "expect": "error",
+      "name": "random-64k.o6.m16m.ppmd-rust.ppmd+truncate-half",
+      "op": "truncate-half",
+      "ppmd_rust": {
+        "error": "failed to fill whole buffer",
+        "ok": false
+      }
+    },
+    {
+      "base": "random-64k.o6.m16m.ppmd-rust.ppmd",
+      "expect": "error",
+      "name": "random-64k.o6.m16m.ppmd-rust.ppmd+flip-first",
+      "op": "flip-first",
+      "ppmd_rust": {
+        "error": "ppmd-rust: Could not initialize the range decoder",
+        "ok": false
+      }
+    },
+    {
+      "base": "random-64k.o6.m16m.ppmd-rust.ppmd",
+      "expect": "not-payload",
+      "name": "random-64k.o6.m16m.ppmd-rust.ppmd+flip-third",
+      "op": "flip-third",
+      "ppmd_rust": {
+        "len": 65536,
+        "ok": true,
+        "sha256": "6593d0805c45df4f8e101832cfdcc25fa08424a8d5e1edaf43f01b9d84fd23e9"
+      }
+    },
+    {
+      "base": "random-64k.o6.m16m.ppmd-rust.ppmd",
+      "expect": "not-payload",
+      "name": "random-64k.o6.m16m.ppmd-rust.ppmd+flip-mid",
+      "op": "flip-mid",
+      "ppmd_rust": {
+        "len": 65536,
+        "ok": true,
+        "sha256": "8d43a1b8eff1b94ee5e7fd502de6b23621b0bc27a9ab58f2ad8a1203d657ddb9"
+      }
+    },
+    {
+      "base": "mixed-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "expect": "error",
+      "name": "mixed-1k.o6.m16m.ppmd-rust.eos.ppmd+truncate-half",
+      "op": "truncate-half",
+      "ppmd_rust": {
+        "error": "failed to fill whole buffer",
+        "ok": false
+      }
+    },
+    {
+      "base": "mixed-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "expect": "error",
+      "name": "mixed-1k.o6.m16m.ppmd-rust.eos.ppmd+flip-first",
+      "op": "flip-first",
+      "ppmd_rust": {
+        "error": "ppmd-rust: Could not initialize the range decoder",
+        "ok": false
+      }
+    },
+    {
+      "base": "mixed-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "expect": "not-payload",
+      "name": "mixed-1k.o6.m16m.ppmd-rust.eos.ppmd+flip-third",
+      "op": "flip-third",
+      "ppmd_rust": {
+        "len": 1024,
+        "ok": true,
+        "sha256": "fdd28a7dd5aa7aaf74c61deb4f1b76952b1fbd46824d2fe9c684e97c75ac78c5"
+      }
+    },
+    {
+      "base": "mixed-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "expect": "not-payload",
+      "name": "mixed-1k.o6.m16m.ppmd-rust.eos.ppmd+flip-mid",
+      "op": "flip-mid",
+      "ppmd_rust": {
+        "len": 1024,
+        "ok": true,
+        "sha256": "69bad498032555ef033c6019b34c4cc937eb4e87052c0cba7c1abcf0655816d9"
+      }
+    },
+    {
+      "base": "text-64k.o6.m1m.ppmd-rust.ppmd7a",
+      "expect": "error",
+      "name": "text-64k.o6.m1m.ppmd-rust.ppmd7a+truncate-half",
+      "op": "truncate-half",
+      "ppmd_rust": {
+        "error": "failed to fill whole buffer",
+        "ok": false
+      }
+    },
+    {
+      "base": "text-64k.o6.m1m.ppmd-rust.ppmd7a",
+      "expect": "not-payload",
+      "name": "text-64k.o6.m1m.ppmd-rust.ppmd7a+flip-first",
+      "op": "flip-first",
+      "ppmd_rust": {
+        "error": "Error during PPMd decoding",
+        "ok": false
+      }
+    },
+    {
+      "base": "text-64k.o6.m1m.ppmd-rust.ppmd7a",
+      "expect": "not-payload",
+      "name": "text-64k.o6.m1m.ppmd-rust.ppmd7a+flip-third",
+      "op": "flip-third",
+      "ppmd_rust": {
+        "error": "Error during PPMd decoding",
+        "ok": false
+      }
+    },
+    {
+      "base": "text-64k.o6.m1m.ppmd-rust.ppmd7a",
+      "expect": "not-payload",
+      "name": "text-64k.o6.m1m.ppmd-rust.ppmd7a+flip-mid",
+      "op": "flip-mid",
+      "ppmd_rust": {
+        "error": "Error during PPMd decoding",
+        "ok": false
+      }
+    },
+    {
+      "base": "mixed-64k.o8.m16m.ppmd-rust.ppmd7a",
+      "expect": "error",
+      "name": "mixed-64k.o8.m16m.ppmd-rust.ppmd7a+truncate-half",
+      "op": "truncate-half",
+      "ppmd_rust": {
+        "error": "failed to fill whole buffer",
+        "ok": false
+      }
+    },
+    {
+      "base": "mixed-64k.o8.m16m.ppmd-rust.ppmd7a",
+      "expect": "not-payload",
+      "name": "mixed-64k.o8.m16m.ppmd-rust.ppmd7a+flip-first",
+      "op": "flip-first",
+      "ppmd_rust": {
+        "error": "Error during PPMd decoding",
+        "ok": false
+      }
+    },
+    {
+      "base": "mixed-64k.o8.m16m.ppmd-rust.ppmd7a",
+      "expect": "not-payload",
+      "name": "mixed-64k.o8.m16m.ppmd-rust.ppmd7a+flip-third",
+      "op": "flip-third",
+      "ppmd_rust": {
+        "error": "Error during PPMd decoding",
+        "ok": false
+      }
+    },
+    {
+      "base": "mixed-64k.o8.m16m.ppmd-rust.ppmd7a",
+      "expect": "not-payload",
+      "name": "mixed-64k.o8.m16m.ppmd-rust.ppmd7a+flip-mid",
+      "op": "flip-mid",
+      "ppmd_rust": {
+        "error": "Error during PPMd decoding",
+        "ok": false
+      }
+    }
+  ],
+  "generator": "tools/ppmd-corpus 0.1.0",
+  "hostile": [
+    {
+      "claimed_unpacked_len": 55267451,
+      "file": "rar/libarchive-ppmd-use-after-free.packed",
+      "header": {
+        "esc": 0,
+        "flags": 255,
+        "len": 3,
+        "mem_mb": 33,
+        "order": 64,
+        "reset": true
+      },
+      "name": "libarchive-ppmd-use-after-free",
+      "packed_len": 119,
+      "source": {
+        "archive": {
+          "file": "test_read_format_rar_ppmd_use_after_free.rar",
+          "len": 302,
+          "sha256": "bf15290f29b3fcdc48018b52100cfa80b52dc04e978b2c5f54ee19237cb739ad"
+        },
+        "origin": "libarchive test suite (BSD-2-Clause), via unrar-rs tests/fixtures/rar4",
+        "packed_offset": 95
+      }
+    },
+    {
+      "claimed_unpacked_len": 55267451,
+      "file": "rar/libarchive-ppmd-use-after-free2.packed",
+      "header": {
+        "esc": null,
+        "flags": 161,
+        "len": 2,
+        "mem_mb": 33,
+        "order": 2,
+        "reset": true
+      },
+      "name": "libarchive-ppmd-use-after-free2",
+      "packed_len": 119,
+      "source": {
+        "archive": {
+          "file": "test_read_format_rar_ppmd_use_after_free2.rar",
+          "len": 286,
+          "sha256": "80164bedbdec5b9b0841014a989a6d4d355d66fe118f60a0cb0134a5c316195f"
+        },
+        "origin": "libarchive test suite (BSD-2-Clause), via unrar-rs tests/fixtures/rar4",
+        "packed_offset": 87
+      }
+    }
+  ],
+  "payloads": [
+    {
+      "crc32": "00000000",
+      "kind": "text",
+      "name": "fixture-text-0.bin",
+      "seed": "fa04f4ef1995407e",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    {
+      "crc32": "a3b36a04",
+      "kind": "text",
+      "name": "fixture-text-1.bin",
+      "seed": "64338d5666df3c6b",
+      "sha256": "3f39d5c348e5b79d06e842c114e6cc571583bbf44e4b0ebfda1a01ec05745d43",
+      "size": 1
+    },
+    {
+      "crc32": "fd2f6706",
+      "kind": "text",
+      "name": "fixture-text-1k.bin",
+      "seed": "27e211123065147e",
+      "sha256": "e6aeaeb2fec97eea383173bd45f6cbeced718e7e6fcb2d1b336ff97fd9d220a7",
+      "size": 1024
+    },
+    {
+      "crc32": "1726c1dd",
+      "kind": "text",
+      "name": "fixture-text-64k.bin",
+      "seed": "83bd8ba56580407e",
+      "sha256": "88ce43379fb44efbfea9d28ce41a2052c04346623d1a6d2fd278805f9a2cb057",
+      "size": 65536
+    },
+    {
+      "crc32": "a6ed892b",
+      "kind": "binary",
+      "name": "fixture-binary-1k.bin",
+      "seed": "336ebb896e23833c",
+      "sha256": "c0fbf3eecd3558218475df28f5b429cc3910a2c151730d4dc95944a89e2a678e",
+      "size": 1024
+    },
+    {
+      "crc32": "b1f02305",
+      "kind": "binary",
+      "name": "fixture-binary-64k.bin",
+      "seed": "9731213e3bc6d73c",
+      "sha256": "9bb651fe5430289a12c6ba9521475467857f285b7be726e0c2e2e1f3dcd33c8a",
+      "size": 65536
+    },
+    {
+      "crc32": "b782dd81",
+      "kind": "mixed",
+      "name": "fixture-mixed-1k.bin",
+      "seed": "26203a9fd4b46d58",
+      "sha256": "52d339f067d0013b9e6568e4d30f3e9028b90d7d42eb6249a045017c1c499259",
+      "size": 1024
+    },
+    {
+      "crc32": "5f3452ae",
+      "kind": "mixed",
+      "name": "fixture-mixed-64k.bin",
+      "seed": "827fa02881513958",
+      "sha256": "24c702d1a6007e79f9bd9ccf7ab937c4885ca782a573e5f0430023ca4b92da5e",
+      "size": 65536
+    },
+    {
+      "crc32": "8808a2ab",
+      "kind": "repetitive",
+      "name": "fixture-repetitive-1k.bin",
+      "seed": "467dce034249bd92",
+      "sha256": "276cf9b0be94c25b98af45008df5205011333c915872efeca66e0ad86317912c",
+      "size": 1024
+    },
+    {
+      "crc32": "25477d8d",
+      "kind": "repetitive",
+      "name": "fixture-repetitive-64k.bin",
+      "seed": "e22254b417ace992",
+      "sha256": "3de9998bf65c8df316e7de0afdd022c4fa917d8e648e5ed6e8b9ded6d3f85fe8",
+      "size": 65536
+    },
+    {
+      "crc32": "18cd3b07",
+      "kind": "random",
+      "name": "fixture-random-1k.bin",
+      "seed": "77532bef44b72e82",
+      "sha256": "2ef9e2da2904821b8ae279cadb31bfe431bd14be2b9e35ea7bca1dc5908ead4f",
+      "size": 1024
+    },
+    {
+      "crc32": "2ecbeff4",
+      "kind": "random",
+      "name": "fixture-random-64k.bin",
+      "seed": "d30cb15811527a82",
+      "sha256": "75692388ff9242597f79a8118dd30f3aaaff7f4ac204163478cfc31ef70d7d4c",
+      "size": 65536
+    },
+    {
+      "crc32": "a76577aa",
+      "kind": "repetitive",
+      "name": "fixture-repetitive-1m.bin",
+      "seed": "000cdf59aae9e992",
+      "sha256": "0f7033f61ee8caebe0c3c5766d8f20656771251b10403c79abac4a13a895cd75",
+      "size": 1048576
+    }
+  ],
+  "ppmd_rust": "1.5.0",
+  "rar_members": [
+    {
+      "crc32": "9a1d1b6d",
+      "file": "rar/rar4-ppm-oldmv.packed",
+      "header": {
+        "esc": 255,
+        "flags": 239,
+        "len": 3,
+        "mem_mb": 16,
+        "order": 16,
+        "reset": true
+      },
+      "member": "ppmd-oldmv.txt",
+      "method": 53,
+      "name": "rar4-ppm-oldmv",
+      "packed_len": 196874,
+      "packed_sha256": "bd9f2bad8e7477b5bd2901dbd39e50705ab93b6cef1ae3bd5a7eb293151bdf6b",
+      "payload_sha256": "c8f9586bdfd59768d267e8a8ebb8d96e3506e4be7f6c3c8a5a99a69ad82605b0",
+      "source": {
+        "origin": "unrar-rs tests/fixtures/rar4 (github.com/scryer-media/rarpar), written by RARLAB rar 6.24 through rarpar's ppmd_perf recipe (generate_ppmd_perf.py --all)",
+        "volumes": [
+          {
+            "file": "rar4_ppm_oldmv.rar",
+            "len": 65536,
+            "sha256": "fe324390bf57f5dab5138594aef764284880f126b5a6b1543f5a6336a66f3962"
+          },
+          {
+            "file": "rar4_ppm_oldmv.r00",
+            "len": 65536,
+            "sha256": "605de337597160a42a02484e3ac2d896d38472a051be1749bd82b66ea3bc0538"
+          },
+          {
+            "file": "rar4_ppm_oldmv.r01",
+            "len": 65536,
+            "sha256": "ffecb766e22f606ef76b8868afec6271c9dc1464cdadb0bc0ad7372b03ae32b5"
+          },
+          {
+            "file": "rar4_ppm_oldmv.r02",
+            "len": 610,
+            "sha256": "216378ad0687743b73139d5c4c7080c0edab6ecae6146ebee79bb257cd376a8c"
+          }
+        ]
+      },
+      "stop": "Full",
+      "symbols": 262144,
+      "symbols_sha256": "c8f9586bdfd59768d267e8a8ebb8d96e3506e4be7f6c3c8a5a99a69ad82605b0",
+      "unpacked_len": 262144
+    }
+  ],
+  "regenerate": "cargo run --locked --release -p ppmd-corpus -- conformance --rar-source <unrar-rs>/tests/fixtures/rar4",
+  "schema": "ppmd-turbo-corpus/conformance/1",
+  "sevenzip": {
+    "banner": "7-Zip (z) 26.01 (arm64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-04-27",
+    "version": "26.01"
+  },
+  "streams": [
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-0.o6.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "text-0.o6.m16m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-text-0.bin",
+      "payload_len": 0,
+      "producer": "ppmd-rust",
+      "stream_len": 5,
+      "stream_sha256": "8855508aade16ec573d21e6a485dfd0a7624085c1a14b5ecdd6485de0c6839a4"
+    },
+    {
+      "coder": "7z",
+      "end_marker": true,
+      "file": "7z/text-0.o6.m16m.ppmd-rust.eos.ppmd",
+      "mem": 16777216,
+      "name": "text-0.o6.m16m.ppmd-rust.eos.ppmd",
+      "order": 6,
+      "payload": "fixture-text-0.bin",
+      "payload_len": 0,
+      "producer": "ppmd-rust",
+      "stream_len": 6,
+      "stream_sha256": "d7095d9e1db1854f989a95465275d923c8f964ad79cbfa4fbc5219e8e75add0b"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-1.o6.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "text-1.o6.m16m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-text-1.bin",
+      "payload_len": 1,
+      "producer": "ppmd-rust",
+      "stream_len": 6,
+      "stream_sha256": "e47bf4ae038310108e689ff3852ee61e7ef4fd330ebd2b02c087ad24ce9a616a"
+    },
+    {
+      "coder": "7z",
+      "end_marker": true,
+      "file": "7z/text-1.o6.m16m.ppmd-rust.eos.ppmd",
+      "mem": 16777216,
+      "name": "text-1.o6.m16m.ppmd-rust.eos.ppmd",
+      "order": 6,
+      "payload": "fixture-text-1.bin",
+      "payload_len": 1,
+      "producer": "ppmd-rust",
+      "stream_len": 7,
+      "stream_sha256": "e14435f03ea006cd8984bd809889da7022debaa5c9fbe2ae5e202efa4b1179f7"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 136,
+        "sha256": "b631dd60bc8d593054d2e58c4291b6838598a6da1e379311dfe47058261ddbd6"
+      },
+      "end_marker": false,
+      "file": "7z/text-1.o6.m64k.7zz.ppmd",
+      "mem": 65536,
+      "name": "text-1.o6.m64k.7zz.ppmd",
+      "order": 6,
+      "payload": "fixture-text-1.bin",
+      "payload_len": 1,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 6
+      },
+      "stream_len": 6,
+      "stream_sha256": "e47bf4ae038310108e689ff3852ee61e7ef4fd330ebd2b02c087ad24ce9a616a"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-1k.o6.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "text-1k.o6.m16m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-text-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 524,
+      "stream_sha256": "47caa3c703470de9ac3f63e17e1c0787cbdf444e12c89b6001bca780eea3b65b"
+    },
+    {
+      "coder": "7z",
+      "end_marker": true,
+      "file": "7z/text-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "mem": 16777216,
+      "name": "text-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "order": 6,
+      "payload": "fixture-text-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 525,
+      "stream_sha256": "232703dd586bd3fc6e3cae730fc1cc30760bdffebc78eeab4ea812d0b3a68e41"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 654,
+        "sha256": "691a351226bb28f756b31ebb2cca72886c197652bc93bf3552948ccacedfa1e4"
+      },
+      "end_marker": false,
+      "file": "7z/text-1k.o6.m64k.7zz.ppmd",
+      "mem": 65536,
+      "name": "text-1k.o6.m64k.7zz.ppmd",
+      "order": 6,
+      "payload": "fixture-text-1k.bin",
+      "payload_len": 1024,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 6
+      },
+      "stream_len": 524,
+      "stream_sha256": "47caa3c703470de9ac3f63e17e1c0787cbdf444e12c89b6001bca780eea3b65b"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-64k.o6.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "text-64k.o6.m16m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 16639,
+      "stream_sha256": "cf7e3c20d129f35e1e33a7f341e38a55723e365a7a5d46cdc7e2b6298a9cd7db"
+    },
+    {
+      "coder": "7z",
+      "end_marker": true,
+      "file": "7z/text-64k.o6.m16m.ppmd-rust.eos.ppmd",
+      "mem": 16777216,
+      "name": "text-64k.o6.m16m.ppmd-rust.eos.ppmd",
+      "order": 6,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 16641,
+      "stream_sha256": "8fdd3a5e7fc8e0c1a15885bab4e41a3a28fe39ef7c989f87b693d3f84ab67797"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 16773,
+        "sha256": "282f5edc33e676ed319b4799c55b6f0b09e3271b50881e306817d265942401c8"
+      },
+      "end_marker": false,
+      "file": "7z/text-64k.o6.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "text-64k.o6.m1m.7zz.ppmd",
+      "order": 6,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 6
+      },
+      "stream_len": 16639,
+      "stream_sha256": "cf7e3c20d129f35e1e33a7f341e38a55723e365a7a5d46cdc7e2b6298a9cd7db"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/binary-1k.o6.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "binary-1k.o6.m16m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-binary-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 509,
+      "stream_sha256": "2b3de80d1a753ed419866b3e57fa7ab82b669b2fa09a832339482ca6c2532d42"
+    },
+    {
+      "coder": "7z",
+      "end_marker": true,
+      "file": "7z/binary-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "mem": 16777216,
+      "name": "binary-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "order": 6,
+      "payload": "fixture-binary-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 511,
+      "stream_sha256": "684abed9bd4c75c9636cb667cb664f89239b554047ba649a8b3f51081246ab18"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 643,
+        "sha256": "dd25eed34ecae15405f419cabe6b6b51bb717b8a303bb88b685a60b5bf51b72e"
+      },
+      "end_marker": false,
+      "file": "7z/binary-1k.o6.m64k.7zz.ppmd",
+      "mem": 65536,
+      "name": "binary-1k.o6.m64k.7zz.ppmd",
+      "order": 6,
+      "payload": "fixture-binary-1k.bin",
+      "payload_len": 1024,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 6
+      },
+      "stream_len": 509,
+      "stream_sha256": "2b3de80d1a753ed419866b3e57fa7ab82b669b2fa09a832339482ca6c2532d42"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/binary-64k.o6.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "binary-64k.o6.m16m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 31555,
+      "stream_sha256": "07d4d3757af2195716f5358b715b79018bd43f4c7648f75b918643b842ee7c2a"
+    },
+    {
+      "coder": "7z",
+      "end_marker": true,
+      "file": "7z/binary-64k.o6.m16m.ppmd-rust.eos.ppmd",
+      "mem": 16777216,
+      "name": "binary-64k.o6.m16m.ppmd-rust.eos.ppmd",
+      "order": 6,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 31557,
+      "stream_sha256": "58856e6c6ac9bb7807ecfb72ba52bd502ce3b5cf53b91d40392233508da919e3"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 31693,
+        "sha256": "26d090b822c60ece6b74d73b58e7972a87e2ca0a0048cf65b4545eeccc6816ed"
+      },
+      "end_marker": false,
+      "file": "7z/binary-64k.o6.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "binary-64k.o6.m1m.7zz.ppmd",
+      "order": 6,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 6
+      },
+      "stream_len": 31555,
+      "stream_sha256": "07d4d3757af2195716f5358b715b79018bd43f4c7648f75b918643b842ee7c2a"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/mixed-1k.o6.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "mixed-1k.o6.m16m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-mixed-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 546,
+      "stream_sha256": "c40f249234328a3fd72f37cacc6864eb0a314fa1cdf5fa8a38ce74c9b1e4c407"
+    },
+    {
+      "coder": "7z",
+      "end_marker": true,
+      "file": "7z/mixed-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "mem": 16777216,
+      "name": "mixed-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "order": 6,
+      "payload": "fixture-mixed-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 548,
+      "stream_sha256": "a4f458197468a6408babf6a12d45d1ab1603e2f01316d2cacd704f06baf13498"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 680,
+        "sha256": "8be32c654df4d2f1925e92fb3b1aa6148254aba8d7c5c255a35f95cec5cf114c"
+      },
+      "end_marker": false,
+      "file": "7z/mixed-1k.o6.m64k.7zz.ppmd",
+      "mem": 65536,
+      "name": "mixed-1k.o6.m64k.7zz.ppmd",
+      "order": 6,
+      "payload": "fixture-mixed-1k.bin",
+      "payload_len": 1024,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 6
+      },
+      "stream_len": 546,
+      "stream_sha256": "c40f249234328a3fd72f37cacc6864eb0a314fa1cdf5fa8a38ce74c9b1e4c407"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/mixed-64k.o6.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "mixed-64k.o6.m16m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-mixed-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 40639,
+      "stream_sha256": "482dc4574ff7e059447d685a2a9afccca782e294f23336936fe54f5c5a059810"
+    },
+    {
+      "coder": "7z",
+      "end_marker": true,
+      "file": "7z/mixed-64k.o6.m16m.ppmd-rust.eos.ppmd",
+      "mem": 16777216,
+      "name": "mixed-64k.o6.m16m.ppmd-rust.eos.ppmd",
+      "order": 6,
+      "payload": "fixture-mixed-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 40642,
+      "stream_sha256": "6b7a6fa8403240f729bfa9e8841a06dd96dc86dd2c68a40f47a705d2fd42e245"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 40773,
+        "sha256": "25e46e868a626acb612d61d32f94ddf0277948797a86b53f5d45af9d0c6d1c96"
+      },
+      "end_marker": false,
+      "file": "7z/mixed-64k.o6.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "mixed-64k.o6.m1m.7zz.ppmd",
+      "order": 6,
+      "payload": "fixture-mixed-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 6
+      },
+      "stream_len": 40639,
+      "stream_sha256": "482dc4574ff7e059447d685a2a9afccca782e294f23336936fe54f5c5a059810"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/repetitive-1k.o6.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "repetitive-1k.o6.m16m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-repetitive-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 99,
+      "stream_sha256": "816a8fc4ce7b6848bf218bb464b4716754d035d84b91ea5342d3775ada9abd7d"
+    },
+    {
+      "coder": "7z",
+      "end_marker": true,
+      "file": "7z/repetitive-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "mem": 16777216,
+      "name": "repetitive-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "order": 6,
+      "payload": "fixture-repetitive-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 100,
+      "stream_sha256": "b4eabb009cd50af57c9b932a3e7a2f5358794bf655b655bb5f1fad74f73d8c57"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 241,
+        "sha256": "429e4111f674525da9b9b28fa1ff484f1b835189e798ad98bf94136a0e440e83"
+      },
+      "end_marker": false,
+      "file": "7z/repetitive-1k.o6.m64k.7zz.ppmd",
+      "mem": 65536,
+      "name": "repetitive-1k.o6.m64k.7zz.ppmd",
+      "order": 6,
+      "payload": "fixture-repetitive-1k.bin",
+      "payload_len": 1024,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 6
+      },
+      "stream_len": 99,
+      "stream_sha256": "816a8fc4ce7b6848bf218bb464b4716754d035d84b91ea5342d3775ada9abd7d"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/repetitive-64k.o6.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "repetitive-64k.o6.m16m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-repetitive-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 1411,
+      "stream_sha256": "67eb9a66e68e5845c304f72509255faa459b5fc05358ad79aa5255c2a3913ae1"
+    },
+    {
+      "coder": "7z",
+      "end_marker": true,
+      "file": "7z/repetitive-64k.o6.m16m.ppmd-rust.eos.ppmd",
+      "mem": 16777216,
+      "name": "repetitive-64k.o6.m16m.ppmd-rust.eos.ppmd",
+      "order": 6,
+      "payload": "fixture-repetitive-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 1414,
+      "stream_sha256": "2075e7ab449e9d5a3376386d1a93e2f842f7180a6d8cfe38b43c5ba29368a82e"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 1557,
+        "sha256": "f3f0066c10f564ca7710f8a4c7195f12d21359fd051a13804258b07698a6b54e"
+      },
+      "end_marker": false,
+      "file": "7z/repetitive-64k.o6.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "repetitive-64k.o6.m1m.7zz.ppmd",
+      "order": 6,
+      "payload": "fixture-repetitive-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 6
+      },
+      "stream_len": 1411,
+      "stream_sha256": "67eb9a66e68e5845c304f72509255faa459b5fc05358ad79aa5255c2a3913ae1"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/random-1k.o6.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "random-1k.o6.m16m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-random-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 1101,
+      "stream_sha256": "c0e607802c9b285529707fc1074c753203ce5eb0323ddf6a36feccf8f0a28ca9"
+    },
+    {
+      "coder": "7z",
+      "end_marker": true,
+      "file": "7z/random-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "mem": 16777216,
+      "name": "random-1k.o6.m16m.ppmd-rust.eos.ppmd",
+      "order": 6,
+      "payload": "fixture-random-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 1102,
+      "stream_sha256": "7109659705a94f25f37c0602eac33551c3b19fc0fa98ed56cb31b524b45dbd69"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 1235,
+        "sha256": "820f604129bd50101e15067e9257a498594e787e7bda29e7855227d1f7cbccbe"
+      },
+      "end_marker": false,
+      "file": "7z/random-1k.o6.m64k.7zz.ppmd",
+      "mem": 65536,
+      "name": "random-1k.o6.m64k.7zz.ppmd",
+      "order": 6,
+      "payload": "fixture-random-1k.bin",
+      "payload_len": 1024,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 6
+      },
+      "stream_len": 1101,
+      "stream_sha256": "c0e607802c9b285529707fc1074c753203ce5eb0323ddf6a36feccf8f0a28ca9"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/random-64k.o6.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "random-64k.o6.m16m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-random-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 67156,
+      "stream_sha256": "dbf042f325b4f3e54068e31193015b9016a2708679a826f253f66b3148e3206c"
+    },
+    {
+      "coder": "7z",
+      "end_marker": true,
+      "file": "7z/random-64k.o6.m16m.ppmd-rust.eos.ppmd",
+      "mem": 16777216,
+      "name": "random-64k.o6.m16m.ppmd-rust.eos.ppmd",
+      "order": 6,
+      "payload": "fixture-random-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 67158,
+      "stream_sha256": "bb62dd64742f7013bf5771b12befba96a2924dec94b5672712517d6c68ef260e"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 67138,
+        "sha256": "7825ac7a6a511335f85cfbca2e360e628526f88c835278d73715d35c99ccfffd"
+      },
+      "end_marker": false,
+      "file": "7z/random-64k.o6.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "random-64k.o6.m1m.7zz.ppmd",
+      "order": 6,
+      "payload": "fixture-random-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 6
+      },
+      "stream_len": 67000,
+      "stream_sha256": "4b0bd6a3a84c9c78c458f5e4fbbbc9d5714e5aa9bb008d27d07dc724fc2a3b40"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-64k.o2.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "text-64k.o2.m16m.ppmd-rust.ppmd",
+      "order": 2,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 24086,
+      "stream_sha256": "aa623382696b7be166e18c3a37b4d1c9811e1497a5fb6c387adacb1e07b2db8d"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 24220,
+        "sha256": "d4499a91a9b12de392bed1658ef77f811fb6c336d269eef0bb18d71cebb4673e"
+      },
+      "end_marker": false,
+      "file": "7z/text-64k.o2.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "text-64k.o2.m1m.7zz.ppmd",
+      "order": 2,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 2
+      },
+      "stream_len": 24086,
+      "stream_sha256": "aa623382696b7be166e18c3a37b4d1c9811e1497a5fb6c387adacb1e07b2db8d"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-64k.o4.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "text-64k.o4.m16m.ppmd-rust.ppmd",
+      "order": 4,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 19344,
+      "stream_sha256": "0f430875ebe2fe45e6f471c80ad5d51a638db183a14c32b09c491e208c42c548"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 19478,
+        "sha256": "55bc5bd42f4d2a94c7a4694c8e312107b31b8c775f2d791104c9cf7c1ede455f"
+      },
+      "end_marker": false,
+      "file": "7z/text-64k.o4.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "text-64k.o4.m1m.7zz.ppmd",
+      "order": 4,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 4
+      },
+      "stream_len": 19344,
+      "stream_sha256": "0f430875ebe2fe45e6f471c80ad5d51a638db183a14c32b09c491e208c42c548"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-64k.o8.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "text-64k.o8.m16m.ppmd-rust.ppmd",
+      "order": 8,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 16376,
+      "stream_sha256": "1cb666c36bf7a64aa76a2fa6b45082893c078eab9e0ed192a803d4db34fcd552"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 18053,
+        "sha256": "c74c8c99f89c974eb75540abfaf292a9298b834c729b373cbf49eb91e2109d77"
+      },
+      "end_marker": false,
+      "file": "7z/text-64k.o8.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "text-64k.o8.m1m.7zz.ppmd",
+      "order": 8,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 8
+      },
+      "stream_len": 17919,
+      "stream_sha256": "5b3af9d49c0ccf7153ab5af3cae246d2a08c410d519e9705cdd792d6211aabbb"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-64k.o16.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "text-64k.o16.m16m.ppmd-rust.ppmd",
+      "order": 16,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 16356,
+      "stream_sha256": "60bd811566f357b48d706df23fe4ec9430d030940c56da0c58bbc0c29cd03119"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 19472,
+        "sha256": "b021951b2731e77daafac2699920cfe592d39a15a6fb60ea05fa646476473b59"
+      },
+      "end_marker": false,
+      "file": "7z/text-64k.o16.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "text-64k.o16.m1m.7zz.ppmd",
+      "order": 16,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 16
+      },
+      "stream_len": 19338,
+      "stream_sha256": "5059b4bfc38682c747eca95336e9888d84a60afff5d3b93889deb6c3ccace864"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-64k.o32.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "text-64k.o32.m16m.ppmd-rust.ppmd",
+      "order": 32,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 16359,
+      "stream_sha256": "bf034f1ac19ba5e2d7e23736879e64060df7579fc88b123917488bb242e82067"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 19474,
+        "sha256": "349933b79ffdb0cf58b7f52d6760998ed667014df1f465cbf67ec1d108591eaf"
+      },
+      "end_marker": false,
+      "file": "7z/text-64k.o32.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "text-64k.o32.m1m.7zz.ppmd",
+      "order": 32,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 32
+      },
+      "stream_len": 19340,
+      "stream_sha256": "bb513c5e1a73e50c37f89c93ca55c1bda94c530fd2e420955db3233007bd9fc2"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-64k.o64.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "text-64k.o64.m16m.ppmd-rust.ppmd",
+      "order": 64,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 16359,
+      "stream_sha256": "bf034f1ac19ba5e2d7e23736879e64060df7579fc88b123917488bb242e82067"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/binary-64k.o2.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "binary-64k.o2.m16m.ppmd-rust.ppmd",
+      "order": 2,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 33187,
+      "stream_sha256": "689d8f099ae2918769ac0ba1c20cf61f78ce5db853302b8898e8038836ce0e15"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 33325,
+        "sha256": "06a709638fe808d977db94405fb0efa6c232ba7a93a9be015d204b3830938a7a"
+      },
+      "end_marker": false,
+      "file": "7z/binary-64k.o2.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "binary-64k.o2.m1m.7zz.ppmd",
+      "order": 2,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 2
+      },
+      "stream_len": 33187,
+      "stream_sha256": "689d8f099ae2918769ac0ba1c20cf61f78ce5db853302b8898e8038836ce0e15"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/binary-64k.o4.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "binary-64k.o4.m16m.ppmd-rust.ppmd",
+      "order": 4,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 31725,
+      "stream_sha256": "700b8bb35dced60ee412d5186fdf418976d5b141fef5d337fdedce1f7baca77a"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 31863,
+        "sha256": "6daf973d570c1759bb7509a1d444cb8bbf9fc8407faec091a76b202cda384455"
+      },
+      "end_marker": false,
+      "file": "7z/binary-64k.o4.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "binary-64k.o4.m1m.7zz.ppmd",
+      "order": 4,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 4
+      },
+      "stream_len": 31725,
+      "stream_sha256": "700b8bb35dced60ee412d5186fdf418976d5b141fef5d337fdedce1f7baca77a"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/binary-64k.o8.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "binary-64k.o8.m16m.ppmd-rust.ppmd",
+      "order": 8,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 31550,
+      "stream_sha256": "b999debc2b4cedae7f79f5f28b7ea7480c24f12d5036cb939ee094eb34f80ab9"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 31688,
+        "sha256": "4434e24da0d6637ac2c1774341cb12b7654085f6d025ea5e2c6bee905db64606"
+      },
+      "end_marker": false,
+      "file": "7z/binary-64k.o8.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "binary-64k.o8.m1m.7zz.ppmd",
+      "order": 8,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 8
+      },
+      "stream_len": 31550,
+      "stream_sha256": "b999debc2b4cedae7f79f5f28b7ea7480c24f12d5036cb939ee094eb34f80ab9"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/binary-64k.o16.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "binary-64k.o16.m16m.ppmd-rust.ppmd",
+      "order": 16,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 31558,
+      "stream_sha256": "cbc236733c7985acbf51449270ce552a1ab3bb70151afbf222de04fc97ab4c04"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 31696,
+        "sha256": "a3ef8f3375f25b80d1a2023201cf8dd44028c0d3acf1b1cf330526684ee4d49f"
+      },
+      "end_marker": false,
+      "file": "7z/binary-64k.o16.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "binary-64k.o16.m1m.7zz.ppmd",
+      "order": 16,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 16
+      },
+      "stream_len": 31558,
+      "stream_sha256": "cbc236733c7985acbf51449270ce552a1ab3bb70151afbf222de04fc97ab4c04"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/binary-64k.o32.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "binary-64k.o32.m16m.ppmd-rust.ppmd",
+      "order": 32,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 31558,
+      "stream_sha256": "cbc236733c7985acbf51449270ce552a1ab3bb70151afbf222de04fc97ab4c04"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 31696,
+        "sha256": "5447e6f9287f754e325fda8cc077ea20be91f80cf7bc20ae6ca7d08b5d14cea9"
+      },
+      "end_marker": false,
+      "file": "7z/binary-64k.o32.m1m.7zz.ppmd",
+      "mem": 1048576,
+      "name": "binary-64k.o32.m1m.7zz.ppmd",
+      "order": 32,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 32
+      },
+      "stream_len": 31558,
+      "stream_sha256": "cbc236733c7985acbf51449270ce552a1ab3bb70151afbf222de04fc97ab4c04"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/binary-64k.o64.m16m.ppmd-rust.ppmd",
+      "mem": 16777216,
+      "name": "binary-64k.o64.m16m.ppmd-rust.ppmd",
+      "order": 64,
+      "payload": "fixture-binary-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 31558,
+      "stream_sha256": "cbc236733c7985acbf51449270ce552a1ab3bb70151afbf222de04fc97ab4c04"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-64k.o6.m2k.ppmd-rust.ppmd",
+      "mem": 2048,
+      "name": "text-64k.o6.m2k.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 54496,
+      "stream_sha256": "a23c4cfdedf649d702d726a77b55a0fc0a0a18d53175b731a09ba3b11bd7a857"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-64k.o6.m64k.ppmd-rust.ppmd",
+      "mem": 65536,
+      "name": "text-64k.o6.m64k.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 28475,
+      "stream_sha256": "61bfa397e818b07ccc8ae0b30a4713ae9e51b0faa3194decc337df9437a8aa87"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-64k.o6.m1m.ppmd-rust.ppmd",
+      "mem": 1048576,
+      "name": "text-64k.o6.m1m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 16639,
+      "stream_sha256": "cf7e3c20d129f35e1e33a7f341e38a55723e365a7a5d46cdc7e2b6298a9cd7db"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-64k.o6.m256m.ppmd-rust.ppmd",
+      "mem": 268435456,
+      "name": "text-64k.o6.m256m.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 16639,
+      "stream_sha256": "cf7e3c20d129f35e1e33a7f341e38a55723e365a7a5d46cdc7e2b6298a9cd7db"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/text-64k.o6.m1g.ppmd-rust.ppmd",
+      "mem": 1073741824,
+      "name": "text-64k.o6.m1g.ppmd-rust.ppmd",
+      "order": 6,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 16639,
+      "stream_sha256": "cf7e3c20d129f35e1e33a7f341e38a55723e365a7a5d46cdc7e2b6298a9cd7db"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 28609,
+        "sha256": "e35bad022333c3a565417e151072ca9ff473b0c7c8da1b2174adfe8c18377855"
+      },
+      "end_marker": false,
+      "file": "7z/text-64k.o6.m64k.7zz.ppmd",
+      "mem": 65536,
+      "name": "text-64k.o6.m64k.7zz.ppmd",
+      "order": 6,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 65536,
+        "order": 6
+      },
+      "stream_len": 28475,
+      "stream_sha256": "61bfa397e818b07ccc8ae0b30a4713ae9e51b0faa3194decc337df9437a8aa87"
+    },
+    {
+      "coder": "7z",
+      "end_marker": false,
+      "file": "7z/mixed-64k.o16.m2k.ppmd-rust.ppmd",
+      "mem": 2048,
+      "name": "mixed-64k.o16.m2k.ppmd-rust.ppmd",
+      "order": 16,
+      "payload": "fixture-mixed-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 57482,
+      "stream_sha256": "29ea2dc2fdc4e031470e9af87e3488672c66ebcb6af84f54043d1c514af848d4"
+    },
+    {
+      "coder": "7z",
+      "end_marker": true,
+      "file": "7z/text-1k.o64.m1g.ppmd-rust.eos.ppmd",
+      "mem": 1073741824,
+      "name": "text-1k.o64.m1g.ppmd-rust.eos.ppmd",
+      "order": 64,
+      "payload": "fixture-text-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 525,
+      "stream_sha256": "41752c7ca7cc10b1a8ce6538a0120533f6081e8e35be10d7af4fe06a553fcbf1"
+    },
+    {
+      "coder": "7z",
+      "container": {
+        "len": 20128,
+        "sha256": "66c89053c80649d1f867fe72abe3d4b96ea0b8d2ac96ccaa27a7284accc5b953"
+      },
+      "end_marker": false,
+      "file": "7z/repetitive-1m.o8.m16m.7zz.ppmd",
+      "mem": 16777216,
+      "name": "repetitive-1m.o8.m16m.7zz.ppmd",
+      "order": 8,
+      "payload": "fixture-repetitive-1m.bin",
+      "payload_len": 1048576,
+      "ppmd_rust_encoder_identical": true,
+      "producer": "7zz",
+      "requested": {
+        "mem": 16777216,
+        "order": 8
+      },
+      "stream_len": 19986,
+      "stream_sha256": "3afeb661152ee24efc2542c2d17725d33c17f2e3559c3b0323dff0f15bf3cccf"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/text-0.o6.m1m.ppmd-rust.ppmd7a",
+      "mem": 1048576,
+      "name": "text-0.o6.m1m.ppmd-rust.ppmd7a",
+      "order": 6,
+      "payload": "fixture-text-0.bin",
+      "payload_len": 0,
+      "producer": "ppmd-rust",
+      "stream_len": 4,
+      "stream_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/text-1.o6.m1m.ppmd-rust.ppmd7a",
+      "mem": 1048576,
+      "name": "text-1.o6.m1m.ppmd-rust.ppmd7a",
+      "order": 6,
+      "payload": "fixture-text-1.bin",
+      "payload_len": 1,
+      "producer": "ppmd-rust",
+      "stream_len": 4,
+      "stream_sha256": "3662be54763b4a588486ed6f078c50d05b9cac8e993debeb3ba853f530dd2e03"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/text-1k.o6.m16m.ppmd-rust.ppmd7a",
+      "mem": 16777216,
+      "name": "text-1k.o6.m16m.ppmd-rust.ppmd7a",
+      "order": 6,
+      "payload": "fixture-text-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 522,
+      "stream_sha256": "f792ddb3033fe0f9d4e63cf0f82812a78e462cb014c39199f08c7d1ad6611318"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/binary-1k.o6.m16m.ppmd-rust.ppmd7a",
+      "mem": 16777216,
+      "name": "binary-1k.o6.m16m.ppmd-rust.ppmd7a",
+      "order": 6,
+      "payload": "fixture-binary-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 508,
+      "stream_sha256": "cd5704b1abbcb75f2469344dc3df5dcfd2975c0ae11abdaaf0f22396c5eb672f"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/mixed-1k.o6.m16m.ppmd-rust.ppmd7a",
+      "mem": 16777216,
+      "name": "mixed-1k.o6.m16m.ppmd-rust.ppmd7a",
+      "order": 6,
+      "payload": "fixture-mixed-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 545,
+      "stream_sha256": "eb1814e405500859589daf1afa4533ef239dbef3fd698ad774036bd1a7f579b1"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/repetitive-1k.o6.m16m.ppmd-rust.ppmd7a",
+      "mem": 16777216,
+      "name": "repetitive-1k.o6.m16m.ppmd-rust.ppmd7a",
+      "order": 6,
+      "payload": "fixture-repetitive-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 98,
+      "stream_sha256": "0e5e0d7a958c20be8460ff9c33955c0123c3fc2e0bf12001753715f5c2e77006"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/random-1k.o6.m16m.ppmd-rust.ppmd7a",
+      "mem": 16777216,
+      "name": "random-1k.o6.m16m.ppmd-rust.ppmd7a",
+      "order": 6,
+      "payload": "fixture-random-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 1100,
+      "stream_sha256": "18e5c4fc5a51fa70aabe5921b0ff698289ef9ff116b6f446651357b3f5288008"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/text-64k.o2.m1m.ppmd-rust.ppmd7a",
+      "mem": 1048576,
+      "name": "text-64k.o2.m1m.ppmd-rust.ppmd7a",
+      "order": 2,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 24088,
+      "stream_sha256": "9ffd090e5556dae3cb1b3a0ed91dd03ba11e52a6a245a6f2f108bd4b3c956d92"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/text-64k.o6.m1m.ppmd-rust.ppmd7a",
+      "mem": 1048576,
+      "name": "text-64k.o6.m1m.ppmd-rust.ppmd7a",
+      "order": 6,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 16644,
+      "stream_sha256": "cf16e2c347f4c93e6e7761b9fd616d20cf018f4fd01cf96446eb5fee83be7d32"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/text-64k.o16.m1m.ppmd-rust.ppmd7a",
+      "mem": 1048576,
+      "name": "text-64k.o16.m1m.ppmd-rust.ppmd7a",
+      "order": 16,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 19344,
+      "stream_sha256": "a379226b8d8aadd271eca66c7c0d63edbe127ba3197cf8194b4aabbd5befbb42"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/text-64k.o64.m1m.ppmd-rust.ppmd7a",
+      "mem": 1048576,
+      "name": "text-64k.o64.m1m.ppmd-rust.ppmd7a",
+      "order": 64,
+      "payload": "fixture-text-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 19347,
+      "stream_sha256": "10cfb4d2d2b1d5d10708ac990419eb6dd0ae3390413afe8208864ee21a0d917f"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/mixed-64k.o8.m1m.ppmd-rust.ppmd7a",
+      "mem": 1048576,
+      "name": "mixed-64k.o8.m1m.ppmd-rust.ppmd7a",
+      "order": 8,
+      "payload": "fixture-mixed-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 40565,
+      "stream_sha256": "89097cc2989a16b0e1579900032a18c6065c5865d8e02cbe574bd16aa41bf70a"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/mixed-64k.o8.m16m.ppmd-rust.ppmd7a",
+      "mem": 16777216,
+      "name": "mixed-64k.o8.m16m.ppmd-rust.ppmd7a",
+      "order": 8,
+      "payload": "fixture-mixed-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 40565,
+      "stream_sha256": "89097cc2989a16b0e1579900032a18c6065c5865d8e02cbe574bd16aa41bf70a"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": false,
+      "file": "rar/mixed-64k.o8.m256m.ppmd-rust.ppmd7a",
+      "mem": 268435456,
+      "name": "mixed-64k.o8.m256m.ppmd-rust.ppmd7a",
+      "order": 8,
+      "payload": "fixture-mixed-64k.bin",
+      "payload_len": 65536,
+      "producer": "ppmd-rust",
+      "stream_len": 40565,
+      "stream_sha256": "89097cc2989a16b0e1579900032a18c6065c5865d8e02cbe574bd16aa41bf70a"
+    },
+    {
+      "coder": "carry-less",
+      "end_marker": true,
+      "file": "rar/text-1k.o6.m1m.ppmd-rust.eos.ppmd7a",
+      "mem": 1048576,
+      "name": "text-1k.o6.m1m.ppmd-rust.eos.ppmd7a",
+      "order": 6,
+      "payload": "fixture-text-1k.bin",
+      "payload_len": 1024,
+      "producer": "ppmd-rust",
+      "stream_len": 524,
+      "stream_sha256": "c02172844385c5a6fb1daf8f28983a7ae1da08b03bf9e754c8a1d7eb8f688f2c"
+    }
+  ]
+}

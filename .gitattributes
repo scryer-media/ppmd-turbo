@@ -3,3 +3,6 @@
 *.bin binary
 *.7z binary
 *.rar binary
+*.ppmd binary
+*.ppmd7a binary
+*.packed binary

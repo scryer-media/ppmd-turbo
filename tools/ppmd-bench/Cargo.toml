@@ -1,0 +1,20 @@
+[package]
+name = "ppmd-bench"
+description = "Single-shot PPMd decode and encode driver for ppmd-turbo's benchmark harness"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/scryer-media/ppmd-turbo"
+publish = false
+
+[dependencies]
+crc32fast = "1.5.0"
+ppmd-corpus = { path = "../ppmd-corpus" }
+# The second contender. A tool dependency only, never the crate's.
+ppmd-rust = "=1.5.0"
+ppmd-turbo = { path = "../.." }
+serde_json = "1.0.149"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.186"
