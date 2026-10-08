@@ -1,46 +1,48 @@
 //! Where the range encoders write their bytes.
 //!
-//! The encoders emit one byte per normalization step (and runs of carry
-//! bytes from the 7z coder's `ShiftLow`), so, as on the input side, the
-//! per-byte path is an inlined store into a buffer and anything slower
-//! happens at the buffer's edge. [`RangeOutput`] is that path; the encoders
-//! are generic over it.
+//! The encoders emit one byte per normalization step, and the 7z coder's
+//! `ShiftLow` emits runs: a cached byte followed by any number of `0xFF`
+//! bytes, all plus a carry. [`RangeOutput`] takes both, so a run is one
+//! call with a count rather than a loop of stores.
 //!
-//! Three backings:
+//! Two sinks:
 //!
-//! - `Vec<u8>` (owned or `&mut`), which grows as needed;
-//! - [`SliceOutput`], a caller's fixed buffer: running out of room is
-//!   recorded and reported by [`RangeOutput::finish`], never a panic;
-//! - [`WriteOutput`], an owned buffer (64 KiB by default) flushed to any
-//!   [`std::io::Write`] when full and at the end. A write error is kept and
-//!   reported by `finish`; bytes after it are dropped.
+//! - `Vec<u8>`, which grows as needed (whole-buffer encodes inside the
+//!   crate and its tests);
+//! - [`Drain`], the step encoders' sink: the caller's output slice, and
+//!   behind it a [`Pending`] queue for what one symbol emits past the
+//!   slice's end. Every byte either sink receives is settled (a carry can
+//!   no longer change it), so the caller may hand off whatever a call
+//!   produced at once.
 
-use std::io::{ErrorKind, Write};
+use crate::params::MAX_INPUT_PER_SYMBOL;
 
-use crate::error::{Error, Result};
-
-/// The default buffer size of [`WriteOutput`]: 64 KiB.
-pub const DEFAULT_FLUSH_SIZE: usize = 1 << 16;
-
-/// The byte sink a range encoder writes to.
+/// The byte sink a range encoder writes to. Never fails: a sink that has
+/// no room keeps the bytes for later ([`Drain`]) or grows (`Vec`).
 pub trait RangeOutput {
-    /// Appends one byte. Never fails here: a sink that cannot take it
-    /// records the failure and reports it from [`finish`](Self::finish).
+    /// Appends one byte.
     fn write_byte(&mut self, byte: u8);
 
-    /// Flushes whatever is buffered to the final sink and reports any
-    /// failure recorded since the sink was created.
-    fn finish(&mut self) -> Result<()>;
+    /// Appends `first`, then `count` copies of `fill`.
+    #[inline]
+    fn write_run(&mut self, first: u8, fill: u8, count: u64) {
+        self.write_byte(first);
+        for _ in 0..count {
+            self.write_byte(fill);
+        }
+    }
 }
 
-impl RangeOutput for Vec<u8> {
+impl RangeOutput for alloc_crate::vec::Vec<u8> {
     #[inline(always)]
     fn write_byte(&mut self, byte: u8) {
         self.push(byte);
     }
 
-    fn finish(&mut self) -> Result<()> {
-        Ok(())
+    fn write_run(&mut self, first: u8, fill: u8, count: u64) {
+        self.push(first);
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
+        self.resize(self.len().saturating_add(count), fill);
     }
 }
 
@@ -50,138 +52,213 @@ impl<O: RangeOutput + ?Sized> RangeOutput for &mut O {
         (**self).write_byte(byte);
     }
 
-    fn finish(&mut self) -> Result<()> {
-        (**self).finish()
+    #[inline]
+    fn write_run(&mut self, first: u8, fill: u8, count: u64) {
+        (**self).write_run(first, fill, count);
     }
 }
 
-/// A caller's fixed-size buffer.
+/// Bytes one step emitted past the end of the caller's output, in order:
+/// an optional head byte, a run of one fill byte, then a short tail.
 ///
-/// Writing past its end is recorded, not a panic: [`finish`](RangeOutput::finish)
-/// then returns an [`Error::Io`] of kind [`ErrorKind::WriteZero`].
-#[derive(Debug)]
-pub struct SliceOutput<'a> {
-    buf: &'a mut [u8],
-    len: usize,
+/// A step (one symbol, the end marker, or the flush) starts only with an
+/// empty queue, so at most one long run can land here per step: the first
+/// emission's, which carries the `0xFF` bytes the 7z coder held back before
+/// the step began. Everything the step emits after that is bounded by its
+/// normalization count: at most two bytes per coder operation for the 7z
+/// coder, four for the carry-less coder, and at most `order + 2` operations
+/// per symbol, so [`MAX_INPUT_PER_SYMBOL`] covers it with room to spare.
+/// The queue is therefore O(1) state, never a growing buffer.
+#[derive(Clone, Debug)]
+pub struct Pending {
+    head: Option<u8>,
+    fill: u8,
+    run: u64,
+    tail: [u8; TAIL],
+    tail_start: usize,
+    tail_len: usize,
     overflowed: bool,
 }
 
-impl<'a> SliceOutput<'a> {
-    /// Writes into `buf` from its first byte.
-    pub fn new(buf: &'a mut [u8]) -> Self {
+const TAIL: usize = 2 * MAX_INPUT_PER_SYMBOL;
+
+impl Default for Pending {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Pending {
+    /// An empty queue.
+    pub const fn new() -> Self {
         Self {
-            buf,
-            len: 0,
+            head: None,
+            fill: 0,
+            run: 0,
+            tail: [0; TAIL],
+            tail_start: 0,
+            tail_len: 0,
             overflowed: false,
         }
     }
 
-    /// Bytes written so far.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Whether nothing has been written yet.
+    /// Whether nothing is queued.
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.head.is_none() && self.run == 0 && self.tail_start == self.tail_len
     }
 
-    /// Whether a byte was dropped for lack of room.
+    /// Bytes queued.
+    pub fn len(&self) -> u64 {
+        u64::from(self.head.is_some()) + self.run + (self.tail_len - self.tail_start) as u64
+    }
+
+    /// Whether a step emitted more than the tail can hold, which the bound
+    /// above rules out. Reported as an error, never a panic.
     pub fn overflowed(&self) -> bool {
         self.overflowed
     }
 
-    /// The bytes written so far.
-    pub fn written(&self) -> &[u8] {
-        &self.buf[..self.len]
+    /// Empties the queue.
+    pub fn clear(&mut self) {
+        self.head = None;
+        self.run = 0;
+        self.tail_start = 0;
+        self.tail_len = 0;
+        self.overflowed = false;
     }
-}
 
-impl RangeOutput for SliceOutput<'_> {
-    #[inline(always)]
-    fn write_byte(&mut self, byte: u8) {
-        if let Some(slot) = self.buf.get_mut(self.len) {
+    #[inline]
+    fn push_tail(&mut self, byte: u8) {
+        if let Some(slot) = self.tail.get_mut(self.tail_len) {
             *slot = byte;
-            self.len += 1;
+            self.tail_len += 1;
         } else {
             self.overflowed = true;
         }
     }
 
-    fn finish(&mut self) -> Result<()> {
-        if self.overflowed {
-            return Err(Error::Io(ErrorKind::WriteZero.into()));
+    /// Moves queued bytes into `out`; returns how many.
+    pub fn drain_into(&mut self, out: &mut [u8]) -> usize {
+        let mut n = 0;
+        if let Some(head) = self.head {
+            let Some(slot) = out.first_mut() else {
+                return 0;
+            };
+            *slot = head;
+            self.head = None;
+            n = 1;
         }
-        Ok(())
+        if self.run != 0 {
+            let room = out.len() - n;
+            let take = usize::try_from(self.run).map_or(room, |run| run.min(room));
+            out[n..n + take].fill(self.fill);
+            self.run -= take as u64;
+            n += take;
+            if self.run != 0 {
+                return n;
+            }
+        }
+        let queued = &self.tail[self.tail_start..self.tail_len];
+        let take = queued.len().min(out.len() - n);
+        out[n..n + take].copy_from_slice(&queued[..take]);
+        self.tail_start += take;
+        if self.tail_start == self.tail_len {
+            self.tail_start = 0;
+            self.tail_len = 0;
+        }
+        n + take
     }
 }
 
-/// An owned buffer flushed to a [`std::io::Write`] when full and at
-/// [`finish`](RangeOutput::finish).
-#[derive(Debug)]
-pub struct WriteOutput<W: Write> {
-    writer: W,
-    buf: Vec<u8>,
-    flush_size: usize,
-    error: Option<std::io::Error>,
+/// The step encoders' sink: the caller's slice first, the [`Pending`] queue
+/// once the slice is full.
+///
+/// The per-byte path is one comparison against `end`, which drops to the
+/// write position as soon as anything is queued so that later bytes queue
+/// behind it and order is kept.
+pub struct Drain<'o, 'q> {
+    out: &'o mut [u8],
+    pos: usize,
+    end: usize,
+    queue: &'q mut Pending,
 }
 
-impl<W: Write> WriteOutput<W> {
-    /// Buffers [`DEFAULT_FLUSH_SIZE`] bytes between writes.
-    pub fn new(writer: W) -> Self {
-        Self::with_flush_size(writer, DEFAULT_FLUSH_SIZE)
-    }
-
-    /// Buffers `flush_size` bytes (at least 1) between writes.
-    pub fn with_flush_size(writer: W, flush_size: usize) -> Self {
-        let flush_size = flush_size.max(1);
+impl<'o, 'q> Drain<'o, 'q> {
+    /// A sink over `out`, queueing into `queue`, which must be empty.
+    pub fn new(out: &'o mut [u8], queue: &'q mut Pending) -> Self {
+        debug_assert!(queue.is_empty());
+        let end = out.len();
         Self {
-            writer,
-            buf: Vec::with_capacity(flush_size),
-            flush_size,
-            error: None,
+            out,
+            pos: 0,
+            end,
+            queue,
         }
     }
 
-    /// The writer. Buffered bytes have not reached it yet.
-    pub fn get_ref(&self) -> &W {
-        &self.writer
+    /// Bytes written into the caller's slice.
+    #[inline]
+    pub fn written(&self) -> usize {
+        self.pos
     }
 
-    /// Unwraps the writer. Call [`finish`](RangeOutput::finish) first, or
-    /// buffered bytes are lost.
-    pub fn into_inner(self) -> W {
-        self.writer
+    /// Whether the slice is full or anything is queued: the encoder starts
+    /// no further step until the queue drains.
+    #[inline]
+    pub fn blocked(&self) -> bool {
+        self.pos >= self.end
     }
 
     #[cold]
     #[inline(never)]
-    fn flush_buf(&mut self) {
-        if self.error.is_none()
-            && let Err(e) = self.writer.write_all(&self.buf)
-        {
-            self.error = Some(e);
-        }
-        self.buf.clear();
+    fn queue_byte(&mut self, byte: u8) {
+        self.end = self.pos;
+        self.queue.push_tail(byte);
     }
 }
 
-impl<W: Write> RangeOutput for WriteOutput<W> {
+impl RangeOutput for Drain<'_, '_> {
     #[inline(always)]
     fn write_byte(&mut self, byte: u8) {
-        self.buf.push(byte);
-        if self.buf.len() >= self.flush_size {
-            self.flush_buf();
+        if self.pos < self.end {
+            // `end <= out.len()`, so this never fails; `get_mut` keeps the
+            // path free of a panic branch.
+            if let Some(slot) = self.out.get_mut(self.pos) {
+                *slot = byte;
+                self.pos += 1;
+                return;
+            }
         }
+        self.queue_byte(byte);
     }
 
-    fn finish(&mut self) -> Result<()> {
-        self.flush_buf();
-        if let Some(e) = self.error.take() {
-            return Err(Error::Io(e));
+    fn write_run(&mut self, first: u8, fill: u8, count: u64) {
+        if self.pos >= self.end {
+            if self.queue.is_empty() {
+                self.end = self.pos;
+                self.queue.head = Some(first);
+                self.queue.fill = fill;
+                self.queue.run = count;
+                return;
+            }
+            self.queue.push_tail(first);
+            for _ in 0..count.min(TAIL as u64 + 1) {
+                self.queue.push_tail(fill);
+            }
+            return;
         }
-        self.writer.flush()?;
-        Ok(())
+        self.write_byte(first);
+        let room = (self.end - self.pos) as u64;
+        let direct = count.min(room) as usize;
+        self.out[self.pos..self.pos + direct].fill(fill);
+        self.pos += direct;
+        let rest = count - direct as u64;
+        if rest != 0 {
+            self.end = self.pos;
+            self.queue.fill = fill;
+            self.queue.run = rest;
+        }
     }
 }
 
@@ -189,46 +266,49 @@ impl<W: Write> RangeOutput for WriteOutput<W> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn slice_output_reports_overflow_at_finish() {
-        let mut buf = [0u8; 2];
-        let mut out = SliceOutput::new(&mut buf);
-        for b in [1, 2, 3] {
-            out.write_byte(b);
+    fn drain_all(queue: &mut Pending) -> alloc_crate::vec::Vec<u8> {
+        let mut all = alloc_crate::vec::Vec::new();
+        let mut buf = [0u8; 3];
+        while !queue.is_empty() {
+            let n = queue.drain_into(&mut buf);
+            all.extend_from_slice(&buf[..n]);
         }
-        assert!(out.overflowed());
-        assert_eq!(out.written(), [1, 2]);
-        assert!(matches!(out.finish(), Err(Error::Io(e)) if e.kind() == ErrorKind::WriteZero));
+        all
+    }
+
+    /// Whatever the slice size, the bytes come out in order.
+    #[test]
+    fn a_drain_keeps_order_across_the_slice_edge() {
+        for room in 0..12 {
+            let mut queue = Pending::new();
+            let mut out = alloc_crate::vec![0u8; room];
+            let mut sink = Drain::new(&mut out, &mut queue);
+            sink.write_byte(1);
+            sink.write_run(2, 0xFF, 5);
+            sink.write_byte(3);
+            sink.write_run(4, 0, 1);
+            let n = sink.written();
+            let mut got = out[..n].to_vec();
+            got.extend(drain_all(&mut queue));
+            assert_eq!(
+                got,
+                [1, 2, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 3, 4, 0],
+                "room {room}"
+            );
+        }
     }
 
     #[test]
-    fn write_output_flushes_at_the_edge_and_at_finish() {
-        let mut out = WriteOutput::with_flush_size(Vec::new(), 3);
-        for b in 0..7u8 {
-            out.write_byte(b);
-        }
-        assert_eq!(out.get_ref().len(), 6);
-        out.finish().unwrap();
-        assert_eq!(out.into_inner(), [0, 1, 2, 3, 4, 5, 6]);
-    }
-
-    struct Broken;
-
-    impl Write for Broken {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("pipe gone"))
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn write_output_keeps_the_first_error() {
-        let mut out = WriteOutput::with_flush_size(Broken, 1);
-        out.write_byte(1);
-        out.write_byte(2);
-        assert!(matches!(out.finish(), Err(Error::Io(e)) if e.to_string() == "pipe gone"));
+    fn a_long_run_is_a_count_not_a_buffer() {
+        let mut queue = Pending::new();
+        let mut out = [0u8; 2];
+        let mut sink = Drain::new(&mut out, &mut queue);
+        sink.write_run(9, 0xFF, 1 << 40);
+        assert_eq!(sink.written(), 2);
+        assert_eq!(queue.len(), (1 << 40) - 1);
+        assert!(!queue.overflowed());
+        let mut vec = alloc_crate::vec::Vec::new();
+        vec.write_run(1, 2, 3);
+        assert_eq!(vec, [1, 2, 2, 2]);
     }
 }

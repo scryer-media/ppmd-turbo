@@ -18,6 +18,12 @@ exclude = [
 ]
 
 [features]
+default = ["std"]
+# The io adapters, std::error::Error and run-time SIMD detection.
+std = []
+# The engine, for the crate's own fuzz targets, benches and differential
+# tests. Hidden and unstable.
+internals = []
 
 [dependencies]
 
@@ -31,6 +37,19 @@ serde_json = "1.0.149"
 sha2 = "0.10.9"
 # The 7z container CRCs in tests/differential_binaries.rs.
 crc32fast = "1.5"
+
+# The encoder suites check streams against the bare model and coders.
+[[test]]
+name = "encode_7z"
+required-features = ["internals"]
+
+[[test]]
+name = "encode_carryless"
+required-features = ["internals"]
+
+[[test]]
+name = "encode_oracle_7zz"
+required-features = ["internals"]
 
 # Repository tools (oracles, bench drivers) join as `tools/<name>` members so
 # their dependencies never reach this crate's own graph. The fuzz harness is

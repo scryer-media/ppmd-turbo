@@ -52,6 +52,7 @@ impl Model {
     }
 
     /// `Ppmd7z_EncodeSymbols`: encodes every byte of `data` in order.
+    #[allow(dead_code)] // The step encoder checks its sink per byte.
     pub(crate) fn encode_bytes<E: RangeEncoder>(&mut self, rc: &mut E, data: &[u8]) -> Result<()> {
         for &byte in data {
             self.encode_symbol(rc, Some(byte))?;

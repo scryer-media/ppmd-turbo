@@ -2,103 +2,150 @@
 //!
 //! Variant H over Dmitry Subbotin's carry-less range coder, as Dmitry
 //! Shkarin's public-domain PPMd var.H encoder writes it (the coder 7-Zip
-//! calls `Ppmd7a` and RAR 2.9 through 4.x uses inside its PPMd blocks).
-//! The encode path follows 7-Zip's `Ppmd7Enc.c` and Shkarin's encoder over
-//! the crate's shared model; RARLAB's unrar has no encoder, and no RARLAB
-//! source text is used here.
+//! calls `Ppmd7a` and RAR 2.9 through 4.x uses inside its PPMd blocks): four
+//! bytes of coder initialization, then the coded symbols. The encode path
+//! follows 7-Zip's `Ppmd7Enc.c` and Shkarin's encoder over the crate's
+//! shared model; RARLAB's unrar has no encoder, and no RARLAB source text is
+//! used here.
 //!
 //! This is the range-coded symbol stream only: no RAR block header, no
 //! escape layer, no archive. Writing RAR blocks or archives is out of scope
-//! by design. It exists so the carry-less decoding paths
-//! ([`CarrylessRangeDecoder`](crate::rc::CarrylessRangeDecoder),
-//! [`RarDecoder`](crate::rar::RarDecoder)) can be round-trip tested; it is
-//! for correctness only, never benchmarked and not a tuned encoder.
+//! by design. The pair exists so the carry-less paths, including
+//! [`RarPpmd`](crate::RarPpmd), can be round-trip tested; it is for
+//! correctness only, never benchmarked and not tuned.
+//!
+//! [`CarrylessDecoder`] and [`CarrylessEncoder`] have exactly the surface of
+//! the 7z pair and its stop rules ([`crate::sevenz`]); the end marker needs
+//! the coder's `code` to equal its `low`, and an initial code of
+//! `0xFFFFFFFF` is corrupt (7-Zip's `Ppmd7a_RangeDec_Init`).
 
-use std::io::{self, Write};
+use crate::arena::Arena;
+use crate::error::{Progress, Result};
+use crate::params::Params;
+use crate::stream::{Carryless, Finish, SevenZStatus, StreamDecoder, StreamEncoder};
 
-use crate::error::Result;
-use crate::model::Model;
-use crate::rc::{CarrylessRangeEncoder, RangeOutput, WriteOutput};
-
-/// Encodes a raw carry-less PPMd stream into any [`std::io::Write`]: the
-/// counterpart of [`Ppmd7Encoder`](crate::ppmd7::Ppmd7Encoder) with the
-/// carry-less coder.
-///
-/// [`finish`](Self::finish) writes the end marker if asked and then the four
-/// bytes of the coder's `low`. The stream starts with the coder's four
-/// initialization bytes, as a RAR PPMd block's coder data does.
-pub struct CarrylessEncoder<W: Write> {
-    model: Model,
-    rc: CarrylessRangeEncoder<WriteOutput<W>>,
+/// A raw carry-less stream decoder; see [`SevenZDecoder`](crate::SevenZDecoder)
+/// for the contract. A non-final call needs `4 * (order + 2)` bytes of input
+/// to decode a symbol.
+pub struct CarrylessDecoder {
+    inner: StreamDecoder<Carryless>,
 }
 
-impl<W: Write> CarrylessEncoder<W> {
-    /// A new encoder writing to `writer`, with model order `order` and an
-    /// arena of `mem_size` bytes (a RAR block declares whole MiB).
-    ///
-    /// Errors: [`Error::InvalidParameters`](crate::Error::InvalidParameters)
-    /// for parameters variant H does not accept.
-    pub fn new(writer: W, order: u32, mem_size: u32) -> Result<Self> {
+impl CarrylessDecoder {
+    /// A decoder for one stream; `unpacked` as for
+    /// [`SevenZDecoder::new`](crate::SevenZDecoder::new).
+    pub fn new(params: Params, unpacked: Option<u64>) -> Result<Self> {
+        Self::with_arena(params, unpacked, Arena::empty())
+    }
+
+    /// [`new`](Self::new) in `arena` when its capacity fits.
+    pub fn with_arena(params: Params, unpacked: Option<u64>, arena: Arena) -> Result<Self> {
         Ok(Self {
-            model: Model::new(order, mem_size)?,
-            rc: CarrylessRangeEncoder::new(WriteOutput::new(writer)),
+            inner: StreamDecoder::with_arena(params, unpacked, arena)?,
         })
     }
 
-    /// The writer. Up to 64 KiB of coded bytes may still be buffered.
-    pub fn get_ref(&self) -> &W {
-        self.rc.output().get_ref()
+    /// Starts the next stream, keeping the arena when it fits.
+    pub fn reset(&mut self, params: Params, unpacked: Option<u64>) -> Result<()> {
+        self.inner.reset(params, unpacked)
     }
 
-    /// Encodes every byte of `data`.
-    ///
-    /// Errors: [`Error::CorruptStream`](crate::Error::CorruptStream) if the
-    /// model or the coder went inconsistent, which a correct encoder never
-    /// does.
-    pub fn encode(&mut self, data: &[u8]) -> Result<()> {
-        self.model.encode_bytes(&mut self.rc, data)
+    /// FinishStream, as [`SevenZDecoder::set_finish_stream`](crate::SevenZDecoder::set_finish_stream).
+    pub fn set_finish_stream(&mut self, on: bool) {
+        self.inner.set_finish_stream(on);
     }
 
-    /// Writes the end marker when `with_end_marker` is set, flushes the
-    /// coder and returns the writer.
-    ///
-    /// Errors: the writer's error, or as for [`encode`](Self::encode).
-    pub fn finish(mut self, with_end_marker: bool) -> Result<W> {
-        if with_end_marker {
-            self.model.encode_symbol(&mut self.rc, None)?;
-        }
-        Ok(self.rc.finish()?.into_inner())
+    /// Decodes from `input` into `out`, as
+    /// [`SevenZDecoder::decode`](crate::SevenZDecoder::decode).
+    pub fn decode(
+        &mut self,
+        input: &[u8],
+        input_is_last: bool,
+        out: &mut [u8],
+    ) -> Result<Progress<SevenZStatus>> {
+        self.inner.decode(input, input_is_last, out)
+    }
+
+    /// Input bytes consumed since construction or the last reset.
+    pub fn total_in(&self) -> u64 {
+        self.inner.total_in()
+    }
+
+    /// Output bytes produced since construction or the last reset.
+    pub fn total_out(&self) -> u64 {
+        self.inner.total_out()
+    }
+
+    /// Heap bytes the decoder holds.
+    pub fn memory_footprint(&self) -> u64 {
+        self.inner.memory_footprint()
+    }
+
+    /// The arena, for the next codec.
+    pub fn into_arena(self) -> Arena {
+        self.inner.into_arena()
     }
 }
 
-impl<W: Write> Write for CarrylessEncoder<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.encode(buf).map_err(io::Error::from)?;
-        Ok(buf.len())
-    }
-
-    /// Hands the bytes already written by the coder to the writer and
-    /// flushes it. The coder's `low` stays until
-    /// [`finish`](CarrylessEncoder::finish).
-    fn flush(&mut self) -> io::Result<()> {
-        self.rc.output_mut().finish().map_err(io::Error::from)
-    }
+/// A raw carry-less stream encoder; see [`SevenZEncoder`](crate::SevenZEncoder)
+/// for the contract. The carry-less coder holds nothing back, so
+/// [`finish`](Self::finish) writes the end marker if asked and then the four
+/// bytes of the coder's `low`.
+pub struct CarrylessEncoder {
+    inner: StreamEncoder<Carryless>,
 }
 
-/// Encodes `data` into a new `Vec` as a raw carry-less stream.
-///
-/// Errors: as [`CarrylessEncoder::new`] and [`CarrylessEncoder::finish`].
-pub fn encode_carryless(
-    data: &[u8],
-    order: u32,
-    mem_size: u32,
-    end_marker: bool,
-) -> Result<Vec<u8>> {
-    let mut model = Model::new(order, mem_size)?;
-    let mut rc = CarrylessRangeEncoder::new(Vec::with_capacity(data.len() / 2 + 16));
-    model.encode_bytes(&mut rc, data)?;
-    if end_marker {
-        model.encode_symbol(&mut rc, None)?;
+impl CarrylessEncoder {
+    /// An encoder for one stream.
+    pub fn new(params: Params) -> Result<Self> {
+        Self::with_arena(params, Arena::empty())
     }
-    rc.finish()
+
+    /// [`new`](Self::new) in `arena` when its capacity fits.
+    pub fn with_arena(params: Params, arena: Arena) -> Result<Self> {
+        Ok(Self {
+            inner: StreamEncoder::with_arena(params, arena)?,
+        })
+    }
+
+    /// Starts the next stream, keeping the arena when it fits.
+    pub fn reset(&mut self, params: Params) -> Result<()> {
+        self.inner.reset(params)
+    }
+
+    /// Encodes from `input` into `out`, as
+    /// [`SevenZEncoder::encode`](crate::SevenZEncoder::encode).
+    pub fn encode(&mut self, input: &[u8], out: &mut [u8]) -> Result<Progress<()>> {
+        self.inner.encode(input, out)
+    }
+
+    /// Ends the stream, as [`SevenZEncoder::finish`](crate::SevenZEncoder::finish).
+    pub fn finish(&mut self, out: &mut [u8], end_marker: bool) -> Result<Finish> {
+        self.inner.finish(out, end_marker)
+    }
+
+    /// Output bytes owed before any further symbol.
+    pub fn pending_output(&self) -> u64 {
+        self.inner.pending_output()
+    }
+
+    /// Input bytes encoded since construction or the last reset.
+    pub fn total_in(&self) -> u64 {
+        self.inner.total_in()
+    }
+
+    /// Output bytes produced since construction or the last reset.
+    pub fn total_out(&self) -> u64 {
+        self.inner.total_out()
+    }
+
+    /// Heap bytes the encoder holds.
+    pub fn memory_footprint(&self) -> u64 {
+        self.inner.memory_footprint()
+    }
+
+    /// The arena, for the next codec.
+    pub fn into_arena(self) -> Arena {
+        self.inner.into_arena()
+    }
 }

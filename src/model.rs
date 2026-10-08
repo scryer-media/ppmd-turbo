@@ -14,7 +14,7 @@
 //! Every arena pointer the model follows comes from the stream's own history
 //! and so is untrusted: each one is checked against the arena and the text
 //! boundary before it is dereferenced, and a pointer that fails the check
-//! ends decoding with [`Error::CorruptStream`]. The checks produce
+//! ends decoding with a corrupt-stream error. The checks produce
 //! validated-span tokens, so a record is checked once and then read
 //! field by field without repeating the check.
 
@@ -158,13 +158,21 @@ impl Model {
     ///
     /// `order` must be in [`PPMD7_MIN_ORDER`]`..=`[`PPMD7_MAX_ORDER`] and
     /// `mem_size` in [`PPMD7_MIN_MEM_SIZE`]`..=`[`PPMD7_MAX_MEM_SIZE`];
-    /// anything else is [`Error::InvalidParameters`]. The arena is allocated
-    /// here, once, and never grows: its length is `mem_size` rounded down to
-    /// whole 12-byte units, plus three units, as unrar lays it out.
+    /// anything else is invalid parameters. The arena is allocated here,
+    /// once, and never grows: its length is `mem_size` rounded down to whole
+    /// 12-byte units, plus three units, as unrar lays it out. A refused
+    /// allocation is an error, never an abort.
     pub fn new(order: u32, mem_size: u32) -> Result<Self> {
+        Self::with_arena(order, mem_size, alloc_crate::vec::Vec::new())
+    }
+
+    /// [`new`](Self::new) in `arena` when its capacity fits the layout (at
+    /// least the arena length and at most twice it), otherwise in a fresh
+    /// allocation.
+    pub fn with_arena(order: u32, mem_size: u32, arena: alloc_crate::vec::Vec<u8>) -> Result<Self> {
         let (order, mem_size) = Self::check_parameters(order, mem_size)?;
         let mut model = Self {
-            alloc: SubAllocator::new(mem_size),
+            alloc: SubAllocator::try_new(mem_size, arena)?,
             see: SeeTable::new(),
             max_order: order,
             min_context: 0,
@@ -185,21 +193,33 @@ impl Model {
             run_length: 0,
             init_rl: -(order.min(12) as i32) - 1,
             unmasked_scratch: [0; 256],
-            #[cfg(all(target_arch = "x86_64", not(miri)))]
+            #[cfg(all(target_arch = "x86_64", not(miri), feature = "std"))]
             use_ssse3_state_batches: std::arch::is_x86_feature_detected!("ssse3"),
+            #[cfg(all(target_arch = "x86_64", not(miri), not(feature = "std")))]
+            use_ssse3_state_batches: cfg!(target_feature = "ssse3"),
             model_fault: false,
             #[cfg(test)]
             restarts: 0,
         };
-        model.start_checked(order, mem_size);
+        model.start_checked(order, mem_size)?;
         Ok(model)
+    }
+
+    /// The arena, for a later model to reuse.
+    pub fn into_arena(self) -> alloc_crate::vec::Vec<u8> {
+        self.alloc.into_arena()
+    }
+
+    /// Bytes the arena allocation holds.
+    pub fn arena_capacity(&self) -> usize {
+        self.alloc.arena_capacity()
     }
 
     pub(crate) fn check_parameters(order: u32, mem_size: u32) -> Result<(usize, usize)> {
         if !(PPMD7_MIN_ORDER..=PPMD7_MAX_ORDER).contains(&order)
             || !(PPMD7_MIN_MEM_SIZE..=PPMD7_MAX_MEM_SIZE).contains(&mem_size)
         {
-            return Err(Error::InvalidParameters);
+            return Err(Error::invalid_parameters());
         }
         Ok((order as usize, mem_size as usize))
     }
@@ -215,35 +235,38 @@ impl Model {
     }
 
     /// Address of the model arena; see [`SubAllocator::arena_addr`].
-    #[cfg(test)]
-    pub(crate) fn arena_addr(&self) -> usize {
+    #[cfg(any(test, feature = "internals"))]
+    pub fn arena_addr(&self) -> usize {
         self.alloc.arena_addr()
     }
 
     /// Restarts the model with a new order and arena size, as a fresh
     /// [`Model::new`] would be, but keeping the arena when its size is
-    /// unchanged so its pages are not faulted in again.
+    /// unchanged (or its allocation still fits the new size) so its pages
+    /// are not faulted in again. On an allocation error the model is left
+    /// as it was.
     pub fn start(&mut self, order: u32, mem_size: u32) -> Result<()> {
         let (order, mem_size) = Self::check_parameters(order, mem_size)?;
-        self.start_checked(order, mem_size);
-        Ok(())
+        self.start_checked(order, mem_size)
     }
 
-    fn start_checked(&mut self, max_order: usize, alloc_size: usize) {
+    fn start_checked(&mut self, max_order: usize, alloc_size: usize) -> Result<()> {
         if self.alloc.allocated_size() != alloc_size {
-            self.alloc = SubAllocator::new(alloc_size);
+            self.alloc.rebuild(alloc_size)?;
         }
         self.max_order = max_order;
         self.esc_count = 1;
         self.model_fault = false;
         self.restart_model();
         self.build_lookup_tables();
+        Ok(())
     }
 
     /// Restarts the model from scratch with its current order and arena
-    /// size: the state a stream begins in.
+    /// size: the state a stream begins in. Allocates nothing.
     pub fn restart(&mut self) {
-        self.start_checked(self.max_order, self.alloc.allocated_size());
+        let restarted = self.start_checked(self.max_order, self.alloc.allocated_size());
+        debug_assert!(restarted.is_ok());
     }
 
     fn build_lookup_tables(&mut self) {
@@ -561,7 +584,7 @@ impl Model {
     #[cold]
     #[inline(never)]
     fn corrupt_model<T>(detail: &'static str) -> Result<T> {
-        Err(Error::CorruptStream { detail })
+        Err(Error::corrupt(detail))
     }
 
     // =======================================================================
@@ -696,7 +719,7 @@ impl Model {
     /// marker (an escape out of the order-0 context; RAR also reads it as the
     /// model giving up on a stream it cannot decode). A model whose arena
     /// pointers or frequencies are inconsistent, or a coder that faulted,
-    /// is [`Error::CorruptStream`]; the model must be restarted before it is
+    /// is a corrupt-stream error; the model must be restarted before it is
     /// used again.
     #[inline(always)]
     pub fn decode_symbol<R: RangeDecoder>(&mut self, rc: &mut R) -> Result<Option<u8>> {
@@ -2082,7 +2105,10 @@ mod tests {
             match model.decode_symbol(&mut rc) {
                 Ok(Some(_)) => decoded += 1,
                 Ok(None) => model.restart(),
-                Err(Error::CorruptStream { .. }) => break,
+                Err(Error {
+                    kind: crate::ErrorKind::Corrupt(_),
+                    ..
+                }) => break,
                 Err(other) => panic!("unexpected error {other:?}"),
             }
         }
@@ -2139,14 +2165,23 @@ mod tests {
             (6, u32::MAX),
         ] {
             assert!(
-                matches!(Model::new(order, mem), Err(Error::InvalidParameters)),
+                matches!(
+                    Model::new(order, mem),
+                    Err(Error {
+                        kind: crate::ErrorKind::InvalidParameters,
+                        ..
+                    })
+                ),
                 "order {order} mem {mem}"
             );
         }
         let mut model = Model::new(6, 1 << 16).unwrap();
         assert!(matches!(
             model.start(65, 1 << 16),
-            Err(Error::InvalidParameters)
+            Err(Error {
+                kind: crate::ErrorKind::InvalidParameters,
+                ..
+            })
         ));
         assert_eq!((model.order(), model.mem_size()), (6, 1 << 16));
     }
@@ -2167,7 +2202,10 @@ mod tests {
             assert!(
                 matches!(
                     model.decode_symbol(&mut rc),
-                    Err(Error::CorruptStream { .. })
+                    Err(Error {
+                        kind: crate::ErrorKind::Corrupt(_),
+                        ..
+                    })
                 ),
                 "range {range}"
             );
@@ -2236,7 +2274,13 @@ mod tests {
 
         let result = model.decode_symbol(&mut rc);
 
-        assert!(matches!(result, Err(Error::CorruptStream { .. })));
+        assert!(matches!(
+            result,
+            Err(Error {
+                kind: crate::ErrorKind::Corrupt(_),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2248,7 +2292,13 @@ mod tests {
 
         let result = model.decode_symbol(&mut rc);
 
-        assert!(matches!(result, Err(Error::CorruptStream { .. })));
+        assert!(matches!(
+            result,
+            Err(Error {
+                kind: crate::ErrorKind::Corrupt(_),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2368,7 +2418,13 @@ mod tests {
 
         let result = model.decode_symbol(&mut rc);
 
-        assert!(matches!(result, Err(Error::CorruptStream { .. })));
+        assert!(matches!(
+            result,
+            Err(Error {
+                kind: crate::ErrorKind::Corrupt(_),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2379,7 +2435,13 @@ mod tests {
 
         let result = model.decode_symbol(&mut rc);
 
-        assert!(matches!(result, Err(Error::CorruptStream { .. })));
+        assert!(matches!(
+            result,
+            Err(Error {
+                kind: crate::ErrorKind::Corrupt(_),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2393,7 +2455,13 @@ mod tests {
 
         let result = model.decode_symbol(&mut rc);
 
-        assert!(matches!(result, Err(Error::CorruptStream { .. })));
+        assert!(matches!(
+            result,
+            Err(Error {
+                kind: crate::ErrorKind::Corrupt(_),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2409,7 +2477,13 @@ mod tests {
         assert_eq!(model.decode_symbol(&mut rc).unwrap(), Some(0));
         let result = model.decode_symbol(&mut rc);
 
-        assert!(matches!(result, Err(Error::CorruptStream { .. })));
+        assert!(matches!(
+            result,
+            Err(Error {
+                kind: crate::ErrorKind::Corrupt(_),
+                ..
+            })
+        ));
     }
 
     #[test]

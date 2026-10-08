@@ -15,15 +15,23 @@
 //! order below. It is reproduced exactly.
 //!
 //! The arena is allocated once, when the model is created or its size
-//! changes, and never grows. Its length is the requested size rounded down to
+//! changes, and never grows. Allocation is fallible (`crate::arena`): a
+//! refused arena is an error, never an abort. An arena handed back by an
+//! earlier codec is reused when its capacity is at least the size needed and
+//! at most twice it; the layout depends only on the requested size, so a
+//! reused arena behaves exactly as a fresh one. Its length is the requested size rounded down to
 //! whole units plus three units: the null unit at offset 0 and the two
 //! trailing units the RAR layout reserves.
 //!
 //! All unchecked arena access is confined to this module, behind
 //! [`ValidatedArenaSpan`] tokens that are only minted after a bounds check.
 
-use std::cell::Cell;
-use std::num::NonZeroU32;
+use core::cell::Cell;
+use core::num::NonZeroU32;
+
+use alloc_crate::vec::Vec;
+
+use crate::error::Result;
 
 /// Size of one allocation unit in bytes.
 pub(crate) const UNIT_SIZE: usize = 12;
@@ -201,10 +209,28 @@ pub(crate) struct SubAllocator {
 }
 
 impl SubAllocator {
+    /// The arena length a requested size lays out to: the size (at least
+    /// eight units) rounded down to whole units, plus the null unit and the
+    /// two trailing units.
+    pub(crate) const fn arena_bytes(requested_size: usize) -> usize {
+        let requested_size = if requested_size < UNIT_SIZE * 8 {
+            UNIT_SIZE * 8
+        } else {
+            requested_size
+        };
+        HEAP_BASE_BYTES + (requested_size / UNIT_SIZE) * UNIT_SIZE + 2 * UNIT_SIZE
+    }
+
+    /// Whether an allocation of `capacity` bytes may back an arena of
+    /// `needed` bytes: large enough, and not more than twice the need, so a
+    /// small stream does not pin a huge arena.
+    pub(crate) const fn reusable(capacity: usize, needed: usize) -> bool {
+        capacity >= needed && capacity / 2 <= needed
+    }
+
     fn layout_for(requested_size: usize) -> AllocatorLayout {
+        let allocated_size = Self::arena_bytes(requested_size);
         let requested_size = requested_size.max(UNIT_SIZE * 8);
-        let rar_allocated_size = (requested_size / UNIT_SIZE) * UNIT_SIZE + 2 * UNIT_SIZE;
-        let allocated_size = HEAP_BASE_BYTES + rar_allocated_size;
 
         let size2 = UNIT_SIZE * ((requested_size / 8 / UNIT_SIZE) * 7);
         let real_size2 = (size2 / UNIT_SIZE) * UNIT_SIZE;
@@ -227,12 +253,62 @@ impl SubAllocator {
         }
     }
 
-    /// Create a new sub-allocator with the given arena size in bytes.
+    /// A sub-allocator over an arena of `arena_size` bytes, in test code
+    /// where allocation cannot fail.
+    #[cfg(test)]
     pub(crate) fn new(arena_size: usize) -> Self {
-        let layout = Self::layout_for(arena_size);
+        match Self::try_new(arena_size, Vec::new()) {
+            Ok(alloc) => alloc,
+            Err(e) => panic!("test arena: {e}"),
+        }
+    }
 
+    /// A sub-allocator for `arena_size` bytes, in `arena` when it is
+    /// [`reusable`](Self::reusable), otherwise in a fresh zeroed allocation.
+    ///
+    /// Errors: allocation failed.
+    pub(crate) fn try_new(arena_size: usize, arena: Vec<u8>) -> Result<Self> {
+        let layout = Self::layout_for(arena_size);
+        let arena = Self::fit_arena(arena, layout.allocated_size)?;
+        Ok(Self::with_layout(arena, arena_size, layout))
+    }
+
+    /// Re-lays the allocator out for `arena_size` bytes, keeping the arena
+    /// when it is reusable. On error the allocator is unchanged.
+    pub(crate) fn rebuild(&mut self, arena_size: usize) -> Result<()> {
+        let layout = Self::layout_for(arena_size);
+        let arena = if Self::reusable(self.arena.capacity(), layout.allocated_size) {
+            core::mem::take(&mut self.arena)
+        } else {
+            // The old arena stays live until the new one exists.
+            crate::arena::try_zeroed(layout.allocated_size as u64)?
+        };
+        let arena = Self::fit_arena(arena, layout.allocated_size)?;
+        *self = Self::with_layout(arena, arena_size, layout);
+        Ok(())
+    }
+
+    /// The arena, for the next codec to reuse.
+    pub(crate) fn into_arena(self) -> Vec<u8> {
+        self.arena
+    }
+
+    /// Bytes the arena allocation holds.
+    pub(crate) fn arena_capacity(&self) -> usize {
+        self.arena.capacity()
+    }
+
+    fn fit_arena(mut arena: Vec<u8>, len: usize) -> Result<Vec<u8>> {
+        if !Self::reusable(arena.capacity(), len) {
+            arena = Vec::new();
+        }
+        crate::arena::fit(&mut arena, len)?;
+        Ok(arena)
+    }
+
+    fn with_layout(arena: Vec<u8>, arena_size: usize, layout: AllocatorLayout) -> Self {
         Self {
-            arena: vec![0u8; layout.allocated_size],
+            arena,
             sub_allocator_size: arena_size.max(UNIT_SIZE * 8),
             arena_fault: Cell::new(false),
             free_lists: [NodeRef::NULL; NUM_INDEXES],
@@ -272,7 +348,7 @@ impl SubAllocator {
     /// Tests use this to prove that a same-size restart reuses the existing
     /// arena instead of faulting in a fresh one; a replacement allocation is
     /// made while the old arena is still live, so the address always moves.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internals"))]
     #[inline]
     pub(crate) fn arena_addr(&self) -> usize {
         self.arena.as_ptr() as usize
