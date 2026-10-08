@@ -1,0 +1,146 @@
+#!/bin/sh
+set -eu
+
+current_user="${USER:-}"
+if [ -z "$current_user" ]; then
+  current_user="$(id -un 2>/dev/null || printf '')"
+fi
+
+home_dir="${HOME:-}"
+
+# Machine-local denylist: one case-insensitive fixed string per line (blank
+# lines and # comments ignored) naming things that must never reach a commit,
+# such as host names, LAN addresses, or account names. It lives outside the
+# repository on purpose, so the hook itself discloses nothing.
+denylist_path="${GIT_PRIVACY_DENYLIST:-${XDG_CONFIG_HOME:-$HOME/.config}/git-privacy/denylist}"
+
+denylist_patterns() {
+  [ -r "$denylist_path" ] || return 0
+  sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$denylist_path" | grep -v '^$' || true
+}
+
+tmp_output="$(mktemp "${TMPDIR:-/tmp}/scryer-pre-commit.XXXXXX")"
+trap 'rm -f "$tmp_output"' EXIT HUP INT TERM
+
+git diff --cached --no-color --unified=0 --diff-filter=ACMR -- . | awk \
+  -v current_user="$current_user" \
+  -v home_dir="$home_dir" \
+  '
+    BEGIN {
+      current_file = "unknown"
+      user_lower = tolower(current_user)
+      unix_users_token = "/" "Users/"
+      unix_home_token = "/" "home/"
+      windows_users_backslash_token = "C:" "\\" "Users" "\\"
+      windows_users_slash_token = "C:/" "Users/"
+
+      # Documentation and test placeholders. A home-directory path only
+      # evidences a leak when the account name belongs to somebody real, and
+      # these are the conventional stand-ins for "your account here". They are
+      # honoured by the generic token check alone: a line naming the committing
+      # user, or their real home directory, is still refused below even when it
+      # also contains one of these.
+      placeholder_count = split("example,user,username,youruser,your-user,someuser,testuser,test-user,alice,bob", placeholder_list, ",")
+      for (i = 1; i <= placeholder_count; i++) {
+        placeholder[placeholder_list[i]] = 1
+      }
+    }
+
+    # The path segment immediately after an occurrence of token at or after
+    # from: the account name that home-directory path is claiming.
+    function account_after(line, token, from,   pos, rest, i, ch, seg) {
+      pos = index(substr(line, from), token)
+      if (pos == 0) {
+        return ""
+      }
+      rest = substr(line, from + pos - 1 + length(token))
+      seg = ""
+      for (i = 1; i <= length(rest); i++) {
+        ch = substr(rest, i, 1)
+        if (ch == "/" || ch == "\\" || ch == "\"" || ch == " " || ch == ")" || ch == "," || ch == ";") {
+          break
+        }
+        seg = seg ch
+      }
+      return tolower(seg)
+    }
+
+    # 1 when every occurrence of token in line names a known placeholder. One
+    # unrecognised account name anywhere refuses the whole line.
+    function all_placeholders(line, token,   from, pos, account) {
+      from = 1
+      while (1) {
+        pos = index(substr(line, from), token)
+        if (pos == 0) {
+          return 1
+        }
+        account = account_after(line, token, from)
+        if (!(account in placeholder)) {
+          return 0
+        }
+        from = from + pos - 1 + length(token)
+      }
+    }
+
+    /^\+\+\+ b\// {
+      current_file = substr($0, 7)
+      next
+    }
+    /^\+/ && $0 !~ /^\+\+\+/ {
+      added_line = substr($0, 2)
+      added_lower = tolower(added_line)
+      if (user_lower != "" && index(added_lower, user_lower) > 0) {
+        printf "%s:%s\n", current_file, added_line
+        next
+      }
+      if (home_dir != "" && index(added_line, home_dir) > 0) {
+        printf "%s:%s\n", current_file, added_line
+        next
+      }
+      flagged = 0
+      if (index(added_line, unix_users_token) > 0 && !all_placeholders(added_line, unix_users_token)) {
+        flagged = 1
+      }
+      if (!flagged && index(added_line, unix_home_token) > 0 && !all_placeholders(added_line, unix_home_token)) {
+        flagged = 1
+      }
+      if (!flagged && index(added_line, windows_users_backslash_token) > 0 && !all_placeholders(added_line, windows_users_backslash_token)) {
+        flagged = 1
+      }
+      if (!flagged && index(added_line, windows_users_slash_token) > 0 && !all_placeholders(added_line, windows_users_slash_token)) {
+        flagged = 1
+      }
+      if (flagged) {
+        printf "%s:%s\n", current_file, added_line
+      }
+    }
+  ' >"$tmp_output"
+
+if [ -s "$tmp_output" ]; then
+  echo "pre-commit blocked: staged changes contain local personal path or username references." >&2
+  echo "Remove or generalize these lines before committing:" >&2
+  sed 's/^/  - /' "$tmp_output" >&2
+  echo "If a path is a documentation or test placeholder, name the account one of:" >&2
+  echo "  example, user, username, youruser, someuser, testuser, alice, bob" >&2
+  exit 1
+fi
+
+patterns="$(mktemp "${TMPDIR:-/tmp}/scryer-denylist.XXXXXX")"
+trap 'rm -f "$tmp_output" "$patterns"' EXIT HUP INT TERM
+denylist_patterns >"$patterns"
+if [ -s "$patterns" ]; then
+  { git diff --cached --no-color --unified=0 --diff-filter=ACMR -- . | grep '^+' | grep -v '^+++ ' | grep -i -F -f "$patterns" || true; } >"$tmp_output"
+  if [ -s "$tmp_output" ]; then
+    echo "pre-commit blocked: staged changes contain a term from your local privacy denylist ($denylist_path)." >&2
+    sed 's/^+/  - /' "$tmp_output" >&2
+    exit 1
+  fi
+  { git diff --cached --name-only --diff-filter=ACMR | grep -i -F -f "$patterns" || true; } >"$tmp_output"
+  if [ -s "$tmp_output" ]; then
+    echo "pre-commit blocked: staged paths contain a term from your local privacy denylist ($denylist_path)." >&2
+    sed 's/^/  - /' "$tmp_output" >&2
+    exit 1
+  fi
+fi
+
+"$(dirname "$0")/scan-secrets"

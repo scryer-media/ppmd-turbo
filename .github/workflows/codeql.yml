@@ -37,7 +37,24 @@ jobs:
           languages: ${{ matrix.language }}
           queries: security-extended
 
+      # Code scanning needs GitHub Code Security on a private repository,
+      # which this one does not have. While the repository is private the
+      # results stay in the job: nothing is uploaded and any result fails the
+      # job. Once it is public, results upload to code scanning as usual.
       - name: Analyze
         uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
         with:
           category: /language:${{ matrix.language }}
+          upload: ${{ github.event.repository.private && 'never' || 'always' }}
+          output: sarif-results
+
+      - name: Fail on any result while the repository is private
+        if: github.event.repository.private
+        run: |
+          count="$(jq '[.runs[].results[]] | length' sarif-results/*.sarif | awk '{ n += $1 } END { print n + 0 }')"
+          if [ "$count" -ne 0 ]; then
+            jq -r '.runs[].results[] | "\(.ruleId): \(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine) \(.message.text)"' sarif-results/*.sarif
+            echo "CodeQL reported $count result(s)"
+            exit 1
+          fi
+          echo "CodeQL reported no results"

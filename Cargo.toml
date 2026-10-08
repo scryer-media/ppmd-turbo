@@ -14,20 +14,52 @@ readme = "README.md"
 # Repository scaffolding that has no business in the crate archive.
 exclude = [
     ".github/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md",
-    "bench/", "docs/", "fuzz/", "tools/", "rust-toolchain.toml", "rustfmt.toml",
+    "bench/", "docs/", "fuzz/", "tests/", "tools/", "rust-toolchain.toml", "rustfmt.toml",
 ]
 
 [features]
+default = ["std"]
+# The io adapters, std::error::Error and run-time SIMD detection.
+std = []
+# The engine, for the crate's own fuzz targets, benches and differential
+# tests. Hidden and unstable.
+internals = []
 
 [dependencies]
 
 [dev-dependencies]
+# Differential oracle for the coders (tests/coder_differential.rs). Test-only:
+# it never reaches the published crate's graph.
+ppmd-rust = "=1.5.0"
+# The conformance suites read tests/fixtures/manifest.json and compare SHA-256
+# digests. Test-only: neither reaches the published crate's graph.
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+# The 7z container CRCs in tests/differential_binaries.rs.
+crc32fast = "1.5"
+# The conformance suites build the ppmd-rust fixture streams in process when
+# they are not on disk, through the same code as `ppmd-corpus fixtures`. A
+# path-only dev-dependency: cargo drops it from the published manifest.
+ppmd-corpus = { path = "tools/ppmd-corpus" }
+
+# The encoder suites check streams against the bare model and coders.
+[[test]]
+name = "encode_7z"
+required-features = ["internals"]
+
+[[test]]
+name = "encode_carryless"
+required-features = ["internals"]
+
+[[test]]
+name = "encode_oracle_7zz"
+required-features = ["internals"]
 
 # Repository tools (oracles, bench drivers) join as `tools/<name>` members so
 # their dependencies never reach this crate's own graph. The fuzz harness is
 # its own workspace, built on nightly by cargo-fuzz.
 [workspace]
-members = []
+members = ["tools/ppmd-bench", "tools/ppmd-corpus", "tools/ppmd-oracle"]
 exclude = ["fuzz"]
 resolver = "3"
 

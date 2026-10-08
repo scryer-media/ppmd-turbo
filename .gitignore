@@ -11,9 +11,22 @@
 /logs/
 /SHA256SUMS
 
-# Benchmark fixtures and results are generated locally.
-/bench/**/fixtures/
-/bench/**/results/
+# Generated fixtures: never committed. `cargo run --locked --release -p
+# ppmd-corpus -- fixtures` writes them and checks each against
+# tools/ppmd-corpus/fixtures.sha256. tests/fixtures/manifest.json, the
+# conformance recipe, is committed.
+/tests/fixtures/7z/
+/tests/fixtures/rar/
+/tests/hostile_fixtures/
+/fuzz/seeds/
+/fuzz/regressions/
+
+# Benchmark fixtures and results are generated locally and never committed:
+# a run's report names the host it ran on.
+/bench/fixtures/
+/bench/results/
+/bench/ppmd-turbo-bench/ppmd-turbo-bench
+/bench/ppmd-turbo-bench/ppmd-turbo-bench.exe
 
 # Rust profiling/coverage
 /coverage/

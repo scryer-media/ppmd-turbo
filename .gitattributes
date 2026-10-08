@@ -1,5 +1,3 @@
 *.txt text eol=lf
-# Fixture streams are compared byte for byte.
-*.bin binary
-*.7z binary
-*.rar binary
+# The fixture digest list is compared line by line.
+*.sha256 text eol=lf

@@ -4,63 +4,130 @@
 //! sub-allocator and secondary escape estimation, and the two range coders
 //! that carry it in the wild:
 //!
-//! - the carry-less range coder RAR 2.9/3.x uses for its PPMd blocks, and
-//! - the LZMA-style range coder 7-Zip uses for the `PPMD` method in `.7z`.
+//! - the LZMA-style range coder 7-Zip uses for the `PPMD` method in `.7z`
+//!   ([`SevenZDecoder`], [`SevenZEncoder`]), and
+//! - the carry-less range coder RAR 2.9 through 4.x uses for its PPMd blocks
+//!   ([`RarPpmd`]; RAR5 has no PPMd).
 //!
-//! Both framings are covered for decoding and encoding. Output is bit-exact
-//! with RARLAB unrar and 7-Zip: a 7z stream encoded here is byte-identical to
-//! 7-Zip's for the same parameters, and a RAR stream decodes to exactly what
-//! unrar produces.
+//! Output is bit-exact with 7-Zip and RARLAB unrar: a 7z stream encoded here
+//! is byte-identical to 7-Zip's for the same parameters, and a RAR stream
+//! decodes to exactly what unrar produces. Writing RAR blocks or archives is
+//! out of scope by design; [`CarrylessEncoder`] and [`CarrylessDecoder`]
+//! handle raw carry-less streams for round-trip testing only.
 //!
-//! The crate is pre-release. Every module below is a placeholder that states
-//! what it will hold; the API is unstable until 1.0.
+//! # The step API
+//!
+//! Every codec is a step machine over slices the caller owns: a call takes
+//! input and an output slice and reports a [`Progress`] with exact
+//! `consumed` and `produced` counts and a status. The codecs never keep
+//! caller bytes between calls; a non-final call decodes only while a whole
+//! symbol's worth of input ([`Params::max_input_per_symbol`], at most
+//! [`MAX_INPUT_PER_SYMBOL`]) remains. Model memory is an [`Arena`] the
+//! caller can reuse across streams. Errors are typed ([`ErrorKind`]),
+//! `Copy`, carry the stream [`Position`], and are sticky until a reset. The
+//! [`io`] module wraps the 7z pair in `Read` and `Write`.
+//!
+//! ```
+//! use ppmd_turbo::{Params, SevenZDecoder, SevenZEncoder, SevenZStatus};
+//!
+//! let data = b"the quick brown fox jumps over the lazy dog";
+//! let params = Params::new(6, 1 << 20)?.reduced_for(data.len() as u64);
+//!
+//! let mut encoder = SevenZEncoder::new(params)?;
+//! let mut stream = vec![0u8; 128];
+//! let mut len = encoder.encode(data, &mut stream)?.produced;
+//! while !{
+//!     let fin = encoder.finish(&mut stream[len..], false)?;
+//!     len += fin.produced;
+//!     fin.done
+//! } {}
+//!
+//! let mut decoder = SevenZDecoder::new(params, Some(data.len() as u64))?;
+//! let mut out = vec![0u8; data.len()];
+//! let step = decoder.decode(&stream[..len], true, &mut out)?;
+//! assert_eq!(step.status, SevenZStatus::ReachedSize);
+//! assert_eq!(step.consumed, len);
+//! assert_eq!(&out[..], data);
+//! # Ok::<(), ppmd_turbo::Error>(())
+//! ```
+//!
+//! # Features
+//!
+//! - `std` (default): the [`io`] adapters, `std::error::Error`, the
+//!   `io::Error` conversion and run-time x86 SIMD detection. Without it the
+//!   crate builds on `core` and `alloc`, choosing SIMD tiers at compile
+//!   time; this is checked, not promised.
+//! - `internals`: the engine, for the crate's own fuzz targets, benches and
+//!   differential tests. Hidden and unstable.
 //!
 //! `unsafe` is permitted where it pays for itself, and only with a
 //! `// SAFETY:` proof on every block, Miri coverage where Miri can run, and a
 //! fuzz target over every decoder and encoder entry point.
 
-pub mod alloc;
-pub mod error;
-pub mod model;
-pub mod ppmd7;
+#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+extern crate alloc as alloc_crate;
+#[cfg(not(feature = "std"))]
+extern crate core as std;
+
+#[cfg_attr(not(feature = "internals"), allow(dead_code))]
+pub(crate) mod alloc;
+mod arena;
+pub mod carryless;
+mod engine;
+mod error;
+#[cfg(feature = "std")]
+pub mod io;
+#[cfg_attr(not(feature = "internals"), allow(dead_code))]
+pub(crate) mod model;
+mod params;
 pub mod rar;
-pub mod rc;
-pub mod see;
+#[cfg_attr(not(feature = "internals"), allow(dead_code))]
+pub(crate) mod rc;
+#[cfg_attr(not(feature = "internals"), allow(dead_code))]
+pub(crate) mod see;
+pub mod sevenz;
+mod stream;
 
-pub use error::{Error, Result};
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub mod internals;
 
-/// The smallest model order variant H accepts (`PPMD7_MIN_ORDER` in 7-Zip).
-pub const PPMD7_MIN_ORDER: u32 = 2;
+pub use arena::Arena;
+pub use carryless::{CarrylessDecoder, CarrylessEncoder};
+pub use error::{Error, ErrorKind, Position, Progress, Result};
+pub use params::{MAX_INPUT_PER_SYMBOL, Params};
+pub use rar::{RarPpmd, RarStatus, Symbol};
+pub use sevenz::{Finish, SevenZDecoder, SevenZEncoder, SevenZStatus};
 
-/// The largest model order variant H accepts (`PPMD7_MAX_ORDER` in 7-Zip).
-pub const PPMD7_MAX_ORDER: u32 = 64;
+pub(crate) const PPMD7_MIN_ORDER: u32 = Params::MIN_ORDER;
+pub(crate) const PPMD7_MAX_ORDER: u32 = Params::MAX_ORDER;
+pub(crate) const PPMD7_MIN_MEM_SIZE: u32 = Params::MIN_MEM;
+pub(crate) const PPMD7_MAX_MEM_SIZE: u32 = Params::MAX_MEM;
 
-/// The smallest sub-allocator size in bytes (`PPMD7_MIN_MEM_SIZE` in 7-Zip).
-pub const PPMD7_MIN_MEM_SIZE: u32 = 1 << 11;
-
-/// The largest sub-allocator size in bytes (`PPMD7_MAX_MEM_SIZE` in 7-Zip):
-/// `0xFFFF_FFFF - 12 * 3`, so the allocator's three trailing units still fit
-/// in 32-bit offsets.
-pub const PPMD7_MAX_MEM_SIZE: u32 = 0xFFFF_FFFF - 12 * 3;
-
-/// Symbol value a decoder returns at the end-of-stream marker
+/// The symbol value of the end marker in the model's encoder
 /// (`PPMD7_SYM_END` in 7-Zip).
-pub const SYM_END: i32 = -1;
+pub(crate) const SYM_END: i32 = -1;
 
-/// Symbol value a decoder returns when the stream is corrupt
-/// (`PPMD7_SYM_ERROR` in 7-Zip).
-pub const SYM_ERROR: i32 = -2;
+/// The model's decoder result for a count past the frequency total, which a
+/// valid stream never produces (`PPMD7_SYM_ERROR` in 7-Zip).
+pub(crate) const SYM_ERROR: i32 = -2;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn limits_match_7zip() {
-        assert_eq!(PPMD7_MIN_ORDER, 2);
-        assert_eq!(PPMD7_MAX_ORDER, 64);
-        assert_eq!(PPMD7_MIN_MEM_SIZE, 2048);
-        assert_eq!(PPMD7_MAX_MEM_SIZE, 0xFFFF_FFDB);
-        assert_eq!((SYM_END, SYM_ERROR), (-1, -2));
+/// Every codec moves between threads; none is shared (`Sync`), because the
+/// sub-allocator's free lists use `Cell`.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Arena>();
+    assert_send::<Error>();
+    assert_send::<SevenZDecoder>();
+    assert_send::<SevenZEncoder>();
+    assert_send::<RarPpmd>();
+    assert_send::<CarrylessDecoder>();
+    assert_send::<CarrylessEncoder>();
+    #[cfg(feature = "std")]
+    {
+        assert_send::<io::SevenZReader<&[u8]>>();
+        assert_send::<io::SevenZWriter<alloc_crate::vec::Vec<u8>>>();
     }
-}
+};

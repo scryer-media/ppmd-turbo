@@ -1,8 +1,9 @@
 name: ci
 
-# fmt, clippy, tests on every desktop platform, Miri, a short fuzz run of
-# every target, docs, MSRV and packaging. `ci-complete` is the one required
-# check: it fails when any lane does.
+# fmt, clippy, tests on every desktop platform, Miri, a short deterministic
+# fuzz run of every target, the hostile tests under AddressSanitizer, docs,
+# MSRV and packaging. fuzz-extended.yml runs the long campaigns on demand.
+# `ci-complete` is the one required check: it fails when any lane does.
 
 on:
   pull_request:
@@ -35,7 +36,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
@@ -62,7 +63,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
@@ -81,15 +82,55 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - run: cargo doc --locked --no-deps --all-features
 
+  # Every generated fixture, written once from the committed recipes and
+  # handed to the lanes that read them. None is committed. The job fails if
+  # any oracle is missing or any file differs from
+  # tools/ppmd-corpus/fixtures.sha256, so no row is silently skipped.
+  fixtures:
+    name: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install 7-Zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends 7zip
+          sevenzip="$(command -v 7zz || command -v 7z)"
+          "$sevenzip" | head -n 3
+          echo "SEVENZIP=$sevenzip" >> "$GITHUB_ENV"
+      - name: Regenerate every fixture
+        run: cargo run --locked --release -p ppmd-corpus -- fixtures --require-all --sevenzip "$SEVENZIP"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fixtures
+          path: |
+            tests/fixtures/7z/
+            tests/fixtures/rar/
+            tests/hostile_fixtures/
+            fuzz/seeds/
+            fuzz/regressions/
+          if-no-files-found: error
+          retention-days: 7
+
   test:
     name: test-${{ matrix.platform }}
+    needs: fixtures
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    env:
+      # A missing fixture fails the suite instead of being skipped.
+      PPMD_TURBO_REQUIRE_FIXTURES: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -110,9 +151,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fixtures
       - name: Test all features
         run: cargo test --locked --workspace --all-features --no-fail-fast
       - name: Test default features
@@ -126,7 +170,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
           components: miri, rust-src
@@ -136,12 +180,43 @@ jobs:
       - name: Set up Miri
         run: cargo "+$NIGHTLY_TOOLCHAIN" miri setup
       - name: Miri
-        run: cargo "+$NIGHTLY_TOOLCHAIN" miri nextest run --locked --all-features -j "$(nproc)"
+        env:
+          # Isolation stays off as before; the lanes Miri runs read no
+          # fixture files and no clock.
+          MIRIFLAGS: -Zmiri-disable-isolation
+        # Miri runs the unit tests, which cover every unsafe path in the
+        # model and the coders, plus the two small coder suites. The corpus,
+        # conformance and hostile suites decode whole streams and ran past
+        # the two-hour job limit under Miri; the native lanes run them.
+        run: cargo "+$NIGHTLY_TOOLCHAIN" miri nextest run --locked --all-features -j "$(nproc)" -E 'kind(lib) | binary(coder_differential) | binary(encode_carryless)'
 
-  # A short run of every target on both 64-bit Linux architectures. A crash
-  # fails the lane; the input is kept as an artifact.
+  # The fuzz harness library, including the seed generator's own checks
+  # (the fixtures job checks the generated seeds against their digests).
+  fuzz-harness:
+    name: fuzz-harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+      - name: Harness tests
+        run: cargo test --locked --manifest-path fuzz/Cargo.toml --lib
+
+  # A short, deterministic run of every target on both 64-bit Linux
+  # architectures: a fixed libFuzzer seed and a fixed iteration count per
+  # target, starting from the generated seeds. cargo-fuzz builds with
+  # AddressSanitizer. A crash fails the lane; the input is kept as an
+  # artifact.
   fuzz:
     name: fuzz-${{ matrix.platform }}-${{ matrix.target }}
+    needs: fixtures
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -150,26 +225,63 @@ jobs:
         platform: [linux-x86_64, linux-aarch64]
         target:
           - decode_7z
+          - decode_rar
+          - decode_differential_7z
+          - roundtrip_7z
+          - roundtrip_carryless
+          - structure_7z
+          - range_coders
+          - checked_vs_unchecked
+          - model_ops
         include:
           - platform: linux-x86_64
             runner: ubuntu-24.04
           - platform: linux-aarch64
             runner: ubuntu-24.04-arm
+          # Iterations sized to about a minute each on a hosted runner.
+          - target: decode_7z
+            runs: 20000
+          - target: decode_rar
+            runs: 20000
+          - target: decode_differential_7z
+            runs: 20000
+          - target: roundtrip_7z
+            runs: 5000
+          - target: roundtrip_carryless
+            runs: 5000
+          - target: structure_7z
+            runs: 2000
+          - target: range_coders
+            runs: 50000
+          - target: checked_vs_unchecked
+            runs: 10000
+          - target: model_ops
+            runs: 5000
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fixtures
       - name: Fuzz
         env:
           TARGET: ${{ matrix.target }}
+          RUNS: ${{ matrix.runs }}
         run: |
-          cargo "+$NIGHTLY_TOOLCHAIN" fuzz run "$TARGET" -- \
-            -max_total_time=60 -rss_limit_mb=2048 -print_final_stats=1
+          mkdir -p "fuzz/corpus/$TARGET"
+          corpora=("fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET")
+          # Minimised past crashes replay first, on every run.
+          if [ -d "fuzz/regressions/$TARGET" ]; then
+            corpora+=("fuzz/regressions/$TARGET")
+          fi
+          cargo "+$NIGHTLY_TOOLCHAIN" fuzz run "$TARGET" "${corpora[@]}" -- \
+            -runs="$RUNS" -seed=1 -rss_limit_mb=2048 -print_final_stats=1
       - name: Keep the failing input
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -177,6 +289,28 @@ jobs:
           name: fuzz-findings-${{ matrix.platform }}-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
+
+  # The hostile-input tests under AddressSanitizer. Only the test crate is
+  # instrumented (`--target` keeps build scripts and proc macros plain).
+  asan:
+    name: asan-linux-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+      - name: Hostile tests under ASan
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+        run: |
+          cargo "+$NIGHTLY_TOOLCHAIN" test --locked --all-features \
+            --target x86_64-unknown-linux-gnu \
+            --test hostile_decode --test hostile_memory
 
   msrv:
     name: msrv
@@ -192,7 +326,7 @@ jobs:
           version="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "MSRV=$version" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - name: The crate
@@ -206,7 +340,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: The crates.io archive builds
@@ -215,7 +349,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [fmt, clippy, docs, test, miri, fuzz, msrv, package]
+    needs: [fmt, clippy, docs, fixtures, test, miri, fuzz-harness, fuzz, asan, msrv, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

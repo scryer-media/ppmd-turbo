@@ -1,0 +1,129 @@
+name: fuzz-extended
+
+# Long fuzz campaigns and the binary oracles, on demand only. Never runs on
+# pull requests or pushes. Each target gets its own job; a crash keeps the
+# failing input, and every run keeps the corpus it grew so it can be
+# minimised and folded back into fuzz/src/seeds.rs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: libFuzzer iterations per target (-runs)
+        required: true
+        default: "2000000"
+      seed:
+        description: libFuzzer seed (-seed); fixed, so a run can be replayed
+        required: true
+        default: "1"
+      oracles:
+        description: Also run the 7zz differential checks on macOS
+        type: boolean
+        default: false
+
+concurrency:
+  group: ppmd-turbo-fuzz-extended-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.97.1
+  NIGHTLY_TOOLCHAIN: nightly-2026-09-01
+  CARGO_FUZZ_VERSION: 0.13.2
+
+jobs:
+  fuzz:
+    name: fuzz-${{ matrix.platform }}-${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x86_64, linux-aarch64]
+        target:
+          - decode_7z
+          - decode_rar
+          - decode_differential_7z
+          - roundtrip_7z
+          - roundtrip_carryless
+          - structure_7z
+          - range_coders
+          - checked_vs_unchecked
+          - model_ops
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      # The seeds and regressions are generated, never committed.
+      - name: Generate the seeds
+        run: cargo "+$NIGHTLY_TOOLCHAIN" run --locked --release -p ppmd-corpus -- fixtures --only seeds
+      - name: Fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          RUNS: ${{ inputs.runs }}
+          SEED: ${{ inputs.seed }}
+        run: |
+          case "$RUNS$SEED" in
+            *[!0-9]*|"") echo "runs and seed must be decimal integers" >&2; exit 2 ;;
+          esac
+          mkdir -p "fuzz/corpus/$TARGET"
+          corpora=("fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET")
+          # Minimised past crashes replay first, on every run.
+          if [ -d "fuzz/regressions/$TARGET" ]; then
+            corpora+=("fuzz/regressions/$TARGET")
+          fi
+          cargo "+$NIGHTLY_TOOLCHAIN" fuzz run "$TARGET" "${corpora[@]}" -- \
+            -runs="$RUNS" -seed="$SEED" -rss_limit_mb=2048 -print_final_stats=1
+      - name: Keep the failing input
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-findings-${{ matrix.platform }}-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+      - name: Keep the grown corpus
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-corpus-${{ matrix.platform }}-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # tests/differential_binaries.rs and the ppmd-oracle CLI against 7zz.
+  # unrar is not installed, so the RAR checks skip.
+  oracles:
+    name: oracles-macos-aarch64
+    if: inputs.oracles
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install 7-Zip
+        run: brew install sevenzip
+      - name: Differential tests
+        env:
+          PPMD_TURBO_ORACLES: "1"
+        run: cargo test --locked --release --test differential_binaries -- --ignored
+      - name: Oracle CLI, reference codec (validates the oracle)
+        run: cargo run --locked --release -p ppmd-oracle -- check-7z --codec reference
+      - name: Oracle CLI, ppmd-turbo
+        run: cargo run --locked --release -p ppmd-oracle -- check-7z --codec turbo

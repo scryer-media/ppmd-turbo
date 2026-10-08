@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+# Refuse commit messages that name anything on the machine-local privacy
+# denylist (see pre-commit for the file's location and format).
+denylist_path="${GIT_PRIVACY_DENYLIST:-${XDG_CONFIG_HOME:-$HOME/.config}/git-privacy/denylist}"
+[ -r "$denylist_path" ] || exit 0
+
+patterns="$(mktemp "${TMPDIR:-/tmp}/scryer-denylist.XXXXXX")"
+trap 'rm -f "$patterns"' EXIT HUP INT TERM
+sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$denylist_path" | grep -v '^$' >"$patterns" || true
+[ -s "$patterns" ] || exit 0
+
+hits="$(grep -v '^#' "$1" | grep -i -F -f "$patterns" || true)"
+if [ -n "$hits" ]; then
+  echo "commit-msg blocked: the message contains a term from your local privacy denylist ($denylist_path)." >&2
+  printf '%s\n' "$hits" | sed 's/^/  - /' >&2
+  exit 1
+fi
+
+home_dir="${HOME:-}"
+current_user="${USER:-$(id -un 2>/dev/null || true)}"
+msg="$(grep -v '^#' "$1")"
+if [ -n "$home_dir" ] && printf '%s' "$msg" | grep -q -F "$home_dir"; then
+  echo "commit-msg blocked: the message contains your home directory path." >&2
+  exit 1
+fi
+if [ -n "$current_user" ] && printf '%s' "$msg" | grep -q -i -F "$current_user"; then
+  echo "commit-msg blocked: the message contains your account name." >&2
+  exit 1
+fi
