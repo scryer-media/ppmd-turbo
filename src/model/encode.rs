@@ -296,6 +296,63 @@ impl Model {
         let (esc_freq, see_index) = self.make_esc_freq2(context_head, suffix_ns, diff);
         let n = diff as usize;
 
+        // D11: the decoder's NEON escape pass, encoder side. The unmasked
+        // total comes from one table-lookup pass; the target is found by
+        // symbol (masking is per symbol, so its first state is the one the
+        // reference would select, if unmasked) and its low end is the
+        // unmasked total of the states before it.
+        #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
+        if ns as usize >= super::escape_neon::MIN_STATES {
+            use super::escape_neon::{Lookup, unmasked_total};
+            let esc_count = self.esc_count;
+            let lookup = Lookup::new(&self.char_mask, esc_count);
+            let (hi_cnt, unmasked) = unmasked_total(
+                &lookup,
+                &self.alloc,
+                &self.char_mask,
+                states_span,
+                ns as usize,
+                esc_count,
+            );
+            if unmasked == n {
+                let scale = esc_freq + hi_cnt;
+                let selected = u8::try_from(target)
+                    .ok()
+                    .filter(|&t| self.char_mask[t as usize] != esc_count)
+                    .and_then(|t| self.span_find_state(states_span, ns as usize, t));
+                if let Some(state_index) = selected {
+                    let (low, _) = unmasked_total(
+                        &lookup,
+                        &self.alloc,
+                        &self.char_mask,
+                        states_span,
+                        state_index,
+                        esc_count,
+                    );
+                    let state_freq = self.span_state_freq(states_span, state_index);
+                    rc.encode(low, u32::from(state_freq), scale);
+                    self.see_update_success(see_index);
+                    return self.update2(
+                        ctx,
+                        context_span,
+                        states_span,
+                        state_index,
+                        state_freq,
+                        found_span,
+                    );
+                }
+                rc.encode(hi_cnt, esc_freq, scale);
+                self.see_update_escape(see_index, scale);
+                for state_index in 0..ns as usize {
+                    let sym = self.span_state_sym(states_span, state_index);
+                    self.char_mask[sym as usize] = esc_count;
+                }
+                self.num_masked = ns;
+                *validated_suffix = suffix_data;
+                return true;
+            }
+        }
+
         // The first `n` unmasked states, as the decoder collects them, with
         // the target's place among them.
         let mut hi_cnt = 0u32;
