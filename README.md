@@ -16,7 +16,7 @@ Pre-release. The API is unstable until 1.0.
 | --- | --- | --- |
 | RAR 2.9-4.x PPMd blocks (RAR3) | implemented | planned |
 | RAR5 | not applicable: RAR5 has no PPMd | not applicable |
-| 7z `PPMD` method | planned | planned |
+| 7z `PPMD` method | implemented | planned |
 
 RAR streams decode to exactly what unrar produces; 7z output is byte-identical
 to 7-Zip's for the same order and memory size.

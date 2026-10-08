@@ -22,9 +22,9 @@ It exists so the crate can write streams for its own correctness tests; no
 profile has a RAR encode row and `ppmd-bench` has no `encode-rar`.
 
 ppmd-turbo rows appear only for the operations the crate provides:
-`ppmd-bench info` reports them, and the harness plans from that. Until the
-decoders land, a run measures ppmd-rust against 7zz, which is the baseline
-ppmd-turbo is then held to.
+`ppmd-bench info` reports them, and the harness plans from that. Both
+decoders are wired; until the encoder lands, 7z encode rows measure
+ppmd-rust against 7zz, which is the baseline ppmd-turbo is then held to.
 
 ## Corpora
 

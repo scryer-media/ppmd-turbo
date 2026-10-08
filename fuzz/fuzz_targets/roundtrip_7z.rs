@@ -6,8 +6,8 @@
 //! - ppmd-rust decodes ppmd-turbo's stream back to the payload;
 //! - ppmd-turbo decodes its own stream back to the payload.
 //!
-//! Until ppmd-turbo's encoder and decoder land, only ppmd-rust's own round
-//! trip runs, which keeps the harness honest. Arenas are capped at 16 MiB.
+//! Until ppmd-turbo's encoder lands, ppmd-rust's own round trip runs and
+//! ppmd-turbo decodes ppmd-rust's stream. Arenas are capped at 16 MiB.
 //! Input layout: `ppmd_turbo_fuzz::layout::Roundtrip7z`.
 #![no_main]
 
@@ -45,6 +45,15 @@ fuzz_target!(|data: &[u8]| {
             eos,
             "ppmd-rust self round trip",
         );
+        if let Some(d) = api::decode_7z(&theirs, order, mem, known, cap) {
+            decoded(
+                &d.output,
+                d.verdict,
+                payload,
+                eos,
+                "ppmd-turbo decoding ppmd-rust",
+            );
+        }
         return;
     };
     let ours = ours.expect("ppmd-turbo's 7z encoder refused legal parameters");

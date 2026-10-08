@@ -36,7 +36,7 @@ is a released version.
   7z PPMd streams from ppmd-rust and 7-Zip, and RAR PPMd members, each
   recorded in a manifest with its parameters and digests.
 - Conformance fixtures under `tests/fixtures`, and 7z and RAR conformance
-  suites over them; the decoder tests wait on the decoders.
+  suites over them.
 - `ppmd-bench`, a one-operation-per-process driver for 7z decode, RAR decode
   and 7z encode that reports its own CPU time, peak heap and peak RSS.
 - The `ppmd-turbo-bench` Go harness with quick, full and fleet profiles,
@@ -49,5 +49,19 @@ is a released version.
   `roundtrip_carryless` and `structure_7z`.
 - `tools/ppmd-oracle`: a minimal PPMd `.7z` writer and reader and
   out-of-process checks against `7zz` and `unrar`.
+- 7z `PPMD` decoding: `Ppmd7Decoder<R: Read>` (with an optional known
+  unpacked size, end-marker handling and an opt-in FinishStream check, as
+  7-Zip's `PpmdDecoder.cpp`) and `decode_7z` for a slice. Output is
+  byte-identical to 7-Zip's.
+- `From<Error> for std::io::Error`: corrupt streams are `InvalidData`,
+  truncation is `UnexpectedEof`, bad parameters are `InvalidInput`, and I/O
+  errors pass through. Coder initialisation reports the reader's own error
+  instead of `Truncated`.
+- `RangeCoderState::new`, to build carry-less coder registers directly.
+- A RAR PPMd end marker reached after the coder ran past its input is
+  `Error::Truncated`, not the end of the data.
+- The fuzz harness, the hostile-input and conformance suites, `ppmd-bench
+  --impl ppmd-turbo` and `ppmd-oracle --codec turbo` run against both
+  decoders.
 - CI: a deterministic fuzz run of every target, the hostile tests under
   AddressSanitizer, and a dispatch-only `fuzz-extended` workflow.

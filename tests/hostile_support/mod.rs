@@ -2,11 +2,8 @@
 //! the no-panic wrapper, the fixtures under `tests/hostile_fixtures`, and a
 //! deterministic PRNG.
 //!
-//! The shim has the shape of `tests/common/api.rs` (the conformance suites')
-//! with the parameter types the RAR decoder actually takes (`u32` order and
-//! arena). Until the decoder lands every entry point is a `todo!()` and every
-//! test that reaches one is `#[ignore = "awaiting decoder"]`; the flip list
-//! is in `docs/testing.md`.
+//! The shim has the shape of `tests/common/api.rs` (the conformance suites'),
+//! over the crate's real decoders.
 
 #![allow(dead_code)]
 
@@ -17,9 +14,12 @@ use std::path::PathBuf;
 use ppmd_turbo::{Error, Result};
 
 pub mod api {
-    //! The intended API, one call per function.
+    //! The crate's API, one call per function.
 
     use super::*;
+
+    #[allow(unused_imports)]
+    pub use ppmd_turbo::rar::RarDecoder;
 
     /// The most output an unsized 7z decode collects. Garbage can decode to
     /// many symbols per input byte; past this the decode stops and returns
@@ -29,79 +29,28 @@ pub mod api {
     /// Decodes a raw 7z `PPMD` stream: exactly `unpacked_len` bytes when it
     /// is given (7z's folder size), otherwise to the end marker or
     /// [`OUTPUT_CAP`].
-    ///
-    /// Intended body:
-    ///
-    /// ```ignore
-    /// let decoder = ppmd_turbo::ppmd7::Ppmd7Decoder::new(stream, order, mem_size)?;
-    /// read_bounded(decoder, unpacked_len, OUTPUT_CAP)
-    /// ```
     pub fn decode_7z(
         stream: &[u8],
         order: u32,
         mem_size: u32,
         unpacked_len: Option<u64>,
     ) -> Result<Vec<u8>> {
-        let _ = (stream, order, mem_size, unpacked_len);
-        todo!("awaiting ppmd_turbo::ppmd7::Ppmd7Decoder")
-    }
-
-    /// RAR's PPMd decoder, kept across the blocks of a member or a solid run.
-    /// Intended: a wrapper over `ppmd_turbo::rar::RarDecoder`.
-    pub struct RarDecoder {
-        _private: (),
-    }
-
-    impl RarDecoder {
-        /// A decoder with no model yet; the first block must reset.
-        ///
-        /// Intended body: `Self { inner: ppmd_turbo::rar::RarDecoder::new() }`.
-        pub fn new() -> Self {
-            Self { _private: () }
-        }
-
-        /// Decodes one block from the carry-less coder's bytes; returns the
-        /// bytes of `rc_data` consumed. `order` is after RAR's mapping and
-        /// `mem_mb` is `MaxMB + 1`; both are used only when `reset`.
-        ///
-        /// Intended body:
-        /// `self.inner.decode_block(reset, order, mem_mb, rc_data, unpacked_remaining, out)`.
-        pub fn decode_block(
-            &mut self,
-            reset: bool,
-            order: u32,
-            mem_mb: u32,
-            rc_data: &[u8],
-            unpacked_remaining: u64,
-            out: &mut Vec<u8>,
-        ) -> Result<usize> {
-            let _ = (reset, order, mem_mb, rc_data, unpacked_remaining, out);
-            todo!("awaiting ppmd_turbo::rar::RarDecoder")
-        }
-    }
-
-    impl Default for RarDecoder {
-        fn default() -> Self {
-            Self::new()
-        }
+        let decoder = match unpacked_len {
+            Some(n) => ppmd_turbo::Ppmd7Decoder::with_unpacked_size(stream, order, mem_size, n)?,
+            None => ppmd_turbo::Ppmd7Decoder::new(stream, order, mem_size)?,
+        };
+        read_bounded(decoder, unpacked_len, OUTPUT_CAP)
     }
 
     /// Puts RAR's carry-less range decoder in the given registers, asks it to
     /// scale its range by `total`, and returns whether it reported the fault
     /// (`RangeDecoder::faulted`) instead of dividing by zero. No stream is
     /// needed: the registers are crafted so that `range / total == 0`.
-    ///
-    /// Intended body (needs a public constructor for the coder registers):
-    ///
-    /// ```ignore
-    /// use ppmd_turbo::rc::{RangeCoderState, RangeDecoder, RarRangeDecoder};
-    /// let mut rc = RarRangeDecoder::from_state(&[][..], RangeCoderState::new(low, code, range));
-    /// let _ = rc.get_threshold(total);
-    /// rc.faulted()
-    /// ```
     pub fn carryless_threshold_faults(low: u32, code: u32, range: u32, total: u32) -> bool {
-        let _ = (low, code, range, total);
-        todo!("awaiting a public RangeCoderState constructor")
+        use ppmd_turbo::rc::{RangeCoderState, RangeDecoder, RarRangeDecoder};
+        let mut rc = RarRangeDecoder::from_state(&[][..], RangeCoderState::new(low, code, range));
+        let _ = rc.get_threshold(total);
+        rc.faulted()
     }
 }
 
