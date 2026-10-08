@@ -13,7 +13,10 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[non_exhaustive]
 pub enum Error {
     /// The stream is not a valid PPMd stream for the given parameters.
-    CorruptStream,
+    CorruptStream {
+        /// What the decoder found wrong, for diagnostics.
+        detail: &'static str,
+    },
     /// The model order or memory size is outside the range variant H accepts,
     /// or a framing header carries values the format does not allow.
     InvalidParameters,
@@ -26,7 +29,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CorruptStream => f.write_str("corrupt PPMd stream"),
+            Self::CorruptStream { detail } => write!(f, "corrupt PPMd stream: {detail}"),
             Self::InvalidParameters => f.write_str("invalid PPMd parameters"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Truncated => f.write_str("truncated PPMd stream"),
