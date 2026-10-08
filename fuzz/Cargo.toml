@@ -18,6 +18,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "range_coders"
+path = "fuzz_targets/range_coders.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
 

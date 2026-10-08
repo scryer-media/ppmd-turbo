@@ -22,6 +22,9 @@ exclude = [
 [dependencies]
 
 [dev-dependencies]
+# Differential oracle for the coders (tests/coder_differential.rs). Test-only:
+# it never reaches the published crate's graph.
+ppmd-rust = "=1.5.0"
 
 # Repository tools (oracles, bench drivers) join as `tools/<name>` members so
 # their dependencies never reach this crate's own graph. The fuzz harness is
