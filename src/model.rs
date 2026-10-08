@@ -28,6 +28,8 @@
 //! builds on the strength of that invariant and checked by `debug_assert!`
 //! in debug builds, Miri and the fuzz targets.
 
+use alloc_crate::vec::Vec;
+
 use crate::alloc::{Arena, UNIT_SIZE, u2i};
 use crate::error::{Error, Result};
 use crate::rc::{RangeDecoder, corrupt};
@@ -156,13 +158,21 @@ impl Model {
     ///
     /// `order` must be in [`PPMD7_MIN_ORDER`]`..=`[`PPMD7_MAX_ORDER`] and
     /// `mem_size` in [`PPMD7_MIN_MEM_SIZE`]`..=`[`PPMD7_MAX_MEM_SIZE`];
-    /// anything else is [`Error::InvalidParameters`]. The arena is allocated
-    /// here, once, and never grows: `mem_size` bytes plus up to three bytes
-    /// of alignment, as 7-Zip's `Ppmd7_Alloc` lays it out.
+    /// anything else is invalid parameters. The arena is allocated here,
+    /// once, and never grows: `mem_size` bytes plus up to three bytes of
+    /// alignment, as 7-Zip's `Ppmd7_Alloc` lays it out. A refused
+    /// allocation is an error, never an abort.
     pub fn new(order: u32, mem_size: u32) -> Result<Self> {
+        Self::with_arena(order, mem_size, Vec::new())
+    }
+
+    /// [`new`](Self::new) in `arena` when its capacity fits the layout (at
+    /// least the arena length and at most twice it), otherwise in a fresh
+    /// allocation.
+    pub fn with_arena(order: u32, mem_size: u32, arena: Vec<u8>) -> Result<Self> {
         Self::check_parameters(order, mem_size)?;
         let mut model = Self {
-            a: Arena::new(mem_size),
+            a: Arena::try_new(mem_size, arena)?,
             min_context: 0,
             max_context: 0,
             found_state: 0,
@@ -182,11 +192,21 @@ impl Model {
         Ok(model)
     }
 
+    /// The arena, for a later model to reuse.
+    pub fn into_arena(self) -> Vec<u8> {
+        self.a.into_vec()
+    }
+
+    /// Bytes the arena allocation holds.
+    pub fn arena_capacity(&self) -> usize {
+        self.a.capacity()
+    }
+
     pub(crate) fn check_parameters(order: u32, mem_size: u32) -> Result<(usize, usize)> {
         if !(PPMD7_MIN_ORDER..=PPMD7_MAX_ORDER).contains(&order)
             || !(PPMD7_MIN_MEM_SIZE..=PPMD7_MAX_MEM_SIZE).contains(&mem_size)
         {
-            return Err(Error::InvalidParameters);
+            return Err(Error::invalid_parameters());
         }
         Ok((order as usize, mem_size as usize))
     }
@@ -202,19 +222,21 @@ impl Model {
     }
 
     /// Address of the model arena, for tests that check a same-size restart
-    /// keeps it.
-    #[cfg(test)]
-    pub(crate) fn arena_addr(&self) -> usize {
+    /// or a handed-back arena keeps it.
+    #[cfg(any(test, feature = "internals"))]
+    pub fn arena_addr(&self) -> usize {
         self.a.arena_addr()
     }
 
     /// Restarts the model with a new order and arena size, as a fresh
     /// [`Model::new`] would be, but keeping the arena when its size is
-    /// unchanged so its pages are not faulted in again.
+    /// unchanged (or its allocation still fits the new size) so its pages
+    /// are not faulted in again. On an allocation error the model is left
+    /// as it was.
     pub fn start(&mut self, order: u32, mem_size: u32) -> Result<()> {
         Self::check_parameters(order, mem_size)?;
         if self.a.size() != mem_size {
-            self.a = Arena::new(mem_size);
+            self.a.rebuild(mem_size)?;
         }
         self.max_order = order;
         self.restart_model();
@@ -222,7 +244,7 @@ impl Model {
     }
 
     /// Restarts the model from scratch with its current order and arena
-    /// size: the state a stream begins in (`Ppmd7_Init`).
+    /// size: the state a stream begins in (`Ppmd7_Init`). Allocates nothing.
     pub fn restart(&mut self) {
         self.restart_model();
     }
@@ -876,7 +898,7 @@ impl Model {
     /// marker (an escape out of the order-0 context) or a count past the
     /// frequency total, which a valid stream never produces; RAR reads both
     /// as the model giving up on the block. A coder that faulted is
-    /// [`Error::CorruptStream`]. The model stays consistent either way and
+    /// a corrupt-stream error. The model stays consistent either way and
     /// may be used again.
     #[inline(always)]
     pub fn decode_symbol<R: RangeDecoder>(&mut self, rc: &mut R) -> Result<Option<u8>> {
@@ -1148,7 +1170,10 @@ mod tests {
             match model.decode_symbol(&mut rc) {
                 Ok(Some(_)) => decoded += 1,
                 Ok(None) => model.restart(),
-                Err(Error::CorruptStream { .. }) => break,
+                Err(Error {
+                    kind: crate::ErrorKind::Corrupt(_),
+                    ..
+                }) => break,
                 Err(other) => panic!("unexpected error {other:?}"),
             }
             if check {
@@ -1231,14 +1256,23 @@ mod tests {
             (6, u32::MAX),
         ] {
             assert!(
-                matches!(Model::new(order, mem), Err(Error::InvalidParameters)),
+                matches!(
+                    Model::new(order, mem),
+                    Err(Error {
+                        kind: crate::ErrorKind::InvalidParameters,
+                        ..
+                    })
+                ),
                 "order {order} mem {mem}"
             );
         }
         let mut model = Model::new(6, 1 << 16).unwrap();
         assert!(matches!(
             model.start(65, 1 << 16),
-            Err(Error::InvalidParameters)
+            Err(Error {
+                kind: crate::ErrorKind::InvalidParameters,
+                ..
+            })
         ));
         assert_eq!((model.order(), model.mem_size()), (6, 1 << 16));
     }
@@ -1260,7 +1294,10 @@ mod tests {
             assert!(
                 matches!(
                     model.decode_symbol(&mut rc),
-                    Err(Error::CorruptStream { .. })
+                    Err(Error {
+                        kind: crate::ErrorKind::Corrupt(_),
+                        ..
+                    })
                 ),
                 "range {range}"
             );

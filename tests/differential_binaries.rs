@@ -32,20 +32,9 @@ use binaries::{SevenZip, Unrar};
 use hostile_support::{Coder, fixtures_of};
 use sevenz::{read_archive, write_archive};
 
-/// ppmd-turbo's 7z decoder is wired in; the encoder checks wait for
-/// [`turbo_encode_7z`]. Flip to `true` when ppmd-turbo's 7z encoder lands.
-const TURBO_ENCODER: bool = false;
-
-/// ppmd-turbo's 7z encoder, no end marker (as 7-Zip writes). Intended body:
-///
-/// ```ignore
-/// let mut enc = ppmd_turbo::ppmd7::Ppmd7Encoder::new(Vec::new(), order, mem)?;
-/// enc.write_all(data)?;
-/// enc.finish(false)
-/// ```
+/// ppmd-turbo's 7z encoder, no end marker (as 7-Zip writes).
 fn turbo_encode_7z(data: &[u8], order: u32, mem: u32) -> Vec<u8> {
-    let _ = (data, order, mem);
-    unreachable!("guarded by TURBO_ENCODER")
+    hostile_support::api::encode_7z(data, order, mem, false).expect("encodes")
 }
 
 fn turbo_decode_7z(stream: &[u8], order: u32, mem: u32, size: u64) -> Result<Vec<u8>, String> {
@@ -60,13 +49,6 @@ fn oracle() -> Option<SevenZip> {
     }
     let seven = SevenZip::find().expect("PPMD_TURBO_ORACLES=1 but no 7zz (set PPMD_ORACLE_7ZZ)");
     Some(seven)
-}
-
-fn turbo_encoder_ready() -> bool {
-    if !TURBO_ENCODER {
-        eprintln!("skipped: awaiting ppmd-turbo's 7z encoder (TURBO_ENCODER = false)");
-    }
-    TURBO_ENCODER
 }
 
 fn work(test: &str) -> PathBuf {
@@ -121,9 +103,6 @@ fn container_round_trips_7zz_streams() {
 #[ignore = "binary oracle: PPMD_TURBO_ORACLES=1, --ignored"]
 fn turbo_encoder_is_byte_identical_to_7zz() {
     let Some(seven) = oracle() else { return };
-    if !turbo_encoder_ready() {
-        return;
-    }
     let dir = work("encoder");
     for (name, data, order, mem) in encodable_cases() {
         let entry = read_archive(
@@ -176,9 +155,6 @@ fn turbo_decoder_reads_7zz_streams() {
 #[ignore = "binary oracle: PPMD_TURBO_ORACLES=1, --ignored"]
 fn sevenzip_reads_turbo_streams_at_every_order() {
     let Some(seven) = oracle() else { return };
-    if !turbo_encoder_ready() {
-        return;
-    }
     let dir = work("reverse");
     for (name, data) in corpus::default_corpus() {
         for order in [2u8, 3, 7, 16, 33, 48, 64] {

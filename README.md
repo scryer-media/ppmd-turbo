@@ -14,12 +14,45 @@ Pre-release. The API is unstable until 1.0.
 
 | Format | Decode | Encode |
 | --- | --- | --- |
-| RAR 2.9-4.x PPMd blocks (RAR3) | implemented | planned |
+| RAR 2.9-4.x PPMd blocks (RAR3) | implemented | out of scope by design; a raw carry-less encoder exists for round-trip tests only |
 | RAR5 | not applicable: RAR5 has no PPMd | not applicable |
-| 7z `PPMD` method | implemented | planned |
+| 7z `PPMD` method | implemented | implemented |
 
 RAR streams decode to exactly what unrar produces; 7z output is byte-identical
-to 7-Zip's for the same order and memory size.
+to 7-Zip's for the same order and memory size, decoding and encoding.
+
+## Usage
+
+Every codec is a step machine over caller slices: a call takes an input
+slice and an output slice, returns how many bytes it consumed and produced
+and why it stopped, and never keeps caller bytes. A container drives it from
+its own buffers; `ppmd_turbo::io` wraps the 7z pair in `BufRead` and
+`Write` adapters for code that wants streams.
+
+```rust
+use ppmd_turbo::{Params, SevenZDecoder, SevenZEncoder, SevenZStatus};
+
+let params = Params::new(6, 16 << 20)?;
+let data = b"an invented sentence, an invented sentence";
+
+let mut enc = SevenZEncoder::new(params)?;
+let mut packed = vec![0u8; 256];
+let step = enc.encode(data, &mut packed)?;
+let mut len = step.produced;
+len += enc.finish(&mut packed[len..], false)?.produced;
+
+let mut dec = SevenZDecoder::new(params, Some(data.len() as u64))?;
+let mut out = vec![0u8; data.len()];
+let step = dec.decode(&packed[..len], true, &mut out)?;
+assert_eq!(step.status, SevenZStatus::ReachedSize);
+assert_eq!(&out[..], &data[..]);
+```
+
+`RarPpmd` decodes RAR 2.9-4.x PPMd blocks for an unpacker that owns the
+RAR framing: `start_block` per block header, `decode` for literals up to the
+escape character, and `next_symbol` for the command bytes after it.
+`Params::memory_footprint` is the exact heap a codec allocates, and an
+`Arena` can move from one codec to the next.
 
 ## Testing
 
@@ -27,9 +60,11 @@ Beyond unit and conformance tests, every decoder and encoder entry point is
 covered as follows:
 
 - hostile-input tests: truncation, bit flips, out-of-range parameters,
-  restart storms, size lies and a heap bound under a counting allocator;
-- six cargo-fuzz targets with committed seeds, differential against
-  ppmd-rust 1.5.0;
+  restart storms, size lies and an exact heap footprint under a counting
+  allocator;
+- eight cargo-fuzz targets, differential against ppmd-rust 1.5.0, including
+  one that checks arbitrary input and output splits decode and encode as
+  one piece does;
 - Miri and AddressSanitizer lanes;
 - out-of-process checks against `7zz` and `unrar` (`tools/ppmd-oracle`).
 

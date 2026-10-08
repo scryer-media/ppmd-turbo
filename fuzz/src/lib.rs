@@ -8,9 +8,9 @@
 //!   seed generator writes;
 //! - [`payload`] generates invented payloads (text from a made-up vocabulary,
 //!   runs, ramps, structured and random binary);
-//! - [`reference`] is ppmd-rust 1.5.0, the in-process reference;
-//! - [`api`] is the shim over ppmd-turbo's decoder and encoder API, which
-//!   returns `None` until that API lands (see `docs/testing.md`);
+//! - [`reference`](mod@reference) is ppmd-rust 1.5.0, the in-process reference;
+//! - [`api`] is the shim over ppmd-turbo's decoder and encoder API; every
+//!   entry routes to ppmd-turbo (see `docs/testing.md`);
 //! - [`outcome`] turns a decode into an output plus a verdict, and decides
 //!   when two verdicts agree;
 //! - [`mutate`] is the structure-aware input of `structure_7z`;

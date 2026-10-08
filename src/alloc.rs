@@ -30,8 +30,12 @@
 //! `docs/algorithms.md`, "Model consistency"). Debug builds, Miri and the fuzz
 //! targets check every access against the arena with `debug_assert!`.
 
-use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
-use std::ptr::NonNull;
+use core::mem::ManuallyDrop;
+use core::ptr::NonNull;
+
+use alloc_crate::vec::Vec;
+
+use crate::error::Result;
 
 /// Size of one allocation unit in bytes.
 pub(crate) const UNIT_SIZE: u32 = 12;
@@ -87,9 +91,20 @@ const NODE_NEXT: u32 = 4;
 const EMPTY_NODE: u16 = 0;
 
 /// The model's arena and the allocator state over it.
+///
+/// The memory is a `Vec<u8>` taken apart into its raw parts, so the hot
+/// accessors address it through one pointer and the allocation can be
+/// handed back ([`into_vec`](Self::into_vec)) for a later model to reuse.
+/// Allocation is fallible (`crate::arena`): a refused arena is an error,
+/// never an abort. A reused allocation is kept when its capacity is at
+/// least the length needed and at most twice it; the layout depends only on
+/// the requested size, so a reused arena behaves exactly as a fresh one.
 pub(crate) struct Arena {
     base: NonNull<u8>,
-    layout: Layout,
+    /// Bytes in use: `align_offset + size`.
+    len: usize,
+    /// The allocation's capacity, for rebuilding the `Vec`.
+    capacity: usize,
     /// The size requested (`p->Size`).
     size: u32,
     align_offset: u32,
@@ -110,30 +125,105 @@ unsafe impl Sync for Arena {}
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        // SAFETY: `base` came from `alloc_zeroed(self.layout)` and is freed
-        // only here.
-        unsafe { dealloc(self.base.as_ptr(), self.layout) };
+        // SAFETY: `base`, `len` and `capacity` are the raw parts of a
+        // `Vec<u8>` taken apart in `from_vec` and rebuilt only here or in
+        // `into_vec`, which forgets `self`.
+        drop(unsafe { Vec::from_raw_parts(self.base.as_ptr(), self.len, self.capacity) });
     }
 }
 
 impl Arena {
-    /// `Ppmd7_Alloc`: an arena of `align_offset + size` bytes. Zeroed so no
-    /// byte is ever read uninitialized; the model never relies on the zeros.
-    pub(crate) fn new(size: u32) -> Self {
+    /// The arena length a requested size lays out to: `align_offset + size`
+    /// with `align_offset = (4 - size) & 3`, as `Ppmd7_Alloc` sizes it.
+    pub(crate) const fn arena_bytes(size: u32) -> usize {
+        (4u32.wrapping_sub(size) & 3) as usize + size as usize
+    }
+
+    /// Whether an allocation of `capacity` bytes may back an arena of
+    /// `needed` bytes: large enough, and not more than twice the need, so a
+    /// small stream does not pin a huge arena.
+    pub(crate) const fn reusable(capacity: usize, needed: usize) -> bool {
+        capacity >= needed && capacity / 2 <= needed
+    }
+
+    /// `Ppmd7_Alloc`: an arena of `align_offset + size` bytes, in `buf` when
+    /// it is [`reusable`](Self::reusable), otherwise in a fresh zeroed
+    /// allocation. The bytes of a fresh arena are zeroed so none is ever
+    /// read uninitialized; the model never relies on their values, so a
+    /// reused arena's old bytes change nothing.
+    ///
+    /// Errors: allocation failed.
+    pub(crate) fn try_new(size: u32, buf: Vec<u8>) -> Result<Self> {
         debug_assert!(size >= crate::PPMD7_MIN_MEM_SIZE);
-        let align_offset = 4u32.wrapping_sub(size) & 3;
-        let total = align_offset as usize + size as usize;
-        let layout = Layout::from_size_align(total, 8).expect("arena size fits a layout");
-        // SAFETY: `total` is nonzero (`size` is at least `PPMD7_MIN_MEM_SIZE`).
-        let ptr = unsafe { alloc_zeroed(layout) };
-        let Some(base) = NonNull::new(ptr) else {
-            handle_alloc_error(layout)
-        };
+        let len = Self::arena_bytes(size);
+        let buf = Self::fit(buf, len)?;
+        Ok(Self::from_vec(buf, size))
+    }
+
+    /// An arena of `size` bytes, in test code where allocation cannot fail.
+    #[cfg(test)]
+    pub(crate) fn new(size: u32) -> Self {
+        match Self::try_new(size, Vec::new()) {
+            Ok(arena) => arena,
+            Err(e) => panic!("test arena: {e}"),
+        }
+    }
+
+    /// Re-lays the arena out for `size` bytes, keeping the allocation when
+    /// it is reusable. On error the arena is unchanged: a replacement is
+    /// allocated while the old allocation is still live.
+    pub(crate) fn rebuild(&mut self, size: u32) -> Result<()> {
+        let len = Self::arena_bytes(size);
+        if Self::reusable(self.capacity, len) {
+            let buf = core::mem::replace(self, Self::from_vec(Vec::new(), 0)).into_vec();
+            let buf = Self::fit(buf, len)?;
+            *self = Self::from_vec(buf, size);
+        } else {
+            let buf = crate::arena::try_zeroed(len as u64)?;
+            *self = Self::from_vec(buf, size);
+        }
+        Ok(())
+    }
+
+    /// The allocation, for a later model to reuse.
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        let this = ManuallyDrop::new(self);
+        // SAFETY: the raw parts of the `Vec` taken apart in `from_vec`;
+        // `this` is never dropped, so the allocation has one owner again.
+        unsafe { Vec::from_raw_parts(this.base.as_ptr(), this.len, this.capacity) }
+    }
+
+    /// Bytes the allocation holds.
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// `buf` resized to exactly `len` bytes, reusing its allocation when it
+    /// is reusable, otherwise a fresh zeroed allocation.
+    fn fit(mut buf: Vec<u8>, len: usize) -> Result<Vec<u8>> {
+        if !Self::reusable(buf.capacity(), len) {
+            buf = Vec::new();
+        }
+        crate::arena::fit(&mut buf, len)?;
+        Ok(buf)
+    }
+
+    /// Takes `buf` apart and lays an arena of `size` bytes out over it.
+    /// `buf.len()` must be `arena_bytes(size)` (or 0 for the placeholder
+    /// `rebuild` swaps in).
+    fn from_vec(buf: Vec<u8>, size: u32) -> Self {
+        let mut buf = ManuallyDrop::new(buf);
+        let len = buf.len();
+        let capacity = buf.capacity();
+        // `as_mut_ptr` never returns null: an empty `Vec` holds a dangling,
+        // non-null pointer.
+        let base = NonNull::new(buf.as_mut_ptr()).unwrap_or(NonNull::dangling());
         let mut arena = Self {
             base,
-            layout,
+            len,
+            capacity,
             size,
-            align_offset,
+            align_offset: 4u32.wrapping_sub(size) & 3,
             lo_unit: 0,
             hi_unit: 0,
             text: 0,
@@ -141,7 +231,9 @@ impl Arena {
             glue_count: 0,
             free_list: [0; NUM_INDEXES],
         };
-        arena.reset();
+        if len != 0 {
+            arena.reset();
+        }
         arena
     }
 
@@ -152,8 +244,8 @@ impl Arena {
     }
 
     /// Address of the arena allocation, for tests that check a same-size
-    /// restart keeps it.
-    #[cfg(test)]
+    /// restart or a handed-back arena keeps it.
+    #[cfg(any(test, feature = "internals"))]
     pub(crate) fn arena_addr(&self) -> usize {
         self.base.as_ptr() as usize
     }
@@ -175,9 +267,9 @@ impl Arena {
     #[inline(always)]
     fn at(&self, off: u32, len: usize) -> *mut u8 {
         debug_assert!(
-            off as usize + len <= self.layout.size(),
+            off as usize + len <= self.len,
             "arena access {off}+{len} past {}",
-            self.layout.size()
+            self.len
         );
         // SAFETY: `off + len` lies inside the allocation (module invariant,
         // checked above in debug builds), so the offset stays in bounds.
@@ -195,11 +287,7 @@ impl Arena {
     /// re-extending a 32-bit offset that might wrap.
     #[inline(always)]
     pub(crate) fn byte(&self, off: usize) -> u8 {
-        debug_assert!(
-            off < self.layout.size(),
-            "arena access {off} past {}",
-            self.layout.size()
-        );
+        debug_assert!(off < self.len, "arena access {off} past {}", self.len);
         // SAFETY: in bounds (module invariant, checked above in debug
         // builds); every byte is initialized.
         unsafe { *self.base.as_ptr().add(off) }
@@ -242,7 +330,7 @@ impl Arena {
         let d = self.at(dst, len as usize);
         // SAFETY: both ranges are inside the allocation (see `at`);
         // `ptr::copy` allows overlap.
-        unsafe { std::ptr::copy(s, d, len as usize) }
+        unsafe { core::ptr::copy(s, d, len as usize) }
     }
 
     /// Swaps the 6-byte records at `a` and `b`.
@@ -252,7 +340,7 @@ impl Arena {
         let pb = self.at(b, 6);
         // SAFETY: both records are in bounds (see `at`); `ptr::swap` allows
         // the ranges to overlap.
-        unsafe { std::ptr::swap(pa.cast::<[u8; 6]>(), pb.cast::<[u8; 6]>()) }
+        unsafe { core::ptr::swap(pa.cast::<[u8; 6]>(), pb.cast::<[u8; 6]>()) }
     }
 
     /// Reads the 6-byte record at `off`.

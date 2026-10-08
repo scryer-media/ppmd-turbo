@@ -6,8 +6,7 @@
 
 use std::io::{Read, Write};
 
-use ppmd_turbo::model::Model;
-use ppmd_turbo::rc::{CarrylessRangeDecoder, SevenZipRangeDecoder};
+use ppmd_turbo::internals::{CarrylessRangeDecoder, Model, SevenZipRangeDecoder};
 
 /// The oracle tool's invented corpus (`text`, `ramp`, `records`, `random`),
 /// included by path so the tests take no dependency on the tool.

@@ -17,14 +17,18 @@ RAR rows.
 | RAR 2.9-4.x decode | candidate | contender | reference without unrar, if built with the RAR codecs, else secondary | reference (`unrar t`) |
 | 7z encode | candidate | contender | reference (`7zz a`) | - |
 
-The carry-less (RAR-style) encoder is excluded from benchmarking by design.
-It exists so the crate can write streams for its own correctness tests; no
-profile has a RAR encode row and `ppmd-bench` has no `encode-rar`.
+The raw carry-less encoder is excluded from benchmarking by design. It
+exists so the crate can write streams for its own correctness tests, and
+writing RAR blocks or archives is out of scope; no profile has a RAR or
+carry-less encode row and `ppmd-bench` has no `encode-rar`.
 
 ppmd-turbo rows appear only for the operations the crate provides:
 `ppmd-bench info` reports them, and the harness plans from that. Both
-decoders are wired; until the encoder lands, 7z encode rows measure
-ppmd-rust against 7zz, which is the baseline ppmd-turbo is then held to.
+decoders and the 7z encoder are wired (`tools/ppmd-bench/src/turbo.rs`).
+ppmd-bench drives the step API the way a container does: for 7z decode,
+the whole stream as the last input, drained into fixed output buffers; for
+RAR, `RarPpmd::decode` with `next_symbol` after each escape; for 7z encode,
+the encoder into fixed output buffers.
 
 ## Corpora
 

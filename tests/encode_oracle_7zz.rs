@@ -12,6 +12,10 @@
 
 mod encode_support;
 
+/// The crate's API (`tests/common/api.rs`).
+#[path = "common/api.rs"]
+mod api;
+
 #[path = "../tools/ppmd-oracle/src/binaries.rs"]
 #[allow(dead_code)]
 mod binaries;
@@ -21,9 +25,9 @@ mod sevenz;
 
 use std::path::{Path, PathBuf};
 
+use api::encode_7z;
 use binaries::SevenZip;
 use encode_support::{corpus, first_difference};
-use ppmd_turbo::encode_7z;
 use sevenz::{read_archive, write_archive};
 
 fn oracle() -> Option<SevenZip> {

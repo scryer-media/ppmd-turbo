@@ -3,8 +3,10 @@
 //! written from the C formulas, and truncation. Everything is seeded and
 //! deterministic.
 
+use super::output::Drain;
 use super::*;
 use crate::error::Error;
+use std::vec::Vec;
 
 /// SplitMix64: a seeded, dependency-free generator for test data.
 struct Rng(u64);
@@ -140,37 +142,112 @@ fn carryless_round_trips_random_operations() {
     }
 }
 
-/// The same stream decodes identically from every input backing, and a
-/// shared source is left right after the coder's bytes.
+/// Encoding through the step sink in arbitrary slices, resuming the coder
+/// from its registers each time, writes the same stream as one `Vec`; and
+/// decoding that stream resumed across arbitrary input splits reads it back.
 #[test]
-fn every_input_backing_decodes_the_same() {
-    let ops = ops(&mut Rng(99), ROUND_TRIP_OPS / 10, BOT);
-    let mut enc = CarrylessRangeEncoder::new(WriteOutput::with_flush_size(Vec::new(), 7));
-    encode_ops(&mut enc, &ops);
-    let stream = enc.finish().unwrap().into_inner();
-
-    let mut dec = CarrylessRangeDecoder::new(ReadInput::with_refill_size(&stream[..], 5)).unwrap();
-    check_decode_ops(&mut dec, &ops);
-    assert_eq!(dec.position(), stream.len());
-
-    let mut with_tail = stream.clone();
-    with_tail.extend_from_slice(b"next block");
-    let mut source = &with_tail[..];
-    {
-        let mut dec = CarrylessRangeDecoder::new(&mut source).unwrap();
-        check_decode_ops(&mut dec, &ops);
+fn resumed_coders_match_one_shot_coders() {
+    fn chunked<R: Copy>(
+        mut rng: Rng,
+        ops: &[Op],
+        mut regs: R,
+        tail: fn(&mut Drain<'_, '_>, &mut R),
+        mut step: impl FnMut(&mut Drain<'_, '_>, &mut R, &Op),
+    ) -> Vec<u8> {
+        let mut stream = Vec::new();
+        let mut queue = output::Pending::new();
+        let mut buf = [0u8; 9];
+        let mut next = 0;
+        let mut flushed = false;
+        loop {
+            let room = rng.range(0, buf.len() as u32) as usize;
+            let out = &mut buf[..room];
+            let drained = queue.drain_into(out);
+            let mut n = drained;
+            if queue.is_empty() {
+                let mut sink = Drain::new(&mut out[drained..], &mut queue);
+                while !sink.blocked() {
+                    if let Some(op) = ops.get(next) {
+                        step(&mut sink, &mut regs, op);
+                        next += 1;
+                    } else if !flushed {
+                        tail(&mut sink, &mut regs);
+                        flushed = true;
+                    } else {
+                        break;
+                    }
+                }
+                n += sink.written();
+            }
+            stream.extend_from_slice(&out[..n]);
+            if flushed && queue.is_empty() {
+                return stream;
+            }
+        }
     }
-    assert_eq!(source, b"next block");
 
-    let mut out = vec![0u8; stream.len()];
-    let mut enc = SevenZipRangeEncoder::new(SliceOutput::new(&mut out));
-    let ops7 = self::ops(&mut Rng(98), 100, 0xFFFF);
+    let ops7 = ops(&mut Rng(98), ROUND_TRIP_OPS / 10, 0xFFFF);
+    let mut enc = SevenZipRangeEncoder::new(Vec::new());
     encode_ops(&mut enc, &ops7);
-    let written = enc.finish().unwrap().len();
-    let mut dec =
-        SevenZipRangeDecoder::new(ReadInput::with_refill_size(&out[..written], 3)).unwrap();
-    check_decode_ops(&mut dec, &ops7);
-    assert!(dec.is_finished_ok());
+    let want = enc.finish().unwrap();
+    let got = chunked(
+        Rng(5),
+        &ops7,
+        SevenZipEncoderRegs::default(),
+        |sink, regs| {
+            let mut e = SevenZipRangeEncoder::resume(sink, *regs);
+            e.flush();
+            *regs = e.regs();
+        },
+        |sink, regs, op| {
+            let mut e = SevenZipRangeEncoder::resume(sink, *regs);
+            encode_ops(&mut e, core::slice::from_ref(op));
+            *regs = e.regs();
+        },
+    );
+    assert_eq!(got, want);
+
+    let ops_c = ops(&mut Rng(99), ROUND_TRIP_OPS / 10, BOT);
+    let mut enc = CarrylessRangeEncoder::new(Vec::new());
+    encode_ops(&mut enc, &ops_c);
+    let want_c = enc.finish().unwrap();
+    let got = chunked(
+        Rng(6),
+        &ops_c,
+        CarrylessEncoderRegs::default(),
+        |sink, regs| {
+            let mut e = CarrylessRangeEncoder::resume(sink, *regs);
+            e.flush();
+            *regs = e.regs();
+        },
+        |sink, regs, op| {
+            let mut e = CarrylessRangeEncoder::resume(sink, *regs);
+            encode_ops(&mut e, core::slice::from_ref(op));
+            *regs = e.regs();
+        },
+    );
+    assert_eq!(got, want_c);
+
+    // Decoding resumed op by op over a growing window reads the same.
+    let mut regs = SevenZipRangeDecoder::new(&want[..]).unwrap().regs();
+    let mut pos = 5;
+    for op in &ops7 {
+        let mut dec = SevenZipRangeDecoder::resume(SliceInput::new(&want[pos..]), regs);
+        check_decode_ops(&mut dec, core::slice::from_ref(op));
+        assert_eq!(dec.zero_bytes_past_eof(), 0);
+        pos += dec.position();
+        regs = dec.regs();
+    }
+    assert_eq!(regs.code, 0);
+    let mut state = CarrylessRangeDecoder::new(&want_c[..]).unwrap().state();
+    let mut pos = 4;
+    for op in &ops_c {
+        let mut dec = CarrylessRangeDecoder::from_state(SliceInput::new(&want_c[pos..]), state);
+        check_decode_ops(&mut dec, core::slice::from_ref(op));
+        pos += dec.position();
+        state = dec.state();
+    }
+    assert_eq!(pos, want_c.len());
 }
 
 // ---------------------------------------------------------------------------
@@ -524,8 +601,7 @@ fn order0_streams_decode_back() {
 
     let stream = encode_carryless(&data);
     let mut model = Order0::new(LIMIT_CARRYLESS);
-    let mut dec =
-        CarrylessRangeDecoder::new(ReadInput::with_refill_size(&stream[..], 1000)).unwrap();
+    let mut dec = CarrylessRangeDecoder::new(&stream[..]).unwrap();
     let decoded: Vec<u8> = (0..data.len())
         .map(|_| model.decode(&mut dec).unwrap())
         .collect();
@@ -560,12 +636,18 @@ fn run<D: RangeDecoder>(dec: &mut D, limit: u32, n: usize) -> core::result::Resu
 fn decode_7z(stream: &[u8], n: usize) -> Option<Outcome> {
     let mut dec = match SevenZipRangeDecoder::new(stream) {
         Ok(dec) => dec,
-        Err(Error::Truncated) => {
+        Err(Error {
+            kind: crate::ErrorKind::Truncated,
+            ..
+        }) => {
             assert!(stream.len() < 5);
             return None;
         }
         // A bad first byte or code: only garbage gets here.
-        Err(Error::CorruptStream { .. }) => return None,
+        Err(Error {
+            kind: crate::ErrorKind::Corrupt(_),
+            ..
+        }) => return None,
         Err(e) => panic!("unexpected {e}"),
     };
     let result = run(&mut dec, LIMIT_7Z, n);
@@ -579,7 +661,10 @@ fn decode_7z(stream: &[u8], n: usize) -> Option<Outcome> {
 fn decode_carryless(stream: &[u8], n: usize) -> Option<Outcome> {
     let mut dec = match CarrylessRangeDecoder::new(stream) {
         Ok(dec) => dec,
-        Err(Error::Truncated) => {
+        Err(Error {
+            kind: crate::ErrorKind::Truncated,
+            ..
+        }) => {
             assert!(stream.len() < 4);
             return None;
         }

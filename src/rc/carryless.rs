@@ -20,7 +20,7 @@
 //! Here a range scaled to zero, or a symbol size of zero, is a sticky fault
 //! ([`RangeDecoder::faulted`]) and the RAR-style
 //! [`get_current_count`](CarrylessRangeDecoder::get_current_count) returns
-//! [`Error::CorruptStream`]. A zero range must never reach normalization:
+//! a corrupt-stream error. A zero range must never reach normalization:
 //! `low ^ (low + 0)` is always below `TOP`, so the reference loop would
 //! shift in bytes forever.
 
@@ -41,6 +41,17 @@ pub struct RangeCoderState {
     pub(crate) range: u32,
 }
 
+impl Default for RangeCoderState {
+    /// The registers before initialization: `low = 0`, `range = 0xFFFFFFFF`.
+    fn default() -> Self {
+        Self {
+            low: 0,
+            code: 0,
+            range: u32::MAX,
+        }
+    }
+}
+
 impl RangeCoderState {
     /// Registers as given. A state saved with
     /// [`CarrylessRangeDecoder::state`] is the normal source; this lets a
@@ -49,6 +60,24 @@ impl RangeCoderState {
     /// coder cannot scale is reported as a fault, never a division by zero.
     pub fn new(low: u32, code: u32, range: u32) -> Self {
         Self { low, code, range }
+    }
+}
+
+/// The carry-less encoder's registers, kept by a step encoder between
+/// calls. The coder never holds bytes back: everything it shifts out is
+/// final.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CarrylessEncoderRegs {
+    pub(crate) low: u32,
+    pub(crate) range: u32,
+}
+
+impl Default for CarrylessEncoderRegs {
+    fn default() -> Self {
+        Self {
+            low: 0,
+            range: u32::MAX,
+        }
     }
 }
 
@@ -72,7 +101,7 @@ impl<I: RangeInput> CarrylessRangeDecoder<I> {
     /// `range = 0xFFFFFFFF`, and four big-endian bytes into `code` (RAR's
     /// `InitDecoder`). Any code is accepted, as unrar accepts it.
     ///
-    /// Errors: [`Error::Truncated`] if the input holds fewer than four bytes.
+    /// Errors: truncated if the input holds fewer than four bytes.
     pub fn new<T: IntoRangeInput<Input = I>>(input: T) -> Result<Self> {
         let mut input = input.into_range_input();
         let mut code = 0u32;
@@ -80,7 +109,7 @@ impl<I: RangeInput> CarrylessRangeDecoder<I> {
             code = (code << 8) | u32::from(input.next_byte());
         }
         if input.zero_bytes_past_eof() != 0 {
-            return Err(input.take_io_error().map_or(Error::Truncated, Error::Io));
+            return Err(Error::truncated());
         }
         Ok(Self::from_parts(
             input,
@@ -93,7 +122,7 @@ impl<I: RangeInput> CarrylessRangeDecoder<I> {
     }
 
     /// [`new`](Self::new) with 7-Zip's `Ppmd7a_RangeDec_Init` check: a code
-    /// of `0xFFFFFFFF` is [`Error::CorruptStream`].
+    /// of `0xFFFFFFFF` is corrupt.
     pub fn new_7a<T: IntoRangeInput<Input = I>>(input: T) -> Result<Self> {
         let decoder = Self::new(input)?;
         if decoder.code == u32::MAX {
@@ -154,11 +183,6 @@ impl<I: RangeInput> CarrylessRangeDecoder<I> {
         &self.input
     }
 
-    /// The input, mutably.
-    pub fn input_mut(&mut self) -> &mut I {
-        &mut self.input
-    }
-
     /// Unwraps the input.
     pub fn into_input(self) -> I {
         self.input
@@ -166,7 +190,7 @@ impl<I: RangeInput> CarrylessRangeDecoder<I> {
 
     /// RAR's `GetCurrentCount`: `range /= scale; return (code - low) / range`.
     ///
-    /// Errors: [`Error::CorruptStream`] if `range / scale` is zero, or if the
+    /// Errors: corrupt if `range / scale` is zero, or if the
     /// coder faulted earlier.
     #[inline(always)]
     pub fn get_current_count(&mut self, scale: u32) -> Result<u32> {
@@ -331,17 +355,39 @@ impl<O: RangeOutput> CarrylessRangeEncoder<O> {
         &mut self.out
     }
 
-    /// Writes the four bytes of `low`, most significant first, then flushes
-    /// the output and returns it.
-    ///
-    /// Errors: the output's error, or [`Error::CorruptStream`] if the coder
-    /// faulted (see [`RangeEncoder::faulted`]).
-    pub fn finish(mut self) -> Result<O> {
+    /// Resumes an encoder writing to `out` from saved registers.
+    #[inline]
+    pub fn resume(out: O, regs: CarrylessEncoderRegs) -> Self {
+        Self {
+            low: regs.low,
+            range: regs.range,
+            faulted: false,
+            out,
+        }
+    }
+
+    /// The registers, for [`resume`](Self::resume).
+    #[inline]
+    pub fn regs(&self) -> CarrylessEncoderRegs {
+        CarrylessEncoderRegs {
+            low: self.low,
+            range: self.range,
+        }
+    }
+
+    /// Writes the four bytes of `low`, most significant first.
+    pub fn flush(&mut self) {
         for _ in 0..4 {
             self.out.write_byte((self.low >> 24) as u8);
             self.low <<= 8;
         }
-        self.out.finish()?;
+    }
+
+    /// [`flush`](Self::flush), then returns the output.
+    ///
+    /// Errors: corrupt if the coder faulted (see [`RangeEncoder::faulted`]).
+    pub fn finish(mut self) -> Result<O> {
+        self.flush();
         if self.faulted {
             return Err(corrupt(
                 "carry-less range encoder: frequency total past the range",
@@ -437,12 +483,18 @@ mod tests {
         assert!(CarrylessRangeDecoder::new(&[0xFF; 4][..]).is_ok());
         assert!(matches!(
             CarrylessRangeDecoder::new_7a(&[0xFF; 4][..]),
-            Err(Error::CorruptStream { .. })
+            Err(Error {
+                kind: crate::ErrorKind::Corrupt(_),
+                ..
+            })
         ));
         for len in 0..4 {
             assert!(matches!(
                 CarrylessRangeDecoder::new(&[0u8; 4][..len]),
-                Err(Error::Truncated)
+                Err(Error {
+                    kind: crate::ErrorKind::Truncated,
+                    ..
+                })
             ));
         }
     }
@@ -502,7 +554,10 @@ mod tests {
         d.range = 100;
         assert!(matches!(
             d.get_current_count(1000),
-            Err(Error::CorruptStream { .. })
+            Err(Error {
+                kind: crate::ErrorKind::Corrupt(_),
+                ..
+            })
         ));
         assert!(d.faulted());
         // Sticky.
@@ -560,7 +615,7 @@ mod tests {
     /// the four bytes of `low`.
     #[test]
     fn encoder_shifts_out_the_top_byte_and_flushes_low() {
-        let mut e = CarrylessRangeEncoder::new(Vec::new());
+        let mut e = CarrylessRangeEncoder::new(alloc_crate::vec::Vec::new());
         // range = 0xFFFFFFFF / 256 = 0x00FFFFFF; low = 0x12 * that = 0x11FFFFEE;
         // low + range = 0x12FFFFED: top bytes 0x11 and 0x12 differ, no shift.
         e.encode(0x12, 1, 256);
@@ -581,12 +636,18 @@ mod tests {
 
     #[test]
     fn encoder_faults_are_reported_by_finish() {
-        let mut e = CarrylessRangeEncoder::new(Vec::new());
+        let mut e = CarrylessRangeEncoder::new(alloc_crate::vec::Vec::new());
         e.range = 100;
         e.encode(0, 1, 1000);
         assert!(e.faulted());
-        assert!(matches!(e.finish(), Err(Error::CorruptStream { .. })));
-        let mut e = CarrylessRangeEncoder::new(Vec::new());
+        assert!(matches!(
+            e.finish(),
+            Err(Error {
+                kind: crate::ErrorKind::Corrupt(_),
+                ..
+            })
+        ));
+        let mut e = CarrylessRangeEncoder::new(alloc_crate::vec::Vec::new());
         e.encode_bit(0, 0);
         assert!(e.faulted());
     }

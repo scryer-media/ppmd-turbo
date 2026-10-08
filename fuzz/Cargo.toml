@@ -17,7 +17,7 @@ doctest = false
 [dependencies]
 arbitrary = { version = "1.5.0", features = ["derive"] }
 libfuzzer-sys = "0.4"
-ppmd-turbo = { path = ".." }
+ppmd-turbo = { path = "..", features = ["internals"] }
 # The in-process reference for the differential and round-trip targets. A
 # dependency of this harness only: it must never reach the crate's graph.
 ppmd-rust = "=1.5.0"
@@ -75,3 +75,10 @@ bench = false
 debug = 1
 
 [workspace]
+
+[[bin]]
+name = "chunking_invariance"
+path = "fuzz_targets/chunking_invariance.rs"
+test = false
+doc = false
+bench = false

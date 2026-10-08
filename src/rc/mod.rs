@@ -1,4 +1,4 @@
-//! Range coders.
+//! Range coders (crate-internal).
 //!
 //! Two coders carry variant H in practice, and the context model is generic
 //! over them through [`RangeDecoder`] and [`RangeEncoder`]:
@@ -11,37 +11,37 @@
 //!   7z `PPMD` method uses ([`SevenZipRangeDecoder`],
 //!   [`SevenZipRangeEncoder`]; `sevenz.rs`).
 //!
-//! The decoders read through a [`RangeInput`] (`input.rs`): a borrowed
-//! slice, an owned refill buffer over `std::io::Read`, or a window over a
-//! [`ByteSource`] shared with another reader. The encoders write through a
-//! [`RangeOutput`] (`output.rs`). Every coder is generic over its input or
-//! output, so the per-byte path compiles to a buffer load or store with a
-//! refill or flush only at the buffer's edge, and a batch loop in the model
-//! decodes any number of symbols without a call through a trait object.
+//! The coders hold registers only. A step codec keeps the registers between
+//! calls and rebuilds a coder over the caller's slice for each call: the
+//! decoders read through a [`SliceInput`] cursor (`cursor.rs`), the encoders
+//! write through a [`Drain`] into the caller's slice (`output.rs`). Neither
+//! side holds caller bytes.
 //!
 //! **Corrupt input.** Neither decoder ever panics or divides by zero. A
 //! range scaled to zero (a frequency total past the range, which only a
 //! corrupt stream or a corrupt model state produces) or a symbol size of
 //! zero sets a sticky fault ([`RangeDecoder::faulted`]) and leaves the
-//! arithmetic defined; the model turns the fault into
-//! [`Error::CorruptStream`](crate::Error::CorruptStream). The carry-less
-//! decoder's RAR-style API ([`CarrylessRangeDecoder::get_current_count`])
-//! returns the error directly.
+//! arithmetic defined; the model turns the fault into a corrupt-stream
+//! error. The carry-less decoder's RAR-style API
+//! ([`CarrylessRangeDecoder::get_current_count`]) returns the error
+//! directly.
 
 mod carryless;
-mod input;
+mod cursor;
 mod output;
 mod sevenz;
 
 #[cfg(test)]
 mod tests;
 
-pub use carryless::{CarrylessRangeDecoder, CarrylessRangeEncoder, RangeCoderState};
-pub use input::{
-    ByteSource, DEFAULT_REFILL_SIZE, IntoRangeInput, RangeInput, ReadInput, SliceInput, SourceInput,
+pub use carryless::{
+    CarrylessEncoderRegs, CarrylessRangeDecoder, CarrylessRangeEncoder, RangeCoderState,
 };
-pub use output::{DEFAULT_FLUSH_SIZE, RangeOutput, SliceOutput, WriteOutput};
-pub use sevenz::{SevenZipRangeDecoder, SevenZipRangeEncoder};
+pub use cursor::{IntoRangeInput, RangeInput, SliceInput};
+pub use output::{Drain, Pending, RangeOutput};
+pub use sevenz::{
+    SevenZipDecoderRegs, SevenZipEncoderRegs, SevenZipRangeDecoder, SevenZipRangeEncoder,
+};
 
 /// RAR's name for the carry-less decoder: RAR 2.9 through 4.x PPMd blocks
 /// are coded with it.
@@ -65,7 +65,7 @@ pub(crate) const BIN_TOTAL: u32 = 1 << BIN_TOTAL_BITS;
 /// The error a coder fault becomes.
 #[cold]
 pub(crate) fn corrupt(detail: &'static str) -> crate::Error {
-    crate::Error::CorruptStream { detail }
+    crate::Error::corrupt(detail)
 }
 
 /// The operations the context model decodes symbols through.
@@ -114,7 +114,7 @@ pub trait RangeDecoder {
     /// and normalization keeps the range large. A corrupt stream can drive
     /// a total past the range; the coder records that instead of dividing by
     /// zero, keeps its arithmetic defined, and the model turns the fault into
-    /// [`Error::CorruptStream`](crate::Error::CorruptStream).
+    /// a corrupt-stream error.
     ///
     /// The fault is sticky: once set, every later symbol decoded through
     /// this coder is reported corrupt too.

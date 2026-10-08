@@ -50,19 +50,14 @@ impl Outcome {
     }
 }
 
-/// The class of a ppmd-turbo error.
-///
-/// Struct patterns with `..` match whether a variant is a unit, a tuple or a
-/// struct, so this compiles across the variants' shapes as the decoder
-/// grows (`CorruptStream` gains a `detail` field, for instance).
+/// The class of a ppmd-turbo error. `ErrorKind` is non-exhaustive, so
+/// this keeps compiling as kinds are added.
 pub fn classify(e: &ppmd_turbo::Error) -> ErrKind {
-    use ppmd_turbo::Error;
-    #[allow(unreachable_patterns, clippy::unneeded_struct_pattern)]
-    match e {
-        Error::InvalidParameters { .. } => ErrKind::InvalidParameters,
-        Error::CorruptStream { .. } => ErrKind::Corrupt,
-        Error::Truncated { .. } => ErrKind::Truncated,
-        Error::Io(inner) => classify_io(inner),
+    use ppmd_turbo::ErrorKind as K;
+    match e.kind {
+        K::InvalidParameters => ErrKind::InvalidParameters,
+        K::Corrupt(_) => ErrKind::Corrupt,
+        K::Truncated => ErrKind::Truncated,
         _ => ErrKind::Other,
     }
 }
@@ -189,7 +184,7 @@ mod tests {
 
     #[test]
     fn classification_sees_through_io() {
-        let wrapped = io::Error::other(ppmd_turbo::Error::Truncated);
+        let wrapped = io::Error::from(ppmd_turbo::Error::new(ppmd_turbo::ErrorKind::Truncated));
         assert_eq!(classify_io(&wrapped), ErrKind::Truncated);
         let plain = io::Error::from(io::ErrorKind::InvalidData);
         assert_eq!(classify_io(&plain), ErrKind::Corrupt);
