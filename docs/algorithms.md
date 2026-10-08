@@ -309,6 +309,12 @@ under the invariant the bound is never hit, but it costs one compare.
 Sources: `PpmdDecoder.cpp:31-47`, `PpmdEncoder.cpp:72-128`, `unpack30.cpp`
 DecodeInit (`model.cpp:571-599`).
 
+**In ppmd-turbo.** `Model::new` and `Model::start` accept the 7z decode
+ranges and return `InvalidParameters` for anything else;
+`RarDecoder::init_model` takes the order and the size in MiB and rejects
+orders outside 2..64 and sizes outside 1..256 MiB. The unrar-rs seed clamped
+out-of-range values instead of rejecting them.
+
 ---
 
 ## 2. Sub-allocator
@@ -332,6 +338,11 @@ and 7-Zip reuses coders across 7z folders, so the arena is reused.
     accounting keeps the model decisions (when to restart, when the text area
     is full) identical to 7-Zip's. ppmd-turbo uses 12-byte units, so it needs
     no fake accounting.
+- **In ppmd-turbo** the arena is allocated once, at unrar's length (the
+  request rounded down to whole units, plus one leading and two trailing
+  units), and never grows. A restart with the same size reuses it, as
+  `StartSubAllocator` does. Every pointer read from the arena is checked
+  against it before use (`alloc.rs`, validated spans).
 
 ### 2.2 Free lists
 
@@ -409,8 +420,11 @@ runs out and when RestartModel fires.
   comment that Glue and Fill must walk the list in the same direction.
 - unrar uses a doubly-linked list.
 - Both produce the same final list order on any input. That has to be
-  preserved, not re-derived: unrar-rs pins it with a reference-order test
-  (`glue_free_blocks_reference`).
+  preserved, not re-derived.
+- **In ppmd-turbo** gluing is intrusive (the free blocks themselves hold the
+  links), as in the unrar-rs seed. The test
+  `intrusive_glue_matches_reference_order_for_every_size_class` checks the
+  list order after gluing against a reference glue for every size class.
 
 ---
 
@@ -452,6 +466,9 @@ BIN_SCALE = 2^14).
 **Root context.** The root (NumStats = 256) uses DummySee with escFreq = 1,
 because escaping from the root means end-of-stream.
 
+**In ppmd-turbo** (`see.rs`) row `i` starts at
+`Summ = (5*i + 10) << (PERIOD_BITS - 4)`, as in both unrar and 7-Zip.
+
 SEE comes from Charles Bloom's PPMZ. Shkarin's PPMII adds the binary-context
 SEE (BinSumm) and the indexing above.
 
@@ -462,6 +479,14 @@ SEE (BinSumm) and the indexing above.
 Both coders use 32-bit Range and Code, 8-bit renormalisation, and
 `kTop = 2^24`. Frequencies are at most 2^16 per context total, so
 `Range / total` always leaves at least 8 bits of precision.
+
+**In ppmd-turbo** the model decodes through the `RangeDecoder` trait
+(`rc.rs`): `get_threshold(total)`, `decode(start, size)` and
+`decode_bit(size0, total)`, the three operations 7-Zip's model calls, plus a
+sticky `faulted()` flag. `decode` and `decode_bit` normalize before they
+return, so the model never normalizes itself. The unrar-rs seed normalized
+explicitly after each decode; every decode there was followed by exactly one
+normalize before the next threshold, so moving it inside is bit-exact.
 
 ### 4.1 7z coder (Pavlov; LZMA-style, `Ppmd7Dec.c`, `Ppmd7Enc.c`)
 
@@ -545,6 +570,11 @@ The 7z method writes no end marker (`PpmdEncoder.cpp:166`).
     only checks `count >= scale`.
   - ppmd-turbo must treat both conditions as corrupt data on every carry-less
     path.
+  - **In ppmd-turbo** the RAR decoder faults when `Range / total` (or the
+    binary `Range / 2^14`) is 0, and the model reports `CorruptStream`. It
+    also faults when a decode leaves Range at 0, which the normalisation
+    loop above would never leave. A count of `total` or more is corrupt, as
+    in unrar. None of these checks fires on well-formed input.
 
 The **encoder** for the carry-less coder is the mirror image. It exists only
 for the `.pmd`/7a framing (see the RAR licensing note in 5.1).
@@ -601,11 +631,17 @@ are raw.
 **Error recovery.** If DecodeChar returns -1, unrar calls `CleanUp`
 (`model.cpp:563-568`): the sub-allocator restarts with 1 MiB and order 2, and
 decoding switches back to LZ tables. Reaching this path means the data is
-corrupt. ppmd-turbo reports corrupt data instead of emulating CleanUp's
-recovery output.
+corrupt.
+
+**In ppmd-turbo** `RarDecoder::decode_symbol` returns `Ok(None)` for the -1
+and `RarDecoder::cleanup` performs CleanUp, so a caller can reproduce
+unrar's recovery output exactly; the unrar-rs RAR3 unpacker does. Coder or
+model faults (section 4.2, pointer checks) are `Err(CorruptStream)` instead.
 
 **Solid archives.** The model and coder continue across file boundaries,
-mid-block.
+mid-block. ppmd-turbo's `RarDecoder` holds the model across blocks and
+members; the coder's registers are saved with `RarRangeDecoder::state` and
+restored with `from_state`, which reads no init bytes.
 
 **Licensing.** The unRAR licence forbids using unrar source to build a
 RAR-compatible compressor. ppmd-turbo's RAR path is therefore decode-only, and
