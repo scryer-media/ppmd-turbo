@@ -6,6 +6,10 @@
 //! comparisons wait for the crate's encoders and stay
 //! `#[ignore = "awaiting encoder"]`.
 
+// Long ppmd-rust streams take Miri hours; `rc::tests` checks the same
+// coders under Miri, and `range_coders` fuzzes them under ASan.
+#![cfg(not(miri))]
+
 use std::io::Write;
 
 mod api {

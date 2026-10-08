@@ -12,6 +12,10 @@
 //! - libarchive's hostile PPMd archives, which must only return without a
 //!   panic.
 
+// Decoding the whole corpus takes Miri hours; the hostile and library tests
+// cover the same decoder under Miri, and the fuzz lanes under ASan.
+#![cfg(not(miri))]
+
 mod common;
 
 use common::api::RarDecoder;

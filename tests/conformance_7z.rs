@@ -8,6 +8,10 @@
 //! decoder must give the payload's SHA-256 for every one, reject the
 //! corrupted variants as their recipes say, and never panic.
 
+// Decoding the whole corpus takes Miri hours; the hostile and library tests
+// cover the same decoder under Miri, and the fuzz lanes under ASan.
+#![cfg(not(miri))]
+
 mod common;
 
 use common::api::decode_7z;
