@@ -190,6 +190,21 @@ impl Arena {
         unsafe { *self.at(off, 1) }
     }
 
+    /// [`u8`](Self::u8) at a `usize` offset, for loops that walk records:
+    /// a 64-bit index lets the compiler step a pointer instead of
+    /// re-extending a 32-bit offset that might wrap.
+    #[inline(always)]
+    pub(crate) fn byte(&self, off: usize) -> u8 {
+        debug_assert!(
+            off < self.layout.size(),
+            "arena access {off} past {}",
+            self.layout.size()
+        );
+        // SAFETY: in bounds (module invariant, checked above in debug
+        // builds); every byte is initialized.
+        unsafe { *self.base.as_ptr().add(off) }
+    }
+
     #[inline(always)]
     pub(crate) fn set_u8(&mut self, off: u32, v: u8) {
         // SAFETY: in bounds (see `at`); `&mut self` is the only access.

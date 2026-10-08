@@ -122,6 +122,8 @@ const CTX_SUFFIX: u32 = 8;
 const CTX_ONE_STATE: u32 = 2;
 
 const STATE_SIZE: u32 = 6;
+/// [`STATE_SIZE`] for loops that walk states as `usize` offsets.
+const SS: usize = STATE_SIZE as usize;
 const ST_SYMBOL: u32 = 0;
 const ST_FREQ: u32 = 1;
 const ST_SUCCESSOR: u32 = 2;
@@ -277,6 +279,18 @@ impl Model {
         self.a.u8(s + ST_FREQ) as u32
     }
 
+    /// [`sym`](Self::sym) for a state walked as a `usize` offset.
+    #[inline(always)]
+    fn sym_at(&self, s: usize) -> u32 {
+        self.a.byte(s + ST_SYMBOL as usize) as u32
+    }
+
+    /// [`freq`](Self::freq) for a state walked as a `usize` offset.
+    #[inline(always)]
+    fn freq_at(&self, s: usize) -> u32 {
+        self.a.byte(s + ST_FREQ as usize) as u32
+    }
+
     #[inline(always)]
     fn set_freq(&mut self, s: u32, v: u32) {
         self.a.set_u8(s + ST_FREQ, v as u8);
@@ -297,13 +311,13 @@ impl Model {
     /// without a bound; the bound only keeps the walk inside the array.
     #[inline(always)]
     fn find_state(&self, stats: u32, ns: u32, sym: u32) -> Option<u32> {
-        let end = stats + ns * STATE_SIZE;
-        let mut s = stats;
+        let end = stats as usize + ns as usize * SS;
+        let mut s = stats as usize;
         while s < end {
-            if self.sym(s) == sym {
-                return Some(s);
+            if self.sym_at(s) == sym {
+                return Some(s as u32);
             }
-            s += STATE_SIZE;
+            s += SS;
         }
         debug_assert!(
             false,
@@ -834,11 +848,12 @@ impl Model {
     #[inline(always)]
     fn mask_symbols(&self, char_mask: &mut [u8; 256], last: u32, stats: u32) {
         char_mask[self.sym(last) as usize] = 0;
-        let mut s2 = stats;
+        let last = last as usize;
+        let mut s2 = stats as usize;
         while s2 < last {
-            let sym0 = self.sym(s2);
-            let sym1 = self.sym(s2 + STATE_SIZE);
-            s2 += 2 * STATE_SIZE;
+            let sym0 = self.sym_at(s2);
+            let sym1 = self.sym_at(s2 + SS);
+            s2 += 2 * SS;
             char_mask[sym0 as usize] = 0;
             char_mask[sym1 as usize] = 0;
         }
@@ -900,18 +915,21 @@ impl Model {
             count -= freq;
 
             self.prev_success = 0;
-            for _ in 1..ns {
-                s += STATE_SIZE;
-                let freq = self.freq(s);
+            let mut p = s as usize;
+            let last = p + (ns as usize - 1) * SS;
+            while p != last {
+                p += SS;
+                let freq = self.freq_at(p);
                 if count < freq {
                     rc.decode(hi_cnt - count, freq);
-                    self.found_state = s;
-                    let sym = self.sym(s);
+                    self.found_state = p as u32;
+                    let sym = self.sym_at(p);
                     self.update1();
                     return sym as i32;
                 }
                 count -= freq;
             }
+            s = p as u32;
 
             if hi_cnt >= summ_freq {
                 self.abandon_symbol(entry_order_fall);
@@ -958,19 +976,21 @@ impl Model {
                 }
             }
 
-            let stats = self.stats(mc);
+            let stats = self.stats(mc) as usize;
             let ns = self.num_stats(mc);
+            let end = stats + ns as usize * SS;
             let mut s = stats;
             let odd = ns & 1;
-            let mut hi_cnt =
-                self.freq(s) & char_mask[self.sym(s) as usize] as u32 & 0u32.wrapping_sub(odd);
-            s += odd * STATE_SIZE;
-            for _ in 0..ns / 2 {
-                let sym0 = self.sym(s);
-                let sym1 = self.sym(s + STATE_SIZE);
-                hi_cnt += self.freq(s) & char_mask[sym0 as usize] as u32;
-                hi_cnt += self.freq(s + STATE_SIZE) & char_mask[sym1 as usize] as u32;
-                s += 2 * STATE_SIZE;
+            let mut hi_cnt = self.freq_at(s)
+                & char_mask[self.sym_at(s) as usize] as u32
+                & 0u32.wrapping_sub(odd);
+            s += odd as usize * SS;
+            while s < end {
+                let sym0 = self.sym_at(s);
+                let sym1 = self.sym_at(s + SS);
+                hi_cnt += self.freq_at(s) & char_mask[sym0 as usize] as u32;
+                hi_cnt += self.freq_at(s + SS) & char_mask[sym1 as usize] as u32;
+                s += 2 * SS;
             }
             self.min_context = mc;
 
@@ -982,18 +1002,18 @@ impl Model {
                 let mut s = stats;
                 let hi = count;
                 loop {
-                    let f = self.freq(s) & char_mask[self.sym(s) as usize] as u32;
+                    let f = self.freq_at(s) & char_mask[self.sym_at(s) as usize] as u32;
                     if count < f {
                         break;
                     }
                     count -= f;
-                    s += STATE_SIZE;
+                    s += SS;
                 }
-                let freq = self.freq(s);
+                let freq = self.freq_at(s);
                 rc.decode(hi - count, freq);
                 self.see.get(see).update();
-                self.found_state = s;
-                let sym = self.sym(s);
+                self.found_state = s as u32;
+                let sym = self.sym_at(s);
                 self.update2();
                 return sym as i32;
             }
@@ -1008,11 +1028,10 @@ impl Model {
             let cell = self.see.get(see);
             cell.summ = cell.summ.wrapping_add(freq_sum as u16);
 
-            let end = stats + ns * STATE_SIZE;
             let mut s = stats;
             while s < end {
-                char_mask[self.sym(s) as usize] = 0;
-                s += STATE_SIZE;
+                char_mask[self.sym_at(s) as usize] = 0;
+                s += SS;
             }
         }
     }

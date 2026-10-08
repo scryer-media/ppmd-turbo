@@ -10,7 +10,9 @@
 //! `RC_Encode(start, size)`; [`RangeEncoder::encode`] takes the total and
 //! does both.
 
-use super::{CTX_ONE_STATE, EXP_ESCAPE, INT_BITS, Model, STATE_SIZE, hi_bits_flag3, update_prob_1};
+use super::{
+    CTX_ONE_STATE, EXP_ESCAPE, INT_BITS, Model, SS, STATE_SIZE, hi_bits_flag3, update_prob_1,
+};
 use crate::error::Result;
 use crate::rc::{RangeEncoder, corrupt};
 
@@ -62,16 +64,19 @@ impl Model {
             }
             self.prev_success = 0;
             let mut sum = self.freq(s);
-            for _ in 1..ns {
-                s += STATE_SIZE;
-                if self.sym(s) as i32 == symbol {
-                    rc.encode(sum, self.freq(s), summ_freq);
-                    self.found_state = s;
+            let mut p = s as usize;
+            let last = p + (ns as usize - 1) * SS;
+            while p != last {
+                p += SS;
+                if self.sym_at(p) as i32 == symbol {
+                    rc.encode(sum, self.freq_at(p), summ_freq);
+                    self.found_state = p as u32;
                     self.update1();
                     return;
                 }
-                sum += self.freq(s);
+                sum += self.freq_at(p);
             }
+            s = p as u32;
             rc.encode(sum, summ_freq - sum, summ_freq);
 
             self.hi_bits_flag = hi_bits_flag3(self.sym(self.found_state));
@@ -118,38 +123,40 @@ impl Model {
 
             let (see, esc_freq) = self.make_esc_freq(num_masked);
             let stats = self.stats(mc);
-            let mut s = stats;
+            let mut s = stats as usize;
+            let end = s + i as usize * SS;
             let mut sum = 0u32;
 
-            while i != 0 {
-                let cur = self.sym(s);
+            while s < end {
+                let cur = self.sym_at(s);
                 if cur as i32 == symbol {
                     let low = sum;
-                    let freq = self.freq(s);
+                    let freq = self.freq_at(s);
                     self.see.get(see).update();
-                    self.found_state = s;
+                    self.found_state = s as u32;
                     sum += esc_freq;
 
                     // The rest of the unmasked total, the found state
-                    // included.
+                    // included: `i` states from `s` on.
+                    let i = ((end - s) / SS) as u32;
                     let odd = i & 1;
                     sum += freq & 0u32.wrapping_sub(odd);
-                    s += odd * STATE_SIZE;
-                    for _ in 0..i / 2 {
-                        let sym0 = self.sym(s);
-                        let sym1 = self.sym(s + STATE_SIZE);
-                        sum += self.freq(s) & char_mask[sym0 as usize] as u32;
-                        sum += self.freq(s + STATE_SIZE) & char_mask[sym1 as usize] as u32;
-                        s += 2 * STATE_SIZE;
+                    s += odd as usize * SS;
+                    while s < end {
+                        let sym0 = self.sym_at(s);
+                        let sym1 = self.sym_at(s + SS);
+                        sum += self.freq_at(s) & char_mask[sym0 as usize] as u32;
+                        sum += self.freq_at(s + SS) & char_mask[sym1 as usize] as u32;
+                        s += 2 * SS;
                     }
                     rc.encode(low, freq, sum);
                     self.update2();
                     return;
                 }
-                sum += self.freq(s) & char_mask[cur as usize] as u32;
-                s += STATE_SIZE;
-                i -= 1;
+                sum += self.freq_at(s) & char_mask[cur as usize] as u32;
+                s += SS;
             }
+            let s = s as u32;
 
             let total = sum + esc_freq;
             let cell = self.see.get(see);
