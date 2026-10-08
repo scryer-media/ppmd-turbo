@@ -74,8 +74,12 @@ jobs:
             *[!0-9]*|"") echo "runs and seed must be decimal integers" >&2; exit 2 ;;
           esac
           mkdir -p "fuzz/corpus/$TARGET"
-          cargo "+$NIGHTLY_TOOLCHAIN" fuzz run "$TARGET" \
-            "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- \
+          corpora=("fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET")
+          # Minimised past crashes replay first, on every run.
+          if [ -d "fuzz/regressions/$TARGET" ]; then
+            corpora+=("fuzz/regressions/$TARGET")
+          fi
+          cargo "+$NIGHTLY_TOOLCHAIN" fuzz run "$TARGET" "${corpora[@]}" -- \
             -runs="$RUNS" -seed="$SEED" -rss_limit_mb=2048 -print_final_stats=1
       - name: Keep the failing input
         if: failure()
