@@ -53,7 +53,7 @@ impl<I: RangeInput> SevenZipRangeDecoder<I> {
             code = (code << 8) | u32::from(input.next_byte());
         }
         if input.zero_bytes_past_eof() != 0 {
-            return Err(Error::Truncated);
+            return Err(input.take_io_error().map_or(Error::Truncated, Error::Io));
         }
         if first != 0 {
             return Err(corrupt("7z range coder: first byte is not zero"));

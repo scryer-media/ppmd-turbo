@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 crc32fast = "1.5"
+# The RAR 1.5-4.x member parser and the RAR3 escape layer, for check-rar.
+ppmd-corpus = { path = "../ppmd-corpus" }
 ppmd-rust = "=1.5.0"
 ppmd-turbo = { path = "../.." }
 

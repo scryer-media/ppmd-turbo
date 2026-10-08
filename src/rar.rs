@@ -129,8 +129,9 @@ impl RarDecoder {
     /// Errors: [`Error::InvalidParameters`] for a bad `order` or `mem_mb`,
     /// [`Error::CorruptStream`] without a model or for a corrupt stream, and
     /// [`Error::Truncated`] when `rc_data` is shorter than the coder's
-    /// initialization or runs out more than [`MAX_ZERO_BYTES_PAST_EOF`]
-    /// bytes before the output is complete.
+    /// initialization, runs out more than [`MAX_ZERO_BYTES_PAST_EOF`]
+    /// bytes before the output is complete, or runs out before the model's
+    /// end marker.
     pub fn decode_block(
         &mut self,
         reset: bool,
@@ -156,6 +157,12 @@ impl RarDecoder {
         let mut produced = 0u64;
         while produced < unpacked_remaining {
             let Some(byte) = model.decode_symbol(&mut rc)? else {
+                // An end marker reached on padding is the data running
+                // out, not the stream ending: a marker the encoder wrote
+                // never needs a byte past the encoder's flush.
+                if rc.zero_bytes_past_eof() != 0 {
+                    return Err(Error::Truncated);
+                }
                 break;
             };
             if rc.zero_bytes_past_eof() > MAX_ZERO_BYTES_PAST_EOF {
