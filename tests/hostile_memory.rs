@@ -5,51 +5,54 @@
 //! at a high order on a long input restarts the model instead of growing,
 //! and a restart storm reuses the arena instead of leaking one per block.
 //!
-//! This is its own test binary so the global allocator counts nothing but
-//! these tests, and the tests share one lock so they never overlap. The
-//! counts are per thread: the harness's own threads (and a finished test's
-//! teardown) allocate and free on their own schedule, so a process-wide
-//! count would depend on timing. Only the test's own thread moves its tally.
+//! The counters are per thread: each test measures only the allocations made
+//! on its own thread, which is where the decoder runs, so the harness and
+//! other tests running at the same time cannot move them, however loaded the
+//! machine is.
 
 mod hostile_support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
+use std::cell::Cell;
 
 use hostile_support::api::{self, RarDecoder};
 use hostile_support::{Rng, fixture, no_panic};
 
-/// Counts each thread's live bytes and high-water mark since the last
-/// [`reset_peak`].
+/// Counts live bytes and the high-water mark since the last [`reset_peak`],
+/// for the allocating thread.
 struct Counting;
 
 thread_local! {
-    /// This thread's live bytes and high-water mark: (live, peak). Both can
-    /// dip below their start when the thread frees what another allocated,
-    /// so they are signed.
-    static MINE: std::cell::Cell<(isize, isize)> = const { std::cell::Cell::new((0, 0)) };
+    // Const-initialised with no destructor, so reading them never allocates
+    // and they are usable for the thread's whole life, teardown included.
+    // Signed: a block freed on another thread than the one that allocated it
+    // moves the freeing thread's count below its own allocations.
+    static LIVE: Cell<isize> = const { Cell::new(0) };
+    static PEAK: Cell<isize> = const { Cell::new(0) };
 }
 
-/// Moves this thread's tally by `delta` bytes. The const-initialized cell
-/// has no destructor and never allocates; `try_with` skips a thread that is
-/// being torn down.
-fn tally(delta: isize) {
-    let _ = MINE.try_with(|m| {
-        let (live, peak) = m.get();
-        let live = live + delta;
-        m.set((live, peak.max(live)));
+/// Adds `delta` bytes to this thread's live count and raises its peak.
+fn count(delta: isize) {
+    let _ = LIVE.try_with(|live| {
+        let now = live.get() + delta;
+        live.set(now);
+        let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
     });
 }
 
+fn bytes(n: usize) -> isize {
+    isize::try_from(n).expect("allocation size fits isize")
+}
+
 // SAFETY: every method forwards to `System` with the caller's layout and
-// pointer unchanged, so `System`'s guarantees carry over; the counter is a
-// const-initialized thread-local cell and never allocates.
+// pointer unchanged, so `System`'s guarantees carry over; the counters are
+// const-initialised thread-locals and never allocate.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded with the caller's layout (see the impl).
         let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
-            tally(layout.size() as isize);
+            count(bytes(layout.size()));
         }
         p
     }
@@ -58,7 +61,7 @@ unsafe impl GlobalAlloc for Counting {
         // SAFETY: forwarded with the caller's layout (see the impl).
         let p = unsafe { System.alloc_zeroed(layout) };
         if !p.is_null() {
-            tally(layout.size() as isize);
+            count(bytes(layout.size()));
         }
         p
     }
@@ -67,14 +70,14 @@ unsafe impl GlobalAlloc for Counting {
         // SAFETY: `ptr` came from this allocator with `layout` (the caller's
         // contract), so from `System` with the same layout.
         unsafe { System.dealloc(ptr, layout) };
-        tally(-(layout.size() as isize));
+        count(-bytes(layout.size()));
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: as for `dealloc`, and `new_size` is the caller's.
         let p = unsafe { System.realloc(ptr, layout, new_size) };
         if !p.is_null() {
-            tally(new_size as isize - layout.size() as isize);
+            count(bytes(new_size) - bytes(layout.size()));
         }
         p
     }
@@ -83,25 +86,26 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-static SERIAL: Mutex<()> = Mutex::new(());
-
-/// This thread's live bytes now.
-fn live() -> usize {
-    MINE.with(|m| m.get()).0.max(0) as usize
+/// Live bytes on this thread now.
+fn live() -> isize {
+    LIVE.with(Cell::get)
 }
 
 /// Restarts this thread's high-water mark at its live count and returns it.
-fn reset_peak() -> usize {
-    MINE.with(|m| {
-        let (live, _) = m.get();
-        m.set((live, live));
-        live.max(0) as usize
-    })
+fn reset_peak() -> isize {
+    let now = live();
+    PEAK.with(|peak| peak.set(now));
+    now
 }
 
 /// Bytes above `base` at this thread's high-water mark.
-fn peak_above(base: usize) -> usize {
-    (MINE.with(|m| m.get()).1.max(0) as usize).saturating_sub(base)
+fn peak_above(base: isize) -> usize {
+    usize::try_from(PEAK.with(Cell::get) - base).unwrap_or(0)
+}
+
+/// Bytes live on this thread above `base`, or 0 if fewer.
+fn live_above(base: isize) -> usize {
+    usize::try_from(live() - base).unwrap_or(0)
 }
 
 /// What a decoder may hold beyond its arena and the caller's output: the
@@ -111,17 +115,44 @@ const SLACK: usize = (1 << 20) + (64 << 10) + (64 << 10);
 
 #[test]
 fn counting_allocator_counts() {
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // Another thread holds 8 MiB across the measurement and allocates 16 MiB
+    // more in the middle of it, as a concurrent test would; this thread's
+    // counts must see none of it. The
+    // threads hand off through channels, so the overlap is certain, not
+    // timing-dependent.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let other = std::thread::spawn(move || {
+        let big = vec![1u8; 8 << 20];
+        held_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        let more = vec![2u8; 16 << 20];
+        held_tx.send(()).unwrap();
+        drop((big, more));
+    });
+    held_rx.recv().unwrap();
+
     let base = reset_peak();
     let v = vec![0u8; 1 << 20];
-    assert!(peak_above(base) >= 1 << 20);
+    let peak = peak_above(base);
+    assert!(
+        (1 << 20..(1 << 20) + 4096).contains(&peak),
+        "peak {peak} above base"
+    );
+    release_tx.send(()).unwrap();
+    held_rx.recv().unwrap();
     drop(v);
-    assert!(live() <= base + 4096, "{} live above {base}", live());
+    assert!(
+        live_above(base) <= 4096,
+        "{} live above base",
+        live_above(base)
+    );
+    assert!(peak_above(base) < (1 << 20) + 4096);
+    other.join().unwrap();
 }
 
 #[test]
 fn z7_tiny_arena_long_input_stays_within_arena() {
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let f = fixture("z7-long-o64-m2k");
     let stream = f.stream.clone();
     let known = Some(f.payload.len() as u64);
@@ -154,7 +185,6 @@ fn z7_tiny_arena_long_input_stays_within_arena() {
 
 #[test]
 fn rar_restart_storm_reuses_the_arena() {
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let f = fixture("cl-text-o6-m1-eos");
     let remaining = f.payload.len() as u64 + 1000;
     let mut dec = RarDecoder::new();
@@ -172,7 +202,7 @@ fn rar_restart_storm_reuses_the_arena() {
     for _ in 0..100 {
         block(&mut dec, &mut out);
     }
-    let after = live();
+    let after = live_above(base);
     // One arena may be swapped for another of the same size; never more.
     let arena = f.mem as usize;
     assert!(
@@ -180,11 +210,7 @@ fn rar_restart_storm_reuses_the_arena() {
         "peak {} above base",
         peak_above(base)
     );
-    assert!(
-        after <= base + SLACK,
-        "{} bytes more live after 100 resets",
-        after - base
-    );
+    assert!(after <= SLACK, "{after} bytes more live after 100 resets");
 }
 
 /// `Params::memory_footprint` is exact: building a codec allocates exactly
@@ -195,12 +221,11 @@ fn memory_footprint_is_what_a_codec_allocates() {
     use ppmd_turbo::{
         CarrylessDecoder, CarrylessEncoder, Params, RarPpmd, SevenZDecoder, SevenZEncoder,
     };
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for (order, mem) in [(2, 2048), (6, 1 << 20), (64, (16 << 20) + 7)] {
         let params = Params::new(order, mem).expect("legal parameters");
         let want = params.memory_footprint() as usize;
-        let check = |what: &str, held: u64, base: usize| {
-            let got = (live() - base, peak_above(base));
+        let check = |what: &str, held: u64, base: isize| {
+            let got = (live_above(base), peak_above(base));
             assert_eq!(got, (want, want), "{what} {order}/{mem}: (live, peak)");
             assert_eq!(held as usize, want, "{what} {order}/{mem}: reported");
         };
@@ -229,7 +254,7 @@ fn memory_footprint_is_what_a_codec_allocates() {
         assert_eq!(rar.memory_footprint(), 0);
         let base = reset_peak();
         rar.start_block(Some(params)).expect("model starts");
-        let got = (live() - base, peak_above(base));
+        let got = (live_above(base), peak_above(base));
         assert_eq!(got, (want, want), "RAR {mb} MiB: (live, peak)");
         assert_eq!(
             rar.memory_footprint() as usize,
@@ -249,7 +274,6 @@ fn memory_footprint_is_what_a_codec_allocates() {
 #[test]
 fn a_reused_arena_is_the_same_memory() {
     use ppmd_turbo::{CarrylessDecoder, Params, SevenZDecoder, SevenZEncoder, SevenZStatus};
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let big = Params::new(6, 4 << 20).expect("legal parameters");
     let small = Params::new(6, 3 << 20).expect("legal parameters");
     let payload = b"an invented line of text, repeated. ".repeat(64);

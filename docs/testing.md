@@ -10,10 +10,10 @@ iteration counts, no sleeps and no clocks.
 | unit and conformance tests | `src/`, `tests/conformance_*.rs`, `tests/fixtures/` | `cargo test`, every platform |
 | encoder tests | `tests/encode_7z.rs`, `tests/encode_carryless.rs` | `cargo test`, every platform; Miri runs the small cases |
 | hostile-input tests | `tests/hostile_decode.rs`, `tests/hostile_memory.rs`, `tests/hostile_fixtures/` | `cargo test`, Miri, ASan |
-| fuzzing, eight targets | `fuzz/` | six in the `fuzz` CI lane (short) and `fuzz-extended.yml` (long); `range_coders` and `chunking_invariance` on demand |
+| fuzzing, ten targets | `fuzz/` | nine in the `fuzz` CI lane (short) and `fuzz-extended.yml` (long); `chunking_invariance` on demand |
 | in-process differential | the fuzz targets, against ppmd-rust 1.5.0 | with fuzzing |
 | out-of-process oracles | `tools/ppmd-oracle/`, `tests/differential_binaries.rs`, `tests/encode_oracle_7zz.rs` | on demand, against `7zz` and `unrar` |
-| Miri | `cargo miri nextest run` | the `miri-x86_64` CI lane |
+| Miri | `MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run` | the `miri-x86_64` CI lane |
 | AddressSanitizer | the hostile tests, and every fuzz target | the `asan-linux-x86_64` and `fuzz-*` CI lanes |
 
 ## Hostile-input tests
@@ -74,21 +74,23 @@ agreement rule, so every target stays a few lines long.
 | `structure_7z` | parameters, a payload generator and up to 8 edits (flip, truncate, insert, delete, append) applied to a valid stream | an unedited stream decodes to its payload; an edited one agrees with ppmd-rust |
 | `range_coders` | 9-byte operations (a kind and two `u32`s) | both range coders on their own: decoding arbitrary bytes never panics, loops or divides by zero; clamped operations round-trip through each encoder and decoder |
 | `chunking_invariance` | 12-byte header (codec, order, memory, flags, split seed) + payload | for 7z, carry-less and RAR (with `next_symbol` after each escape), encoded or raw streams decode to the same bytes, verdict and error position in arbitrary input and output pieces as in one; the encoders write the same stream either way; `NeedInput` only short of one symbol's input, `OutputFull` only on a full slice, errors repeat |
+| `checked_vs_unchecked` | mode byte (codec, refill window 1..8, `FinishStream`) + a `decode_rar` or `decode_7z` input | the step decoder given the whole input in one call and a bare internals model driven one symbol at a time over a trickling input, with the framing spelled out, agree on every byte, verdict and input position |
+| `model_ops` | up to 48 operations (block start, forget, cleanup, model start and restart, invalid parameters, symbol and block decodes) | invalid parameters change nothing; after any history a block start, model start or restart decodes a fresh known stream exactly |
 
 Every target reaches ppmd-turbo through the shim in `fuzz/src/api.rs`, which
 drives each step codec through input and output pieces chosen by a seeded
 generator, so a failing input reproduces its own split points.
-`range_coders` calls the coders through `ppmd_turbo::internals` directly.
-It and `chunking_invariance` have no committed seeds and are not in the CI
-matrices; run them by hand.
+`range_coders`, `checked_vs_unchecked` and `model_ops` also call the model
+and the coders through `ppmd_turbo::internals` directly.
+`chunking_invariance` has no committed seeds and is not in the CI matrices;
+run it by hand.
 
 Memory per iteration is bounded: decode arenas cap at 64 MiB, round-trip
 arenas at 16 MiB, RAR arenas at 16 MiB, generated payloads at 16 KiB and
 decoded output at 1 MiB. No target has a `.dict` file: the input is
 range-coded, so it has no tokens for libFuzzer to splice.
 
-Committed seeds live in `fuzz/seeds/<target>/`, between 7 and 23 per
-target for the six CI targets. New inputs go to `fuzz/corpus/<target>/`, which is ignored by git.
+Committed seeds live in `fuzz/seeds/<target>/`, between 6 and 33 per target for the nine CI targets. New inputs go to `fuzz/corpus/<target>/`, which is ignored by git.
 
 ```sh
 cargo +nightly fuzz build
@@ -97,9 +99,11 @@ cargo +nightly fuzz run decode_7z fuzz/corpus/decode_7z fuzz/seeds/decode_7z -- 
   -runs=20000 -seed=1 -rss_limit_mb=2048
 ```
 
-CI runs each of the six seeded targets on x86_64 and aarch64 Linux from its
-seeds, with `-seed=1` and a fixed `-runs` per target (20000 for the
-decoders, 5000 for the round trips and 2000 for `structure_7z`). `fuzz-extended.yml` is
+CI runs each of the nine seeded targets on x86_64 and aarch64 Linux from
+its seeds, with `-seed=1` and a fixed `-runs` per target (20000 for the
+decoders, 5000 for the round trips, 2000 for `structure_7z`, 50000 for
+`range_coders`, 10000 for `checked_vs_unchecked` and 5000 for `model_ops`).
+`fuzz-extended.yml` is
 dispatch-only. It takes `runs` and `seed` inputs, uploads crashes and the
 grown corpus, and can also run the `7zz` oracles.
 
@@ -126,6 +130,23 @@ cargo test --locked --manifest-path fuzz/Cargo.toml --lib -- --ignored regenerat
    failure). The fuzz input format is a harness detail; the hostile test is
    the lasting record.
 5. Fix the decoder.
+
+## Miri
+
+```sh
+MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri nextest run --locked --all-features
+```
+
+Isolation is off because the hostile tests read their fixtures from
+`tests/`; nothing in the suite reads a clock or the environment. The vector
+state searches are compiled out under Miri, so it checks the scalar paths.
+Long loops run shortened under `cfg(miri)`, and the corpus conformance and
+coder-differential suites are left out (`#![cfg(not(miri))]`): each takes
+Miri over half an hour, and the same decoders run under Miri through the
+hostile and library tests. The unchecked arena accessors in `src/alloc.rs`
+rely on a caller invariant that only debug assertions check (see
+`ValidatedArenaSpan`); `cargo +nightly fuzz build --debug-assertions` runs the
+fuzz targets with those checks on.
 
 ## Out-of-process oracles
 

@@ -50,6 +50,9 @@ jobs:
           - roundtrip_7z
           - roundtrip_carryless
           - structure_7z
+          - range_coders
+          - checked_vs_unchecked
+          - model_ops
         include:
           - platform: linux-x86_64
             runner: ubuntu-24.04

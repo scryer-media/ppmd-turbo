@@ -642,6 +642,10 @@ mod tests {
     /// interval) every thousand symbols or so; each time, decoding carries
     /// on with a fresh block.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "needs over 250k symbols to fill the arena; the fuzz and ASan lanes cover it"
+    )]
     fn arena_exhaustion_and_reuse_after_errors_never_panic() {
         let data = noise(1 << 20, 0x9E37_79B9);
         let mut ppmd = RarPpmd::new();
@@ -692,7 +696,10 @@ mod tests {
         let data = noise(1 << 12, 0x0BAD_5EED);
         let mut ppmd = RarPpmd::new();
         let mut out = [0u8; 32];
-        for round in 0..500u32 {
+        // Under Miri, enough rounds to cover every reset, cleanup, forget
+        // and arena-size change at least twice.
+        let rounds = if cfg!(miri) { 30 } else { 500 };
+        for round in 0..rounds {
             let start = (round as usize * 7) % 2048;
             let reset = (round % 5 != 4).then(|| rar(2 + round % 63, 1 + round % 3));
             if ppmd.start_block(reset).is_ok() {

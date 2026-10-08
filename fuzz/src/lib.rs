@@ -14,6 +14,10 @@
 //! - [`outcome`] turns a decode into an output plus a verdict, and decides
 //!   when two verdicts agree;
 //! - [`mutate`] is the structure-aware input of `structure_7z`;
+//! - [`paths`] is `checked_vs_unchecked`: the fast decode path against the
+//!   checked one;
+//! - [`ops`] is `model_ops`: operation sequences against the long-lived
+//!   model APIs;
 //! - [`seeds`] generates the committed seed corpora and the hostile-test
 //!   fixtures under `tests/hostile_fixtures`.
 
@@ -22,8 +26,10 @@
 pub mod api;
 pub mod layout;
 pub mod mutate;
+pub mod ops;
 pub mod outcome;
 pub mod params;
+pub mod paths;
 pub mod payload;
 pub mod reference;
 pub mod seeds;

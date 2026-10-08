@@ -137,6 +137,10 @@ jobs:
       - name: Set up Miri
         run: cargo "+$NIGHTLY_TOOLCHAIN" miri setup
       - name: Miri
+        env:
+          # The hostile and conformance tests read their fixtures from
+          # tests/; nothing in the suite reads a clock or the environment.
+          MIRIFLAGS: -Zmiri-disable-isolation
         run: cargo "+$NIGHTLY_TOOLCHAIN" miri nextest run --locked --all-features -j "$(nproc)"
 
   # The fuzz harness library and its committed seeds: the seeds must match
@@ -178,6 +182,9 @@ jobs:
           - roundtrip_7z
           - roundtrip_carryless
           - structure_7z
+          - range_coders
+          - checked_vs_unchecked
+          - model_ops
         include:
           - platform: linux-x86_64
             runner: ubuntu-24.04
@@ -196,6 +203,12 @@ jobs:
             runs: 5000
           - target: structure_7z
             runs: 2000
+          - target: range_coders
+            runs: 50000
+          - target: checked_vs_unchecked
+            runs: 10000
+          - target: model_ops
+            runs: 5000
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -1353,14 +1353,17 @@ mod tests {
     /// orders and arena sizes, never panics and leaves a working model.
     #[test]
     fn restart_storms_leave_a_working_model() {
+        // Miri runs the same storm, shortened: each restart rebuilds the
+        // root context, which costs Miri seconds, not microseconds.
+        let (restarts, starts) = if cfg!(miri) { (40, 20) } else { (2_000, 200) };
         let data = noise(1 << 12, 0x0BAD_5EED);
         let mut model = Model::new(6, 1 << 16).unwrap();
-        for round in 0..2_000u32 {
+        for round in 0..restarts {
             model.restart();
             let mut rc = RarRangeDecoder::new(&data[(round as usize % 2048)..]).unwrap();
             let _ = model.decode_symbol(&mut rc);
         }
-        for round in 0..200u32 {
+        for round in 0..starts {
             let order = PPMD7_MIN_ORDER + round % (PPMD7_MAX_ORDER - 1);
             let mem = if round % 2 == 0 { 1 << 12 } else { 1 << 16 };
             model.start(order, mem).unwrap();
