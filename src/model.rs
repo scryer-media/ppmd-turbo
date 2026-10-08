@@ -216,6 +216,170 @@ fn collect_unmasked(
     }
 }
 
+/// D11 NEON escape pass: the masked-state test as a 256-byte table lookup
+/// (`tbl` over the whole `char_mask`, held in sixteen registers) on sixteen
+/// states at a time, with no scratch list. The first pass sums the unmasked
+/// frequencies and counts the unmasked states; the selection pass skips whole
+/// sixteen-state batches by their unmasked sum and finishes inside one batch
+/// in scalar; an escape masks every state of the context (masking an already
+/// masked symbol again is a no-op), so no list of the unmasked ones is needed.
+#[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
+mod escape_neon {
+    use super::STATE_SIZE;
+    use crate::alloc::{SubAllocator, ValidatedArenaSpan};
+    use std::arch::aarch64::*;
+
+    /// Contexts narrower than this take the scalar path.
+    pub(super) const MIN_STATES: usize = 16;
+
+    pub(super) struct Lookup {
+        table: [uint8x16x4_t; 4],
+        esc: uint8x16_t,
+    }
+
+    impl Lookup {
+        #[inline(always)]
+        pub(super) fn new(char_mask: &[u8; 256], esc_count: u8) -> Self {
+            let p = char_mask.as_ptr();
+            // SAFETY: `char_mask` is 256 bytes, exactly the four 64-byte loads.
+            unsafe {
+                Self {
+                    table: [
+                        vld1q_u8_x4(p),
+                        vld1q_u8_x4(p.add(64)),
+                        vld1q_u8_x4(p.add(128)),
+                        vld1q_u8_x4(p.add(192)),
+                    ],
+                    esc: vdupq_n_u8(esc_count),
+                }
+            }
+        }
+
+        /// `char_mask[sym] == esc_count` per lane, as 0xFF / 0. An index
+        /// past a 64-byte table reads 0 from `tbl`, so exactly one of the four
+        /// lookups is live for each lane and their OR is `char_mask[sym]`.
+        #[inline(always)]
+        fn masked(&self, syms: uint8x16_t) -> uint8x16_t {
+            let [t0, t1, t2, t3] = self.table;
+            // SAFETY: register-only NEON intrinsics; NEON is part of every AArch64
+            // target's baseline, so the feature they require is always present.
+            unsafe {
+                let v = vorrq_u8(
+                    vorrq_u8(
+                        vqtbl4q_u8(t0, syms),
+                        vqtbl4q_u8(t1, vsubq_u8(syms, vdupq_n_u8(64))),
+                    ),
+                    vorrq_u8(
+                        vqtbl4q_u8(t2, vsubq_u8(syms, vdupq_n_u8(128))),
+                        vqtbl4q_u8(t3, vsubq_u8(syms, vdupq_n_u8(192))),
+                    ),
+                );
+                vceqq_u8(v, self.esc)
+            }
+        }
+
+        /// The unmasked frequencies of states `index..index + 16` (masked
+        /// lanes zero) and the masked-lane vector.
+        #[inline(always)]
+        fn batch16(
+            &self,
+            alloc: &SubAllocator,
+            states: ValidatedArenaSpan,
+            index: usize,
+        ) -> (uint8x16_t, uint8x16_t) {
+            let h0 = alloc.span_state_heads8_neon(states, index * STATE_SIZE);
+            let h1 = alloc.span_state_heads8_neon(states, (index + 8) * STATE_SIZE);
+            // SAFETY: register-only NEON intrinsics; NEON is part of every AArch64
+            // target's baseline, so the feature they require is always present.
+            unsafe {
+                let syms = vmovn_high_u16(vmovn_u16(h0), h1);
+                let freqs = vshrn_high_n_u16::<8>(vshrn_n_u16::<8>(h0), h1);
+                let masked = self.masked(syms);
+                (vbicq_u8(freqs, masked), masked)
+            }
+        }
+    }
+
+    /// Unmasked frequency total and unmasked state count over all `ns`
+    /// states (`ns >= MIN_STATES`).
+    #[inline(always)]
+    pub(super) fn unmasked_total(
+        lookup: &Lookup,
+        alloc: &SubAllocator,
+        char_mask: &[u8; 256],
+        states: ValidatedArenaSpan,
+        ns: usize,
+        esc_count: u8,
+    ) -> (u32, usize) {
+        // SAFETY: as in `Lookup::masked`.
+        let mut freq_acc = unsafe { vdupq_n_u16(0) };
+        let mut masked_acc = freq_acc;
+        let mut index = 0usize;
+        // Each u16 lane gathers two u8 lanes per batch, at most 16 batches of
+        // 255: no overflow.
+        while index + 16 <= ns {
+            let (freqs, masked) = lookup.batch16(alloc, states, index);
+            // SAFETY: as in `Lookup::masked`.
+            unsafe {
+                freq_acc = vpadalq_u8(freq_acc, freqs);
+                masked_acc = vpadalq_u8(masked_acc, vshrq_n_u8::<7>(masked));
+            }
+            index += 16;
+        }
+        // SAFETY: as in `Lookup::masked`.
+        let (mut hi_cnt, masked) =
+            unsafe { (u32::from(vaddvq_u16(freq_acc)), vaddvq_u16(masked_acc)) };
+        let mut unmasked = index - usize::from(masked);
+        while index < ns {
+            let head = alloc.span_read_u16(states, index * STATE_SIZE);
+            if char_mask[head as u8 as usize] != esc_count {
+                hi_cnt += u32::from(head >> 8);
+                unmasked += 1;
+            }
+            index += 1;
+        }
+        (hi_cnt, unmasked)
+    }
+
+    /// The unmasked state the cumulative `count` falls in, in state order:
+    /// `(index, freq, low)`, or `None` past the last unmasked state.
+    #[inline(always)]
+    pub(super) fn select(
+        lookup: &Lookup,
+        alloc: &SubAllocator,
+        char_mask: &[u8; 256],
+        states: ValidatedArenaSpan,
+        ns: usize,
+        esc_count: u8,
+        count: u32,
+    ) -> Option<(usize, u8, u32)> {
+        let mut cum = 0u32;
+        let mut index = 0usize;
+        while index + 16 <= ns {
+            let (freqs, _) = lookup.batch16(alloc, states, index);
+            // SAFETY: as in `Lookup::masked`.
+            let batch = u32::from(unsafe { vaddlvq_u8(freqs) });
+            if cum + batch > count {
+                break;
+            }
+            cum += batch;
+            index += 16;
+        }
+        while index < ns {
+            let head = alloc.span_read_u16(states, index * STATE_SIZE);
+            if char_mask[head as u8 as usize] != esc_count {
+                let freq = u32::from(head >> 8);
+                cum += freq;
+                if cum > count {
+                    return Some((index, (head >> 8) as u8, cum - freq));
+                }
+            }
+            index += 1;
+        }
+        None
+    }
+}
+
 // --- Helpers for converting between NodeRef and byte offsets ---
 
 #[inline]
@@ -1063,16 +1227,39 @@ impl Model {
         // model-owned array avoids zeroing a padded 2 KiB stack allocation on
         // every escape decode.
         let esc_count = self.esc_count;
-        let Some(hi_cnt) = collect_unmasked(
-            &self.alloc,
-            &self.char_mask,
-            &mut self.unmasked_scratch,
-            states_span,
-            ns as usize,
-            n,
-            esc_count,
-        ) else {
-            return false;
+        #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
+        let vector = (ns as usize >= escape_neon::MIN_STATES)
+            .then(|| escape_neon::Lookup::new(&self.char_mask, esc_count))
+            .and_then(|lookup| {
+                let (hi_cnt, unmasked) = escape_neon::unmasked_total(
+                    &lookup,
+                    &self.alloc,
+                    &self.char_mask,
+                    states_span,
+                    ns as usize,
+                    esc_count,
+                );
+                // Any count but the consistent model's goes the reference way.
+                (unmasked == n).then_some((lookup, hi_cnt))
+            });
+        #[cfg(not(all(target_arch = "aarch64", target_endian = "little", not(miri))))]
+        let vector: Option<((), u32)> = None;
+        let hi_cnt = match &vector {
+            Some((_, hi_cnt)) => *hi_cnt,
+            None => {
+                let Some(hi_cnt) = collect_unmasked(
+                    &self.alloc,
+                    &self.char_mask,
+                    &mut self.unmasked_scratch,
+                    states_span,
+                    ns as usize,
+                    n,
+                    esc_count,
+                ) else {
+                    return false;
+                };
+                hi_cnt
+            }
         };
         let scale = esc_freq + hi_cnt;
         let count = rc.get_threshold(scale);
@@ -1082,17 +1269,30 @@ impl Model {
 
         if count < hi_cnt {
             // Symbol found among unmasked.
-            let mut cum = 0u32;
             let mut selected = None;
-
-            for &packed in &self.unmasked_scratch[..n] {
-                let state_index = unmasked_state_index(packed);
-                let state_freq = unmasked_state_frequency(packed);
-                let freq = state_freq as u32;
-                cum += freq;
-                if cum > count {
-                    selected = Some((state_index, state_freq, cum - freq));
-                    break;
+            #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
+            if let Some((lookup, _)) = &vector {
+                selected = escape_neon::select(
+                    lookup,
+                    &self.alloc,
+                    &self.char_mask,
+                    states_span,
+                    ns as usize,
+                    esc_count,
+                    count,
+                );
+            }
+            if vector.is_none() {
+                let mut cum = 0u32;
+                for &packed in &self.unmasked_scratch[..n] {
+                    let state_index = unmasked_state_index(packed);
+                    let state_freq = unmasked_state_frequency(packed);
+                    let freq = state_freq as u32;
+                    cum += freq;
+                    if cum > count {
+                        selected = Some((state_index, state_freq, cum - freq));
+                        break;
+                    }
                 }
             }
             if let Some((state_index, state_freq, low)) = selected {
@@ -1117,10 +1317,19 @@ impl Model {
         self.see_update_escape(see_index, scale);
 
         // Mask remaining unmasked symbols.
-        let char_mask = &mut self.char_mask;
-        for &packed in &self.unmasked_scratch[..n] {
-            let sym = unmasked_state_symbol(packed);
-            char_mask[sym as usize] = esc_count;
+        if vector.is_some() {
+            // No list of the unmasked states: mask them all; the masked ones
+            // already hold `esc_count`.
+            for state_index in 0..ns as usize {
+                let sym = self.span_state_sym(states_span, state_index);
+                self.char_mask[sym as usize] = esc_count;
+            }
+        } else {
+            let char_mask = &mut self.char_mask;
+            for &packed in &self.unmasked_scratch[..n] {
+                let sym = unmasked_state_symbol(packed);
+                char_mask[sym as usize] = esc_count;
+            }
         }
         self.num_masked = ns;
         *validated_suffix = suffix_data;
@@ -2302,6 +2511,112 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 assert_find_agrees_on_every_path(&mut model, span, &syms);
+            }
+        }
+    }
+
+    /// The escape-pass fast paths (branch-free collection, and the NEON
+    /// table-lookup pass where it exists) agree with the reference walk on
+    /// every context width, mask density and threshold.
+    #[test]
+    fn escape_pass_fast_paths_match_the_reference() {
+        let mut model = Model::new(6, 1 << 20).unwrap();
+        let context_span = model.validated_context(model.min_context).unwrap();
+        let stats = model.span_ctx_stats(context_span);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let widths = (1..=40usize).chain([47, 48, 63, 64, 100, 128, 200, 255, 256]);
+        for ns in widths {
+            let span = model.validated_states(stats, ns.max(2)).unwrap();
+            for round in 0..24 {
+                // Distinct symbols, as in a real context.
+                let mut syms: Vec<u8> = (0..=255u8).collect();
+                for i in (1..256).rev() {
+                    syms.swap(i, next() as usize % (i + 1));
+                }
+                for (index, &sym) in syms.iter().take(ns).enumerate() {
+                    let freq = 1 + (next() % 124) as u8;
+                    model.span_write_state(span, index, sym, freq, 0);
+                }
+                let esc = 1 + (next() % 255) as u8;
+                let density = round % 6;
+                let mut mask = [0u8; 256];
+                for m in mask.iter_mut() {
+                    *m = if next() % 6 < density {
+                        esc
+                    } else {
+                        (next() % 256) as u8
+                    };
+                    if *m == esc && density == 0 {
+                        *m = esc.wrapping_add(1);
+                    }
+                }
+                let unmasked: Vec<usize> = (0..ns)
+                    .filter(|&i| mask[model.span_state_sym(span, i) as usize] != esc)
+                    .collect();
+                let n = unmasked.len();
+                let want: u32 = unmasked
+                    .iter()
+                    .map(|&i| u32::from(model.span_state_freq(span, i)))
+                    .sum();
+                let mut scratch = [0u32; 256];
+                let got = collect_unmasked(&model.alloc, &mask, &mut scratch, span, ns, n, esc);
+                assert_eq!(got, Some(want), "ns={ns} round={round}");
+                for (slot, &i) in scratch.iter().zip(&unmasked) {
+                    assert_eq!(unmasked_state_index(*slot), i);
+                }
+                // The reference's verdicts for a count it cannot meet.
+                let mut ref_scratch = [0u32; 256];
+                assert_eq!(
+                    collect_unmasked(&model.alloc, &mask, &mut scratch, span, ns, n + 1, esc),
+                    collect_unmasked_reference(
+                        &model.alloc,
+                        &mask,
+                        &mut ref_scratch,
+                        span,
+                        ns,
+                        n + 1,
+                        esc
+                    )
+                );
+
+                #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
+                if ns >= escape_neon::MIN_STATES {
+                    let lookup = escape_neon::Lookup::new(&mask, esc);
+                    assert_eq!(
+                        escape_neon::unmasked_total(&lookup, &model.alloc, &mask, span, ns, esc),
+                        (want, n)
+                    );
+                    let mut cum = 0u32;
+                    for &i in &unmasked {
+                        let f = u32::from(model.span_state_freq(span, i));
+                        for count in [cum, cum + f / 2, cum + f - 1] {
+                            assert_eq!(
+                                escape_neon::select(
+                                    &lookup,
+                                    &model.alloc,
+                                    &mask,
+                                    span,
+                                    ns,
+                                    esc,
+                                    count
+                                ),
+                                Some((i, f as u8, cum)),
+                                "ns={ns} count={count}"
+                            );
+                        }
+                        cum += f;
+                    }
+                    assert_eq!(
+                        escape_neon::select(&lookup, &model.alloc, &mask, span, ns, esc, cum),
+                        None
+                    );
+                }
             }
         }
     }

@@ -404,6 +404,37 @@ impl SubAllocator {
         heads.map(u16::from_le)
     }
 
+    /// The `Symbol | Freq << 8` heads of eight consecutive states, left in a
+    /// vector register (lane `i` is state `i` of the batch) for the D11
+    /// escape pass.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
+    #[inline(always)]
+    pub(crate) fn span_state_heads8_neon(
+        &self,
+        span: ValidatedArenaSpan,
+        relative: usize,
+    ) -> std::arch::aarch64::uint16x8_t {
+        const STATE_BATCH_BYTES: usize = 8 * 6;
+        debug_assert!(
+            relative
+                .checked_add(STATE_BATCH_BYTES)
+                .is_some_and(|end| end <= span.len())
+        );
+        // SAFETY: the validated span covers all 48 bytes `vld3q_u16` loads;
+        // AArch64 permits unaligned vector loads and the pointer stays local.
+        // The target is little-endian (cfg above), so lane 0 of each triple
+        // is `Symbol | Freq << 8`.
+        unsafe {
+            std::arch::aarch64::vld3q_u16(
+                self.arena
+                    .as_ptr()
+                    .add(span.offset() + relative)
+                    .cast::<u16>(),
+            )
+            .0
+        }
+    }
+
     /// Gather the symbol bytes of eight consecutive states into one vector,
     /// lane `i` holding the symbol of state `i` of the batch and lanes 8..16
     /// zeroed.
