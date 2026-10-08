@@ -71,30 +71,42 @@ impl<I: RangeInput> Cursor for CarrylessRangeDecoder<I> {
 /// `ESC`, a symbol equal to `esc` stops the loop (consumed, not written).
 /// Returns the bytes written and why it stopped; on an error the bytes
 /// before it are still valid.
+///
+/// `margin` is the coder's per-symbol input bound. The cursor is tested once
+/// per batch, not per symbol: from position `p`, the next
+/// `(fast_end - p) / margin + 1` symbols all start at or before `fast_end`,
+/// so the batch decodes exactly the symbols a per-symbol test would and
+/// stops at the same place. A per-symbol test cost about 14 instructions a
+/// symbol in the inner loop.
 #[inline]
 pub(crate) fn fast<R: Cursor, const ESC: bool>(
     model: &mut Model,
     rc: &mut R,
     out: &mut [u8],
     fast_end: usize,
+    margin: usize,
     esc: u8,
 ) -> (usize, Result<Stop>) {
+    debug_assert!(margin > 0);
     let mut produced = 0;
-    for slot in out.iter_mut() {
-        if rc.position() > fast_end {
+    while produced < out.len() {
+        let Some(room) = fast_end.checked_sub(rc.position()) else {
             return (produced, Ok(Stop::Margin));
-        }
-        match model.decode_symbol(rc) {
-            Ok(Some(byte)) => {
-                debug_assert_eq!(rc.padding(), 0, "a symbol outran the input margin");
-                if ESC && byte == esc {
-                    return (produced, Ok(Stop::Escape));
+        };
+        let batch = (room / margin + 1).min(out.len() - produced);
+        for slot in &mut out[produced..produced + batch] {
+            match model.decode_symbol(rc) {
+                Ok(Some(byte)) => {
+                    debug_assert_eq!(rc.padding(), 0, "a symbol outran the input margin");
+                    if ESC && byte == esc {
+                        return (produced, Ok(Stop::Escape));
+                    }
+                    *slot = byte;
+                    produced += 1;
                 }
-                *slot = byte;
-                produced += 1;
+                Ok(None) => return (produced, Ok(Stop::EndMarker)),
+                Err(e) => return (produced, Err(e)),
             }
-            Ok(None) => return (produced, Ok(Stop::EndMarker)),
-            Err(e) => return (produced, Err(e)),
         }
     }
     (produced, Ok(Stop::OutputFull))

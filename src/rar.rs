@@ -345,7 +345,7 @@ impl RarPpmd {
         let margin = carryless_margin(model.order() as u8);
         let mut rc = CarrylessRangeDecoder::from_state(SliceInput::new(rest), self.regs);
         let (mut produced, mut stop) = match rest.len().checked_sub(margin) {
-            Some(fast_end) => run::fast::<_, true>(model, &mut rc, out, fast_end, esc),
+            Some(fast_end) => run::fast::<_, true>(model, &mut rc, out, fast_end, margin, esc),
             None => (0, Ok(Stop::Margin)),
         };
         if input_is_last && stop == Ok(Stop::Margin) {
