@@ -250,6 +250,20 @@ Every item below lists the same fields:
   `clear_mask` (`model.rs:2227`).
 - **Measure:** cycles in the escape loop on binary or high-entropy data
   (escape-heavy) vs text.
+- **Done (scalar part), 0.1.0:** the stamps and the packed scratch came
+  over from unrar-rs; the gather is now branch-free (each state is stored
+  and kept by adding its unmasked bit to the index), which was 47% of the
+  samples on binary input. 7z binary order 6, 1 MiB: 1293M to 911M cycles
+  (ppmd-rust 811M); carry-less binary order 6: 1.33x, mixed: 1.21x.
+- **Done (two passes), 0.1.0:** the first pass only sums the unmasked
+  frequencies (no scratch store); selection re-walks the states and an
+  escape stamps every state, and the scratch gather is kept only for an
+  inconsistent model. 4 MiB, cycles: binary order 6 3925M to 3841M (7z
+  4017M to 3761M), mixed order 6 4251M to 3890M, mixed order 32 1.08x;
+  7% fewer instructions; text unchanged.
+  The selection pass then counts down from the threshold (one compare,
+  no spilled mask base): 7z binary order 6 3787M to 3696M cycles,
+  carry-less mixed order 6 4000M to 3847M, 3% fewer instructions.
 
 ### D9. Wide loads for context heads and successors
 
@@ -447,6 +461,14 @@ applies to it beyond staying bit-exact.
 - **Unsafe:** Yes, for intrinsics; optional.
 - **Seen in:** 7-Zip unrolled loops; unrar-rs gathers.
 - **Measure:** encode cycles/symbol at orders 2–6 on binary data.
+- **Done (escape pass, scalar), 0.2.0:** the escape pass is one
+  branch-free walk (unmasked sum, count, the first matching state and the
+  sum before it), with the collecting loop kept for an inconsistent model.
+  1 MiB at order 6, cycles: binary 5244M to 4044M (ppmd-rust 2368M), mixed
+  4721M to 3961M (2461M); text 64 KiB 381M to 344M (303M).
+  Recording the target behind a once-taken branch, instead of a
+  branch-free `before` mask that chained every state to the last, then
+  took binary to 3580M and mixed to 3527M (1.14x and 1.11x).
 
 ### E4. Share the model fast paths with decode
 

@@ -25,6 +25,9 @@ is a released version.
   can be flushed without finishing the coder.
 - Encoder test suites and an opt-in `7zz` oracle; the `roundtrip_7z` and
   `roundtrip_carryless` fuzz targets run the crate's encoders.
+- Encode: the escape pass sums the unmasked states and finds the symbol in
+  one walk with no branch per state, 1.47x faster on binary input, 1.33x
+  on mixed and 1.11x on 64 KiB of text.
 
 ## 0.1.0 - 2026-10-08
 
@@ -85,3 +88,11 @@ is a released version.
 - CI: a deterministic fuzz run of the six seeded targets, the hostile tests
   under AddressSanitizer, Miri, and a dispatch-only `fuzz-extended`
   workflow.
+- Decode: the escape decode gathers the unmasked states without a branch
+  per state, 1.2-1.35x faster on binary and mixed input (7z binary order 6:
+  1293M to 911M cycles) and unchanged on text.
+- Decode: the escape decode sums the unmasked frequencies in a first pass
+  and walks the states again only to select or mask, 4-9% fewer cycles on
+  binary and mixed input and unchanged on text.
+- Decode: the escape decode's selection counts down from the threshold
+  and reuses the gather's borrows, 2-4% fewer cycles.

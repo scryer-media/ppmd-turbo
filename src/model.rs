@@ -1060,74 +1060,47 @@ impl Model {
         let (esc_freq, see_index) = self.make_esc_freq2(context_head, suffix_ns, diff);
         let n = diff as usize;
 
-        // Collect only the live state indices. The frequencies are already in
-        // the arena and are cheap to reload on the selection pass. Reusing the
-        // model-owned array avoids zeroing a padded 2 KiB stack allocation on
-        // every escape decode.
+        // Two passes, like 7-Zip's Ppmd7: the first only sums the unmasked
+        // frequencies, and the states are walked again only to select the
+        // decoded one or to mask them on escape. The walk has no
+        // data-dependent branch (whether a symbol is masked is close to a
+        // coin flip on escape-heavy input).
         let mut hi_cnt = 0u32;
         let esc_count = self.esc_count;
         let alloc = &self.alloc;
         let char_mask = &self.char_mask;
-        let scratch = &mut self.unmasked_scratch[..n];
-
-        #[cfg(all(target_arch = "aarch64", not(miri)))]
-        {
-            let mut state_index = 0usize;
-            let mut scratch_index = 0usize;
-            while state_index + 8 <= ns as usize && scratch_index < n {
-                let heads = alloc.span_read_state_heads8(states_span, state_index * STATE_SIZE);
-                for (lane, head) in heads.into_iter().enumerate() {
-                    let sym = head as u8;
-                    if char_mask[sym as usize] != esc_count {
-                        hi_cnt += (head >> 8) as u32;
-                        scratch[scratch_index] = pack_unmasked_state(state_index + lane, head);
-                        scratch_index += 1;
-                        if scratch_index == n {
-                            break;
-                        }
-                    }
-                }
-                state_index += 8;
-            }
-            while scratch_index < n {
-                if state_index >= ns as usize {
-                    return false;
-                }
-                let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-                let sym = head as u8;
-                if char_mask[sym as usize] != esc_count {
-                    hi_cnt += (head >> 8) as u32;
-                    scratch[scratch_index] = pack_unmasked_state(state_index, head);
-                    scratch_index += 1;
-                }
-                state_index += 1;
-            }
+        let mut found = 0usize;
+        for state_index in 0..ns as usize {
+            let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
+            let unmasked = char_mask[head as u8 as usize] != esc_count;
+            hi_cnt += u32::from(head >> 8) & 0u32.wrapping_sub(u32::from(unmasked));
+            found += usize::from(unmasked);
         }
-
-        // Every target except NEON aarch64 walks the states one at a time. A
-        // pshufb gather feeding a scalar per-lane test measured as pure
-        // instruction bloat on x86-64 (more work per state than this loop),
-        // so x86-64 shares the plain scalar shape of the reference.
-        #[cfg(any(not(target_arch = "aarch64"), miri))]
-        {
-            let mut state_index = 0usize;
-            for slot in scratch.iter_mut() {
-                let head = loop {
-                    if state_index >= ns as usize {
-                        return false;
-                    }
-                    let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-                    let sym = head as u8;
-                    if char_mask[sym as usize] != esc_count {
-                        break head;
-                    }
-                    state_index += 1;
-                };
-
-                hi_cnt += (head >> 8) as u32;
-                *slot = pack_unmasked_state(state_index, head);
-                state_index += 1;
+        // A consistent model has exactly `ns - num_masked` unmasked states.
+        // A corrupt one keeps the reference's shape: too few is a failed
+        // decode, and with too many only the first `n` count, so that case
+        // gathers them into the scratch array.
+        let consistent = found == n;
+        if !consistent {
+            if found < n {
+                return false;
             }
+            let scratch = &mut self.unmasked_scratch;
+            let mut kept = 0usize;
+            for state_index in 0..ns as usize {
+                let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
+                if char_mask[head as u8 as usize] != esc_count {
+                    scratch[kept] = pack_unmasked_state(state_index, head);
+                    kept += 1;
+                    if kept == n {
+                        break;
+                    }
+                }
+            }
+            hi_cnt = scratch[..n]
+                .iter()
+                .map(|&packed| u32::from(unmasked_state_frequency(packed)))
+                .sum();
         }
         let scale = esc_freq + hi_cnt;
         let count = rc.get_threshold(scale);
@@ -1136,18 +1109,32 @@ impl Model {
         }
 
         if count < hi_cnt {
-            // Symbol found among unmasked.
-            let mut cum = 0u32;
+            // Symbol found among unmasked. `count < hi_cnt` guarantees a
+            // selection: the unmasked frequencies sum to `hi_cnt`.
             let mut selected = None;
-
-            for &packed in &self.unmasked_scratch[..n] {
-                let state_index = unmasked_state_index(packed);
-                let state_freq = unmasked_state_frequency(packed);
-                let freq = state_freq as u32;
-                cum += freq;
-                if cum > count {
-                    selected = Some((state_index, state_freq, cum - freq));
-                    break;
+            if consistent {
+                let mut rest = count;
+                for state_index in 0..ns as usize {
+                    let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
+                    let unmasked = char_mask[head as u8 as usize] != esc_count;
+                    let freq = u32::from(head >> 8) & 0u32.wrapping_sub(u32::from(unmasked));
+                    if rest < freq {
+                        selected = Some((state_index, (head >> 8) as u8, count - rest));
+                        break;
+                    }
+                    rest -= freq;
+                }
+            } else {
+                let mut cum = 0u32;
+                for &packed in &self.unmasked_scratch[..n] {
+                    let state_index = unmasked_state_index(packed);
+                    let state_freq = unmasked_state_frequency(packed);
+                    let freq = state_freq as u32;
+                    cum += freq;
+                    if cum > count {
+                        selected = Some((state_index, state_freq, cum - freq));
+                        break;
+                    }
                 }
             }
             if let Some((state_index, state_freq, low)) = selected {
@@ -1171,11 +1158,22 @@ impl Model {
         // SEE update (escape): add scale to summ.
         self.see_update_escape(see_index, scale);
 
-        // Mask remaining unmasked symbols.
+        // Mask remaining unmasked symbols. In a consistent model every state
+        // is either already masked or one of them, so stamping all of them
+        // is the same and needs no mask check.
         let char_mask = &mut self.char_mask;
-        for &packed in &self.unmasked_scratch[..n] {
-            let sym = unmasked_state_symbol(packed);
-            char_mask[sym as usize] = esc_count;
+        if consistent {
+            for state_index in 0..ns as usize {
+                let sym = self
+                    .alloc
+                    .span_read_u8(states_span, state_index * STATE_SIZE + STATE_SYM);
+                char_mask[sym as usize] = esc_count;
+            }
+        } else {
+            for &packed in &self.unmasked_scratch[..n] {
+                let sym = unmasked_state_symbol(packed);
+                char_mask[sym as usize] = esc_count;
+            }
         }
         self.num_masked = ns;
         *validated_suffix = suffix_data;
