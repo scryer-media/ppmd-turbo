@@ -74,6 +74,27 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        "encode-turbo" => {
+            // proto_bench encode-turbo PAYLOAD ORDER MEM REFERENCE_STREAM
+            let payload = std::fs::read(it.next().expect("payload")).expect("read payload");
+            let order: u32 = arg(it.next(), "order");
+            let mem: u32 = arg(it.next(), "mem");
+            let reference = std::fs::read(it.next().expect("reference")).expect("read reference");
+            let start = Instant::now();
+            let out = ppmd_turbo::ppmd7::encode_7z(&payload, order, mem, false).expect("encode");
+            let secs = start.elapsed().as_secs_f64();
+            let crc = crc32fast::hash(&out);
+            let same = out == reference;
+            println!(
+                "{secs:.6} {crc:08x} {}",
+                if same { "ok" } else { "MISMATCH" }
+            );
+            if same {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         _ => panic!("unknown command {cmd}"),
     }
 }
