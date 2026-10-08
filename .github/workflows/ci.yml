@@ -141,7 +141,11 @@ jobs:
           # The hostile and conformance tests read their fixtures from
           # tests/; nothing in the suite reads a clock or the environment.
           MIRIFLAGS: -Zmiri-disable-isolation
-        run: cargo "+$NIGHTLY_TOOLCHAIN" miri nextest run --locked --all-features -j "$(nproc)"
+        # Miri runs the unit tests, which cover every unsafe path in the
+        # model and the coders, plus the two small coder suites. The corpus,
+        # conformance and hostile suites decode whole streams and ran past
+        # the two-hour job limit under Miri; the native lanes run them.
+        run: cargo "+" miri nextest run --locked --all-features -j "$(nproc)" -E 'kind(lib) | binary(coder_differential) | binary(encode_carryless)'
 
   # The fuzz harness library and its committed seeds: the seeds must match
   # what fuzz/src/seeds.rs generates, so a format change regenerates them.
