@@ -155,12 +155,12 @@ fn every_input_backing_decodes_the_same() {
 
     let mut with_tail = stream.clone();
     with_tail.extend_from_slice(b"next block");
-    let mut source = &with_tail[..];
+    let mut source = super::input::Lent::new(&with_tail, 9);
     {
         let mut dec = CarrylessRangeDecoder::new(&mut source).unwrap();
         check_decode_ops(&mut dec, &ops);
     }
-    assert_eq!(source, b"next block");
+    assert_eq!(source.rest(), b"next block");
 
     let mut out = vec![0u8; stream.len()];
     let mut enc = SevenZipRangeEncoder::new(SliceOutput::new(&mut out));

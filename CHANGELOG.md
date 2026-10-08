@@ -58,6 +58,13 @@ is a released version.
   errors pass through. Coder initialisation reports the reader's own error
   instead of `Truncated`.
 - `RangeCoderState::new`, to build carry-less coder registers directly.
+- Any `ByteSource`, owned or `&mut`, converts into a coder input, so
+  `CarrylessRangeDecoder::new(source)` takes an owned source and
+  `SourceInput::into_parts` gives it back with its count of zeros fed past
+  the end. `SourceInput` documents its calls into the source as guarantees:
+  one `fill_buf` per window, the first byte of every span taken at once, and
+  exactly one empty span per zero fed past the end. `&[u8]` is no longer a
+  `ByteSource`; a slice reads through `SliceInput`, as before.
 - A RAR PPMd end marker reached after the coder ran past its input is
   `Error::Truncated`, not the end of the data.
 - The fuzz harness, the hostile-input and conformance suites, `ppmd-bench

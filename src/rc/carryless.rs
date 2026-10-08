@@ -72,6 +72,12 @@ impl<I: RangeInput> CarrylessRangeDecoder<I> {
     /// `range = 0xFFFFFFFF`, and four big-endian bytes into `code` (RAR's
     /// `InitDecoder`). Any code is accepted, as unrar accepts it.
     ///
+    /// `input` is a `&[u8]`, any [`ByteSource`](super::ByteSource) (moved in,
+    /// or `&mut` to keep it), or an explicit [`RangeInput`]. An owned source
+    /// comes back through [`into_input`](Self::into_input) and
+    /// [`SourceInput::into_parts`](super::SourceInput::into_parts); on an
+    /// error it is dropped, so pass `&mut source` if it must outlive one.
+    ///
     /// Errors: [`Error::Truncated`] if the input holds fewer than four bytes.
     pub fn new<T: IntoRangeInput<Input = I>>(input: T) -> Result<Self> {
         let mut input = input.into_range_input();

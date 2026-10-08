@@ -63,8 +63,11 @@ pub trait RangeInput {
 }
 
 /// Converts a value into the [`RangeInput`] a decoder reads from, so the
-/// decoder constructors take `&[u8]`, `&mut impl ByteSource` or an explicit
-/// input alike.
+/// decoder constructors take `&[u8]`, any [`ByteSource`] (owned or `&mut`)
+/// or an explicit input alike.
+///
+/// A `&[u8]` becomes a [`SliceInput`] and a [`ByteSource`] a
+/// [`SourceInput`] over it.
 pub trait IntoRangeInput {
     /// The input this value becomes.
     type Input: RangeInput;
@@ -299,27 +302,31 @@ impl<R: Read> IntoRangeInput for ReadInput<R> {
 ///
 /// The same contract as [`std::io::BufRead`], without errors: a source that
 /// fails returns an empty span and reports its failure through its own API.
+///
+/// A slice is not a `ByteSource`: pass `&[u8]` to a decoder directly and it
+/// reads through [`SliceInput`], with no window copies.
+///
+/// # Lending a span or falling back to one byte
+///
+/// A source that lends its own buffer when it can and otherwise produces one
+/// byte at a time (a bit reader off a byte boundary, say) can stage that byte
+/// in a one-byte array it owns and return a slice of it: [`SourceInput`]
+/// takes the first byte of every non-empty span at once (see its
+/// guarantees), so the staged byte is consumed by the next call. Written as
+/// `if !span().is_empty() { return span(); }`, the lending path calls the
+/// span accessor twice; that is the borrow checker's limit on returning a
+/// borrow conditionally, not this trait's, and the second call is usually
+/// an inlined field read.
 pub trait ByteSource {
     /// Lends the bytes available at the current position without consuming
-    /// them. An empty span means the input has ended.
+    /// them. An empty span means the input has ended, for now: a later call
+    /// may return bytes again.
     fn fill_buf(&mut self) -> &[u8];
 
     /// Marks the first `amount` bytes of the span last returned by
     /// [`fill_buf`](Self::fill_buf) as consumed. `amount` never exceeds that
     /// span's length.
     fn consume(&mut self, amount: usize);
-}
-
-impl ByteSource for &[u8] {
-    #[inline]
-    fn fill_buf(&mut self) -> &[u8] {
-        self
-    }
-
-    #[inline]
-    fn consume(&mut self, amount: usize) {
-        *self = self.get(amount..).unwrap_or_default();
-    }
 }
 
 impl<T: ByteSource + ?Sized> ByteSource for &mut T {
@@ -340,10 +347,26 @@ impl<T: ByteSource + ?Sized> ByteSource for &mut T {
 /// comparison and a masked (so unchecked-by-construction) array load, and the
 /// source is called only when the window is used up. The window's bytes are
 /// lent, not consumed: the source consumes a window when the next one is
-/// fetched, and on drop it consumes exactly the bytes taken, so it is left
-/// positioned right after the last byte the coder read.
+/// fetched, and on drop (or [`into_parts`](Self::into_parts)) it consumes
+/// exactly the bytes taken, so it is left positioned right after the last
+/// byte the coder read.
+///
+/// # Guarantees to the source
+///
+/// - [`fill_buf`](ByteSource::fill_buf) is called only when the window is
+///   used up and a byte is wanted, once per window, and never otherwise.
+/// - The first byte of a non-empty span is taken by that same call: a span
+///   is never fetched and then left unread.
+/// - Each call that returns an empty span feeds exactly one zero past the
+///   end, and each zero fed past the end comes from exactly one such call.
+///   So a source can count the zeros itself, one per empty span it returns.
+/// - [`consume`](ByteSource::consume) is called with the bytes taken from the
+///   previous span (0 after an empty one) just before each `fill_buf`, and
+///   once more on drop or [`into_parts`](Self::into_parts) with the bytes
+///   taken from the current one. It never exceeds that span's length.
 pub struct SourceInput<S: ByteSource> {
-    source: S,
+    /// Always `Some` until [`into_parts`](Self::into_parts) takes it.
+    source: Option<S>,
     window: [u8; WINDOW],
     window_len: usize,
     window_pos: usize,
@@ -355,7 +378,7 @@ impl<S: ByteSource> SourceInput<S> {
     /// Reads `source` from its current position.
     pub fn new(source: S) -> Self {
         Self {
-            source,
+            source: Some(source),
             window: [0; WINDOW],
             window_len: 0,
             window_pos: 0,
@@ -366,7 +389,21 @@ impl<S: ByteSource> SourceInput<S> {
 
     /// The source. Bytes in the current window are not yet consumed from it.
     pub fn source(&self) -> &S {
-        &self.source
+        self.source
+            .as_ref()
+            .expect("the source is only taken by into_parts")
+    }
+
+    /// Consumes the bytes taken from the current window and gives back the
+    /// source, positioned right after the last byte the coder read, with the
+    /// number of zeros fed past its end.
+    pub fn into_parts(mut self) -> (S, u32) {
+        let mut source = self
+            .source
+            .take()
+            .expect("the source is only taken by into_parts");
+        source.consume(self.window_pos);
+        (source, self.zero_bytes_past_eof)
     }
 
     /// Consumes the current window from the source and copies the next one
@@ -375,9 +412,13 @@ impl<S: ByteSource> SourceInput<S> {
     #[cold]
     #[inline(never)]
     fn refill(&mut self) -> u8 {
-        self.source.consume(self.window_len);
+        let source = self
+            .source
+            .as_mut()
+            .expect("the source is only taken by into_parts");
+        source.consume(self.window_len);
         self.consumed_before_window += self.window_len;
-        let available = self.source.fill_buf();
+        let available = source.fill_buf();
         let len = available.len().min(WINDOW);
         self.window[..len].copy_from_slice(&available[..len]);
         self.window_len = len;
@@ -418,15 +459,21 @@ impl<S: ByteSource> RangeInput for SourceInput<S> {
 
 impl<S: ByteSource> Drop for SourceInput<S> {
     fn drop(&mut self) {
-        self.source.consume(self.window_pos);
+        if let Some(source) = self.source.as_mut() {
+            source.consume(self.window_pos);
+        }
     }
 }
 
-impl<'a, S: ByteSource + ?Sized> IntoRangeInput for &'a mut S {
-    type Input = SourceInput<&'a mut S>;
+/// Any source, owned or borrowed: `&mut S` is a [`ByteSource`] too, so
+/// `CarrylessRangeDecoder::new(&mut source)` leaves `source` usable after
+/// the decoder is dropped, and `CarrylessRangeDecoder::new(source)` moves it
+/// in (get it back with [`SourceInput::into_parts`]).
+impl<S: ByteSource> IntoRangeInput for S {
+    type Input = SourceInput<S>;
 
     #[inline]
-    fn into_range_input(self) -> SourceInput<&'a mut S> {
+    fn into_range_input(self) -> SourceInput<S> {
         SourceInput::new(self)
     }
 }
@@ -437,6 +484,57 @@ impl<S: ByteSource> IntoRangeInput for SourceInput<S> {
     #[inline]
     fn into_range_input(self) -> Self {
         self
+    }
+}
+
+/// A test source over a slice that lends at most `span` bytes at a time and
+/// counts its calls.
+#[cfg(test)]
+pub(crate) struct Lent<'a> {
+    pub(crate) data: &'a [u8],
+    span: usize,
+    last: usize,
+    pub(crate) fills: usize,
+    pub(crate) empty_fills: u32,
+}
+
+#[cfg(test)]
+impl<'a> Lent<'a> {
+    pub(crate) fn new(data: &'a [u8], span: usize) -> Self {
+        Self {
+            data,
+            span,
+            last: 0,
+            fills: 0,
+            empty_fills: 0,
+        }
+    }
+
+    /// The bytes not yet consumed.
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        self.data
+    }
+}
+
+#[cfg(test)]
+impl ByteSource for Lent<'_> {
+    fn fill_buf(&mut self) -> &[u8] {
+        self.fills += 1;
+        self.last = self.data.len().min(self.span);
+        if self.last == 0 {
+            self.empty_fills += 1;
+        }
+        &self.data[..self.last]
+    }
+
+    fn consume(&mut self, amount: usize) {
+        assert!(
+            amount <= self.last,
+            "consumed {amount} of a {}-byte span",
+            self.last
+        );
+        self.data = &self.data[amount..];
+        self.last -= amount;
     }
 }
 
@@ -518,26 +616,118 @@ mod tests {
     #[test]
     fn source_input_leaves_the_source_after_the_last_byte_taken() {
         let data: Vec<u8> = (0..=255u8).cycle().take(WINDOW * 3 + 5).collect();
-        let mut source = &data[..];
+        let mut source = Lent::new(&data, usize::MAX);
         {
             let mut input = (&mut source).into_range_input();
             let got = drain(&mut input, WINDOW + 10);
             assert_eq!(got, data[..WINDOW + 10]);
             assert_eq!(input.position(), WINDOW + 10);
         }
-        assert_eq!(source, &data[WINDOW + 10..]);
+        assert_eq!(source.rest(), &data[WINDOW + 10..]);
     }
 
     #[test]
     fn source_input_feeds_zeros_past_the_end() {
         let data = [9u8, 8, 7];
-        let mut source = &data[..];
+        let mut source = Lent::new(&data, usize::MAX);
         {
             let mut input = SourceInput::new(&mut source);
             assert_eq!(drain(&mut input, 5), [9, 8, 7, 0, 0]);
             assert_eq!(input.position(), 3);
             assert_eq!(input.zero_bytes_past_eof(), 2);
         }
-        assert!(source.is_empty());
+        assert!(source.rest().is_empty());
+    }
+
+    /// The documented call pattern: one `fill_buf` per window and one empty
+    /// span per zero fed past the end, also when the source ends, resumes
+    /// and ends again, and for every span size across the window size.
+    #[test]
+    fn source_input_fetches_one_empty_span_per_zero_past_the_end() {
+        let data: Vec<u8> = (0..700u32).map(|i| (i * 13 + 1) as u8).collect();
+        for span in [1, 2, 7, WINDOW - 1, WINDOW, WINDOW + 1, usize::MAX] {
+            let mut source = Lent::new(&data[..300], span);
+            let mut input = SourceInput::new(&mut source);
+            assert_eq!(drain(&mut input, 304), [&data[..300], &[0; 4][..]].concat());
+            let source = input.source.as_mut().unwrap();
+            assert_eq!(source.empty_fills, 4, "span {span}");
+            // More data arrives: the next fetch lends it, and the count of
+            // empty spans keeps matching the count of zeros.
+            source.data = &data[300..700];
+            assert_eq!(drain(&mut input, 400), &data[300..700]);
+            assert_eq!(drain(&mut input, 3), [0; 3]);
+            assert_eq!(input.zero_bytes_past_eof(), 7);
+            let (source, zeros) = input.into_parts();
+            assert_eq!((source.empty_fills, zeros), (7, 7), "span {span}");
+            assert!(source.rest().is_empty());
+            // One fetch per window and one per zero, and no others.
+            let w = span.min(WINDOW);
+            let windows = 300usize.div_ceil(w) + 400usize.div_ceil(w);
+            assert_eq!(source.fills, windows + 7, "span {span}");
+        }
+    }
+
+    /// An owned source moves into a decoder and comes back with
+    /// `into_parts`, positioned after the coder's bytes.
+    #[test]
+    fn an_owned_source_comes_back_from_the_decoder() {
+        let mut data = vec![0u8, 0x12, 0x34, 0x56, 0x78];
+        data.extend_from_slice(b"tail");
+        let dec = crate::rc::RarRangeDecoder::new(Lent::new(&data, 3)).unwrap();
+        let (source, zeros) = dec.into_input().into_parts();
+        assert_eq!(source.rest(), b"\x78tail");
+        assert_eq!(zeros, 0);
+
+        let dec = crate::rc::RarRangeDecoder::new(Lent::new(&data[..2], 3));
+        assert!(matches!(dec, Err(crate::Error::Truncated)));
+    }
+
+    /// A source that lends its buffer when it can and otherwise stages one
+    /// byte in itself, as the type's docs describe; every staged byte is
+    /// taken by the fetch that returned it.
+    #[test]
+    fn a_staged_one_byte_span_is_always_taken() {
+        struct Staged<'a> {
+            data: &'a [u8],
+            byte: [u8; 1],
+            staged: bool,
+            fetches: usize,
+        }
+        impl ByteSource for Staged<'_> {
+            fn fill_buf(&mut self) -> &[u8] {
+                assert!(!self.staged, "a staged byte was fetched twice");
+                self.fetches += 1;
+                // Lend on even fetches, stage one byte on odd ones.
+                if self.fetches.is_multiple_of(2) {
+                    return self.data;
+                }
+                match self.data.split_first() {
+                    Some((&b, _)) => {
+                        self.byte[0] = b;
+                        self.staged = true;
+                        &self.byte
+                    }
+                    None => &[],
+                }
+            }
+            fn consume(&mut self, amount: usize) {
+                if self.staged {
+                    assert!(amount <= 1);
+                    self.staged = amount == 0;
+                }
+                self.data = &self.data[amount..];
+            }
+        }
+        let data: Vec<u8> = (0..600u32).map(|i| i as u8 ^ 0x5A).collect();
+        let mut source = Staged {
+            data: &data,
+            byte: [0],
+            staged: false,
+            fetches: 0,
+        };
+        let mut input = SourceInput::new(&mut source);
+        assert_eq!(drain(&mut input, 600), data);
+        drop(input);
+        assert!(!source.staged && source.data.is_empty());
     }
 }
