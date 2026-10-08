@@ -68,3 +68,6 @@ is a released version.
 - Decode: the escape decode gathers the unmasked states without a branch
   per state, 1.2-1.35x faster on binary and mixed input (7z binary order 6:
   1293M to 911M cycles) and unchanged on text.
+- Decode: the escape decode sums the unmasked frequencies in a first pass
+  and walks the states again only to select or mask, 4-9% fewer cycles on
+  binary and mixed input and unchanged on text.

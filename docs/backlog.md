@@ -255,6 +255,12 @@ Every item below lists the same fields:
   and kept by adding its unmasked bit to the index), which was 47% of the
   samples on binary input. 7z binary order 6, 1 MiB: 1293M to 911M cycles
   (ppmd-rust 811M); carry-less binary order 6: 1.33x, mixed: 1.21x.
+- **Done (two passes), 0.1.0:** the first pass only sums the unmasked
+  frequencies (no scratch store); selection re-walks the states and an
+  escape stamps every state, and the scratch gather is kept only for an
+  inconsistent model. 4 MiB, cycles: binary order 6 3925M to 3841M (7z
+  4017M to 3761M), mixed order 6 4251M to 3890M, mixed order 32 1.08x;
+  7% fewer instructions; text unchanged.
 
 ### D9. Wide loads for context heads and successors
 
