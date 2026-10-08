@@ -21,13 +21,10 @@
 /fuzz/seeds/
 /fuzz/regressions/
 
-# Benchmark fixtures are generated locally. Results are too, except each
-# run's report.md and report.json, which are committed as the record.
+# Benchmark fixtures and results are generated locally and never committed:
+# a run's report names the host it ran on.
 /bench/fixtures/
-/bench/results/**
-!/bench/results/*/
-!/bench/results/*/report.md
-!/bench/results/*/report.json
+/bench/results/
 /bench/ppmd-turbo-bench/ppmd-turbo-bench
 /bench/ppmd-turbo-bench/ppmd-turbo-bench.exe
 
