@@ -137,6 +137,10 @@ jobs:
       - name: Set up Miri
         run: cargo "+$NIGHTLY_TOOLCHAIN" miri setup
       - name: Miri
+        env:
+          # The hostile and conformance tests read their fixtures from
+          # tests/; nothing in the suite reads a clock or the environment.
+          MIRIFLAGS: -Zmiri-disable-isolation
         run: cargo "+$NIGHTLY_TOOLCHAIN" miri nextest run --locked --all-features -j "$(nproc)"
 
   # The fuzz harness library and its committed seeds: the seeds must match

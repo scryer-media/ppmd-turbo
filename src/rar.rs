@@ -349,6 +349,10 @@ mod tests {
         /// the coder's interval every few thousand symbols; each time, decoding
         /// carries on with a fresh coder over the same, uncleaned model.
         #[test]
+        #[cfg_attr(
+            miri,
+            ignore = "needs over 250k symbols to fill the arena; the fuzz and ASan lanes cover it"
+        )]
         fn arena_exhaustion_and_reuse_after_errors_never_panic() {
             let data = noise(1 << 20, 0x9E37_79B9);
             let mut decoder = RarDecoder::new();
@@ -385,7 +389,10 @@ mod tests {
             let data = noise(1 << 12, 0x0BAD_5EED);
             let mut decoder = RarDecoder::new();
             let mut out = Vec::new();
-            for round in 0..500u32 {
+            // Under Miri, enough rounds to cover every reset, cleanup and
+            // arena-size change at least twice.
+            let rounds = if cfg!(miri) { 30 } else { 500 };
+            for round in 0..rounds {
                 let order = 2 + round % 63;
                 let mem_mb = 1 + round % 3;
                 let start = (round as usize * 7) % 2048;
@@ -421,7 +428,8 @@ mod tests {
         fn arbitrary_blocks_never_panic() {
             let mut decoder = RarDecoder::new();
             let mut out = Vec::new();
-            for seed in 1..200u32 {
+            let seeds: u32 = if cfg!(miri) { 16 } else { 200 };
+            for seed in 1..seeds {
                 let data = noise(256, seed.wrapping_mul(0x9E37_79B9));
                 out.clear();
                 let _ =

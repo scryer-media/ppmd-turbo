@@ -170,8 +170,11 @@ fn z7_bit_flips_are_errors_or_full_length() {
 
 #[test]
 fn rar_bit_flips_are_bounded() {
+    // Miri flips the first 8 bytes, which cover the coder's initialisation
+    // and the first symbols; native runs flip the first 64.
+    let bytes = if cfg!(miri) { 8 } else { 64 };
     for f in fixtures_of(Coder::CarryLess) {
-        for i in 0..f.stream.len().min(64) {
+        for i in 0..f.stream.len().min(bytes) {
             for mask in [0x01, 0x80, 0xFF] {
                 let mut s = f.stream.clone();
                 s[i] ^= mask;
