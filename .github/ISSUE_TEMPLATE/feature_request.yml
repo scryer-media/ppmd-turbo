@@ -1,0 +1,10 @@
+name: Feature request
+description: A framing, an API or a platform the crate should support.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need and why
+    validations:
+      required: true

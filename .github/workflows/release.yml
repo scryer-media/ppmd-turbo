@@ -1,0 +1,230 @@
+name: release
+
+# Two ways in, the same checks and the same publish:
+#
+# - Run from the Actions tab (workflow_dispatch) on main with the version to
+#   release. The run refuses unless that commit already passed ci.yml, then
+#   publishes the crate to crates.io through trusted publishing and creates
+#   the tag v<version> and the GitHub release. dry_run (the default) stops
+#   after the checks.
+# - Push a signed tag v<version> on main. The run tests the tag itself, then
+#   publishes the same way.
+#
+# crates.io's trusted publisher is registered to this file's name and the
+# crates-io environment, so both ways have to stay in this one workflow.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, exactly as in Cargo.toml (e.g. 0.1.0)"
+        required: true
+        type: string
+      dry_run:
+        description: "Run the checks only; publish nothing"
+        required: true
+        type: boolean
+        default: true
+
+concurrency:
+  group: ppmd-turbo-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.97.1
+  CRATE: ppmd-turbo
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      checks: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: The version being released
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            version="$INPUT_VERSION"
+            if [ "$GITHUB_REF" != refs/heads/main ]; then
+              echo "::error::a release is dispatched from main, not $GITHUB_REF"
+              exit 1
+            fi
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$version' is not a version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: The manifest has this version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          manifest="$(cargo pkgid -p "$CRATE" | sed 's/.*[#@]//')"
+          echo "manifest $manifest, releasing $VERSION"
+          test "$manifest" = "$VERSION"
+      - name: The changelog has a dated section for this version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          heading="$(grep -m1 "^## .*$VERSION" CHANGELOG.md || true)"
+          echo "$heading"
+          test -n "$heading"
+          ! echo "$heading" | grep -qi unreleased
+      # A dispatched release creates the tag itself. One already on GitHub is
+      # fine only at this commit: a release that stopped after the tag.
+      - name: No tag for this version at another commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # The peeled line (^{}) names an annotated tag's commit; sorting puts
+          # it last, so it wins over the tag object's own id.
+          tagged="$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | sort -k2 | tail -n1 | cut -f1)"
+          if [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "::error::v$VERSION already tags $tagged, not $GITHUB_SHA"
+            exit 1
+          fi
+          echo "tag v$VERSION: ${tagged:-not yet created}"
+      # A dispatched release does not rerun the platform matrix; it takes
+      # ci.yml's verdict on this exact commit, which covers every platform,
+      # wasm, the MSRV and the package.
+      - name: This commit already passed CI
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
+            --jq '.check_runs[] | "\(.name)\t\(.conclusion)"' > "$RUNNER_TEMP/checks.tsv"
+          cat "$RUNNER_TEMP/checks.tsv"
+          conclusion="$(awk -F'\t' '$1 == "ci-complete" {print $2; exit}' "$RUNNER_TEMP/checks.tsv")"
+          if [ "$conclusion" != success ]; then
+            echo "::error::ci-complete on $GITHUB_SHA is '${conclusion:-absent}', not success; wait for ci.yml or fix it"
+            exit 1
+          fi
+      - name: Test
+        if: github.event_name == 'push'
+        run: cargo test --locked --workspace --all-features --no-fail-fast
+      # semver-checks needs a published baseline. The first release has none,
+      # so the check starts with the second.
+      - name: Is there a published baseline
+        id: baseline
+        run: |
+          code="$(curl -s -o /dev/null -w '%{http_code}' -A "$CRATE release workflow" "https://crates.io/api/v1/crates/$CRATE")"
+          echo "crates.io answered $code"
+          if [ "$code" = 200 ]; then echo "exists=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        if: steps.baseline.outputs.exists == 'true'
+        with:
+          tool: cargo-semver-checks@0.50.0
+      - name: The public API changed no more than the version says
+        if: steps.baseline.outputs.exists == 'true'
+        run: cargo semver-checks -p "$CRATE"
+      - name: Package
+        run: cargo publish -p "$CRATE" --locked --dry-run
+
+  publish:
+    name: publish to crates.io
+    needs: verify
+    if: >-
+      !cancelled() && !inputs.dry_run
+      && needs.verify.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # The first release is uploaded from the maintainer's machine, because
+      # trusted publishing needs the crate to exist already. The
+      # tag still lands here, and a dispatched release can be rerun after a
+      # later step failed, so an upload that is already there is not an error.
+      - name: Is this version already on crates.io
+        id: exists
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          code="$(curl -s -o /dev/null -w '%{http_code}' -A "$CRATE release workflow" "https://crates.io/api/v1/crates/$CRATE/$VERSION")"
+          echo "crates.io answered $code"
+          if [ "$code" = 200 ]; then echo "published=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        if: steps.exists.outputs.published != 'true'
+        id: auth
+      - name: Publish
+        if: steps.exists.outputs.published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p "$CRATE" --locked --no-verify
+
+  github-release:
+    name: github release
+    needs: [verify, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Release notes from the changelog
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          # The section whose heading names the version; failing that, the
+          # first section of the file.
+          awk -v ver="$VERSION" '/^## /{ if (found) exit; if (index($0, ver)) found=1; next } found' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            awk 'NR>1 && /^## /{ n++; if (n==2) exit } n==1' CHANGELOG.md > notes.md
+          fi
+          cat notes.md
+      # A pushed tag already exists; a dispatched release creates v<version>
+      # at the commit it checked. A tag created with this job's token starts
+      # no workflow, so this does not run the release a second time.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "release v$VERSION already exists"
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            target=(--target "$GITHUB_SHA")
+          else
+            target=(--verify-tag)
+          fi
+          gh release create "v$VERSION" "${target[@]}" \
+            --title "$CRATE $VERSION" \
+            --notes-file notes.md

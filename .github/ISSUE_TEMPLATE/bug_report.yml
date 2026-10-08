@@ -1,0 +1,28 @@
+name: Bug report
+description: Output that differs from 7-Zip or unrar, a panic, a crash or a build failure.
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: ppmd-turbo version
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The framing (7z or RAR), the order and memory size, what you expected and what you got. Include any panic message.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The stream (or how it was generated) and the calls made. Never attach private data.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform (OS, CPU, rustc version)

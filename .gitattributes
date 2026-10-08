@@ -1,0 +1,5 @@
+*.txt text eol=lf
+# Fixture streams are compared byte for byte.
+*.bin binary
+*.7z binary
+*.rar binary

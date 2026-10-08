@@ -1,0 +1,51 @@
+[package]
+name = "ppmd-turbo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+authors = ["NZB Man"]
+license = "MIT OR Apache-2.0"
+keywords = ["ppmd", "compression", "7z", "rar", "decompression"]
+categories = ["compression", "encoding"]
+homepage = "https://github.com/scryer-media/ppmd-turbo"
+repository = "https://github.com/scryer-media/ppmd-turbo"
+description = "PPMd variant H (Ppmd7) compression and decompression, bit-exact with 7-Zip and RAR, performance-first"
+readme = "README.md"
+# Repository scaffolding that has no business in the crate archive.
+exclude = [
+    ".github/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md",
+    "bench/", "docs/", "fuzz/", "tools/", "rust-toolchain.toml", "rustfmt.toml",
+]
+
+[features]
+
+[dependencies]
+
+[dev-dependencies]
+
+# Repository tools (oracles, bench drivers) join as `tools/<name>` members so
+# their dependencies never reach this crate's own graph. The fuzz harness is
+# its own workspace, built on nightly by cargo-fuzz.
+[workspace]
+members = []
+exclude = ["fuzz"]
+resolver = "3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = 3
+
+# Benchmarks and profiling want symbols without giving up codegen.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = 1
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
