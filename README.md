@@ -10,11 +10,11 @@ estimation, both range coders that carry it (RAR's carry-less coder and
 
 ## Status
 
-Pre-release. The crate is a skeleton; the API is unstable until 1.0.
+Pre-release. The API is unstable until 1.0.
 
 | Format | Decode | Encode |
 | --- | --- | --- |
-| RAR 2.9/3.x PPMd blocks (RAR3) | planned | planned |
+| RAR 2.9-4.x PPMd blocks (RAR3) | implemented | planned |
 | RAR5 | not applicable: RAR5 has no PPMd | not applicable |
 | 7z `PPMD` method | planned | planned |
 

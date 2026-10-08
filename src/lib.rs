@@ -4,7 +4,7 @@
 //! sub-allocator and secondary escape estimation, and the two range coders
 //! that carry it in the wild:
 //!
-//! - the carry-less range coder RAR 2.9/3.x uses for its PPMd blocks, and
+//! - the carry-less range coder RAR 2.9 through 4.x uses for its PPMd blocks, and
 //! - the LZMA-style range coder 7-Zip uses for the `PPMD` method in `.7z`.
 //!
 //! Both framings are covered for decoding and encoding. Output is bit-exact
@@ -12,20 +12,21 @@
 //! 7-Zip's for the same parameters, and a RAR stream decodes to exactly what
 //! unrar produces.
 //!
-//! The crate is pre-release. Every module below is a placeholder that states
-//! what it will hold; the API is unstable until 1.0.
+//! The crate is pre-release and the API is unstable until 1.0. RAR decoding
+//! ([`rar`]: RAR 2.9 through 4.x; RAR5 has no PPMd) is implemented; the 7z
+//! framing ([`ppmd7`]) and both encoders are still to come.
 //!
 //! `unsafe` is permitted where it pays for itself, and only with a
 //! `// SAFETY:` proof on every block, Miri coverage where Miri can run, and a
 //! fuzz target over every decoder and encoder entry point.
 
-pub mod alloc;
+pub(crate) mod alloc;
 pub mod error;
 pub mod model;
 pub mod ppmd7;
 pub mod rar;
 pub mod rc;
-pub mod see;
+pub(crate) mod see;
 
 pub use error::{Error, Result};
 
