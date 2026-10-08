@@ -137,6 +137,85 @@ pub struct Model {
     restarts: u32,
 }
 
+// --- D11 escape pass: collect the unmasked states of a masked context ---
+
+/// The escape pass's first loop, in the reference's shape: walk the states in
+/// order, append every state whose symbol is not masked to `scratch` until
+/// `n` are found, and return their frequency total. `None` when the context
+/// holds fewer than `n` unmasked states (a corrupt model).
+///
+/// Kept as the fallback for any context the fast path cannot vouch for and
+/// as the oracle the fast paths are tested against.
+#[cold]
+#[inline(never)]
+fn collect_unmasked_reference(
+    alloc: &SubAllocator,
+    char_mask: &[u8; 256],
+    scratch: &mut [u32; 256],
+    states: ValidatedArenaSpan,
+    ns: usize,
+    n: usize,
+    esc_count: u8,
+) -> Option<u32> {
+    let mut hi_cnt = 0u32;
+    let mut state_index = 0usize;
+    for slot in scratch.iter_mut().take(n) {
+        let head = loop {
+            if state_index >= ns {
+                return None;
+            }
+            let head = alloc.span_read_u16(states, state_index * STATE_SIZE);
+            if char_mask[head as u8 as usize] != esc_count {
+                break head;
+            }
+            state_index += 1;
+        };
+        hi_cnt += u32::from(head >> 8);
+        *slot = pack_unmasked_state(state_index, head);
+        state_index += 1;
+    }
+    Some(hi_cnt)
+}
+
+/// Branch-free escape collection: every state is written to the next scratch
+/// slot and the slot index advances only when the state is unmasked, so the
+/// loop has no data-dependent branch (the reference's per-state mask test
+/// mispredicts on almost every state of a wide, partly masked context).
+///
+/// It scans all `ns` states instead of stopping at the `n`-th unmasked one.
+/// In a consistent model a context holds exactly `n` unmasked states (its
+/// suffix holds every symbol the masked children held), so the result is the
+/// reference's; any other count falls back to the reference, which keeps the
+/// result identical even on a model the invariant does not cover.
+#[inline(always)]
+fn collect_unmasked(
+    alloc: &SubAllocator,
+    char_mask: &[u8; 256],
+    scratch: &mut [u32; 256],
+    states: ValidatedArenaSpan,
+    ns: usize,
+    n: usize,
+    esc_count: u8,
+) -> Option<u32> {
+    debug_assert!(ns <= 256 && n <= ns);
+    let mut found = 0usize;
+    let mut hi_cnt = 0u32;
+    for state_index in 0..ns {
+        let head = alloc.span_read_u16(states, state_index * STATE_SIZE);
+        let unmasked = char_mask[head as u8 as usize] != esc_count;
+        // `found <= state_index < ns <= 256`, so the mask is only there to
+        // let the compiler drop the bounds check.
+        scratch[found & 0xff] = pack_unmasked_state(state_index, head);
+        found += usize::from(unmasked);
+        hi_cnt += u32::from(head >> 8) & u32::from(unmasked).wrapping_neg();
+    }
+    if found == n {
+        Some(hi_cnt)
+    } else {
+        collect_unmasked_reference(alloc, char_mask, scratch, states, ns, n, esc_count)
+    }
+}
+
 // --- Helpers for converting between NodeRef and byte offsets ---
 
 #[inline]
@@ -983,71 +1062,18 @@ impl Model {
         // the arena and are cheap to reload on the selection pass. Reusing the
         // model-owned array avoids zeroing a padded 2 KiB stack allocation on
         // every escape decode.
-        let mut hi_cnt = 0u32;
         let esc_count = self.esc_count;
-        let alloc = &self.alloc;
-        let char_mask = &self.char_mask;
-        let scratch = &mut self.unmasked_scratch[..n];
-
-        #[cfg(all(target_arch = "aarch64", not(miri)))]
-        {
-            let mut state_index = 0usize;
-            let mut scratch_index = 0usize;
-            while state_index + 8 <= ns as usize && scratch_index < n {
-                let heads = alloc.span_read_state_heads8(states_span, state_index * STATE_SIZE);
-                for (lane, head) in heads.into_iter().enumerate() {
-                    let sym = head as u8;
-                    if char_mask[sym as usize] != esc_count {
-                        hi_cnt += (head >> 8) as u32;
-                        scratch[scratch_index] = pack_unmasked_state(state_index + lane, head);
-                        scratch_index += 1;
-                        if scratch_index == n {
-                            break;
-                        }
-                    }
-                }
-                state_index += 8;
-            }
-            while scratch_index < n {
-                if state_index >= ns as usize {
-                    return false;
-                }
-                let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-                let sym = head as u8;
-                if char_mask[sym as usize] != esc_count {
-                    hi_cnt += (head >> 8) as u32;
-                    scratch[scratch_index] = pack_unmasked_state(state_index, head);
-                    scratch_index += 1;
-                }
-                state_index += 1;
-            }
-        }
-
-        // Every target except NEON aarch64 walks the states one at a time. A
-        // pshufb gather feeding a scalar per-lane test measured as pure
-        // instruction bloat on x86-64 (more work per state than this loop),
-        // so x86-64 shares the plain scalar shape of the reference.
-        #[cfg(any(not(target_arch = "aarch64"), miri))]
-        {
-            let mut state_index = 0usize;
-            for slot in scratch.iter_mut() {
-                let head = loop {
-                    if state_index >= ns as usize {
-                        return false;
-                    }
-                    let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-                    let sym = head as u8;
-                    if char_mask[sym as usize] != esc_count {
-                        break head;
-                    }
-                    state_index += 1;
-                };
-
-                hi_cnt += (head >> 8) as u32;
-                *slot = pack_unmasked_state(state_index, head);
-                state_index += 1;
-            }
-        }
+        let Some(hi_cnt) = collect_unmasked(
+            &self.alloc,
+            &self.char_mask,
+            &mut self.unmasked_scratch,
+            states_span,
+            ns as usize,
+            n,
+            esc_count,
+        ) else {
+            return false;
+        };
         let scale = esc_freq + hi_cnt;
         let count = rc.get_threshold(scale);
         if count >= scale {
