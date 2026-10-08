@@ -300,28 +300,6 @@ mod escape_neon {
         }
     }
 
-    /// The frequency total of all `ns` states (`ns >= MIN_STATES`).
-    #[inline(always)]
-    pub(super) fn freq_total(alloc: &SubAllocator, states: ValidatedArenaSpan, ns: usize) -> u32 {
-        // SAFETY: register-only NEON intrinsics, as in `Lookup::masked`.
-        let mut acc = unsafe { vdupq_n_u16(0) };
-        let mut index = 0usize;
-        while index + 8 <= ns {
-            let heads = alloc.span_state_heads8_neon(states, index * STATE_SIZE);
-            // SAFETY: as above. Each lane gathers at most 32 frequencies of
-            // at most 255: no overflow.
-            acc = unsafe { vsraq_n_u16::<8>(acc, heads) };
-            index += 8;
-        }
-        // SAFETY: as above.
-        let mut total = unsafe { vaddlvq_u16(acc) };
-        while index < ns {
-            total += u32::from(alloc.span_read_u16(states, index * STATE_SIZE) >> 8);
-            index += 1;
-        }
-        total
-    }
-
     /// Unmasked frequency total and unmasked state count over all `ns`
     /// states (`ns >= MIN_STATES`).
     #[inline(always)]
@@ -1111,17 +1089,6 @@ impl Model {
         }
 
         self.prev_success = 0;
-        // D11 C4: a wide context escapes when the threshold lies past every
-        // state; one vector pass over the frequencies decides that up front
-        // instead of the serial walk below reaching the last state.
-        #[cfg(all(target_arch = "aarch64", target_endian = "little", not(miri)))]
-        if ns >= escape_neon::MIN_STATES {
-            let total = escape_neon::freq_total(&self.alloc, states_span, ns);
-            if count >= total {
-                return self.symbol1_escape(rc, states_span, ns, sum_freq, total, found_span);
-            }
-        }
-
         let mut hi_cnt = p0_freq;
         let mut remaining = ns - 1;
         let mut state_index = 1usize;
@@ -1144,37 +1111,22 @@ impl Model {
             }
             remaining -= 1;
             if remaining == 0 {
-                return self.symbol1_escape(rc, states_span, ns, sum_freq, hi_cnt, found_span);
+                self.hi_bits_flag = self.hb2_flag[self.prev_sym as usize];
+                self.num_masked = ns as u32;
+                self.found_state = 0;
+                *found_span = None;
+
+                for index in (0..ns).rev() {
+                    let sym = self.span_state_sym(states_span, index);
+                    self.char_mask[sym as usize] = self.esc_count;
+                }
+
+                let escape_freq = sum_freq - hi_cnt;
+                rc.decode(hi_cnt, escape_freq);
+                return true;
             }
             state_index += 1;
         }
-    }
-
-    /// The escape out of a multi-symbol context: every state is masked and
-    /// the escape interval `[hi_cnt, sum_freq)` is consumed.
-    #[inline(always)]
-    fn symbol1_escape<R: RangeDecoder>(
-        &mut self,
-        rc: &mut R,
-        states_span: ValidatedArenaSpan,
-        ns: usize,
-        sum_freq: u32,
-        hi_cnt: u32,
-        found_span: &mut Option<ValidatedArenaSpan>,
-    ) -> bool {
-        self.hi_bits_flag = self.hb2_flag[self.prev_sym as usize];
-        self.num_masked = ns as u32;
-        self.found_state = 0;
-        *found_span = None;
-
-        for index in (0..ns).rev() {
-            let sym = self.span_state_sym(states_span, index);
-            self.char_mask[sym as usize] = self.esc_count;
-        }
-
-        let escape_freq = sum_freq - hi_cnt;
-        rc.decode(hi_cnt, escape_freq);
-        true
     }
 
     /// update1: increase freq, maintain sorted order, rescale if needed.
