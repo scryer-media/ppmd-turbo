@@ -120,4 +120,4 @@ range coder are Igor Pavlov's. See [ATTRIBUTION.md](ATTRIBUTION.md).
 
 ## Licence
 
-Licensed under the [Apache License, Version 2.0](LICENSE-Apache).
+Licensed under the [Apache License, Version 2.0](LICENSE).
