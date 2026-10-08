@@ -3,13 +3,16 @@
 //! Variant H over Dmitry Subbotin's carry-less range coder, as Dmitry
 //! Shkarin's public-domain PPMd var.H encoder writes it (the coder 7-Zip
 //! calls `Ppmd7a` and RAR 2.9 through 4.x uses inside its PPMd blocks).
-//! Nothing here derives from unrar, which has no encoder.
+//! The encode path follows 7-Zip's `Ppmd7Enc.c` and Shkarin's encoder over
+//! the crate's shared model; RARLAB's unrar has no encoder, and no RARLAB
+//! source text is used here.
 //!
 //! This is the range-coded symbol stream only: no RAR block header, no
-//! escape layer, no archive. It exists so the carry-less decoding paths
+//! escape layer, no archive. Writing RAR blocks or archives is out of scope
+//! by design. It exists so the carry-less decoding paths
 //! ([`CarrylessRangeDecoder`](crate::rc::CarrylessRangeDecoder),
 //! [`RarDecoder`](crate::rar::RarDecoder)) can be round-trip tested; it is
-//! a correctness tool, not a tuned encoder.
+//! for correctness only, never benchmarked and not a tuned encoder.
 
 use std::io::{self, Write};
 

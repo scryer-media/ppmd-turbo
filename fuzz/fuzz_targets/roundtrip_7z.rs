@@ -6,8 +6,9 @@
 //! - ppmd-rust decodes ppmd-turbo's stream back to the payload;
 //! - ppmd-turbo decodes its own stream back to the payload.
 //!
-//! Until ppmd-turbo's encoder lands, ppmd-rust's own round trip runs and
-//! ppmd-turbo decodes ppmd-rust's stream. Arenas are capped at 16 MiB.
+//! The shim routes to ppmd-turbo's encoder; the branch for a shim that
+//! returns no encoder (ppmd-rust's self round trip) is never taken. Arenas
+//! are capped at 16 MiB.
 //! Input layout: `ppmd_turbo_fuzz::layout::Roundtrip7z`.
 #![no_main]
 

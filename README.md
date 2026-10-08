@@ -14,7 +14,7 @@ Pre-release. The API is unstable until 1.0.
 
 | Format | Decode | Encode |
 | --- | --- | --- |
-| RAR 2.9-4.x PPMd blocks (RAR3) | implemented | planned |
+| RAR 2.9-4.x PPMd blocks (RAR3) | implemented | out of scope by design; a raw carry-less encoder exists for round-trip tests only |
 | RAR5 | not applicable: RAR5 has no PPMd | not applicable |
 | 7z `PPMD` method | implemented | planned |
 

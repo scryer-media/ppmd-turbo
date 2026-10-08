@@ -7,7 +7,8 @@
 //! - the carry-less range coder RAR 2.9 through 4.x uses for its PPMd blocks, and
 //! - the LZMA-style range coder 7-Zip uses for the `PPMD` method in `.7z`.
 //!
-//! Both framings are covered for decoding and encoding. Output is bit-exact
+//! Both framings are covered for decoding, and the 7z framing for encoding;
+//! writing RAR blocks or archives is out of scope by design. Output is bit-exact
 //! with RARLAB unrar and 7-Zip: a 7z stream encoded here is byte-identical to
 //! 7-Zip's for the same parameters, and a RAR stream decodes to exactly what
 //! unrar produces.
@@ -18,7 +19,8 @@
 //! ([`rar`]: RAR 2.9 through 4.x; RAR5 has no PPMd). The 7z encoder
 //! ([`Ppmd7Encoder`], or [`encode_7z`]) writes streams byte-identical to
 //! 7-Zip's. [`carryless`] writes raw carry-less streams for round-trip
-//! testing only; it never writes RAR blocks or archives.
+//! testing only (correctness only, never benchmarked); it never writes RAR
+//! blocks or archives.
 //!
 //! ```
 //! use std::io::Read;
