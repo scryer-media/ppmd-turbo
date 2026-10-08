@@ -31,7 +31,7 @@ sha2 = "0.10.9"
 # their dependencies never reach this crate's own graph. The fuzz harness is
 # its own workspace, built on nightly by cargo-fuzz.
 [workspace]
-members = ["tools/ppmd-corpus"]
+members = ["tools/ppmd-bench", "tools/ppmd-corpus"]
 exclude = ["fuzz"]
 resolver = "3"
 
