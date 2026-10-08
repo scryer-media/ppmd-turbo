@@ -68,6 +68,29 @@ covered as follows:
 - Miri and AddressSanitizer lanes;
 - out-of-process checks against `7zz` and `unrar` (`tools/ppmd-oracle`).
 
+### Fixtures
+
+The repository holds no binary files. Every fixture stream, fuzz seed and
+fuzz regression is generated from committed recipes, and one command writes
+them all:
+
+```sh
+cargo run --locked --release -p ppmd-corpus -- fixtures
+```
+
+It encodes the ppmd-rust rows in process, has 7-Zip's `7zz` write the 7-Zip
+rows, fetches the RARLAB-written and libarchive source archives of the three
+RAR rows by digest from rarpar's published test corpus (or reads them from
+`--rar-source DIR`), runs the fuzz crate's seed generator
+(`fuzz/src/seeds.rs`), and checks every file against
+`tools/ppmd-corpus/fixtures.sha256`. A missing `7zz` or source skips those
+rows with a note; `--require-all` makes that an error, as CI does.
+
+`cargo test` needs none of it to run: the ppmd-rust and hostile fixtures are
+built in memory through the same code, and the `7zz` and RAR rows are skipped
+until the command has written them (set `PPMD_TURBO_REQUIRE_FIXTURES=1` to
+fail instead).
+
 See [docs/testing.md](docs/testing.md).
 
 ## Benchmarks
