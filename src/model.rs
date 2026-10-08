@@ -191,7 +191,7 @@ impl Model {
         Ok(model)
     }
 
-    fn check_parameters(order: u32, mem_size: u32) -> Result<(usize, usize)> {
+    pub(crate) fn check_parameters(order: u32, mem_size: u32) -> Result<(usize, usize)> {
         if !(PPMD7_MIN_ORDER..=PPMD7_MAX_ORDER).contains(&order)
             || !(PPMD7_MIN_MEM_SIZE..=PPMD7_MAX_MEM_SIZE).contains(&mem_size)
         {
