@@ -106,6 +106,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ppmd-oracle"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "ppmd-rust",
+ "ppmd-turbo",
+]
+
+[[package]]
 name = "ppmd-rust"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -115,6 +124,7 @@ checksum = "196a7c80b9a7652aba7cc070827516c2abe4ccdf53d128e1944003cf5726cff1"
 name = "ppmd-turbo"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "ppmd-rust",
  "serde_json",
  "sha2",

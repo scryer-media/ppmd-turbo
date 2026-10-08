@@ -21,6 +21,20 @@ Pre-release. The API is unstable until 1.0.
 RAR streams decode to exactly what unrar produces; 7z output is byte-identical
 to 7-Zip's for the same order and memory size.
 
+## Testing
+
+Beyond unit and conformance tests, every decoder and encoder entry point is
+covered as follows:
+
+- hostile-input tests: truncation, bit flips, out-of-range parameters,
+  restart storms, size lies and a heap bound under a counting allocator;
+- six cargo-fuzz targets with committed seeds, differential against
+  ppmd-rust 1.5.0;
+- Miri and AddressSanitizer lanes;
+- out-of-process checks against `7zz` and `unrar` (`tools/ppmd-oracle`).
+
+See [docs/testing.md](docs/testing.md).
+
 ## Benchmarks
 
 The harness is a Go program under `bench/ppmd-turbo-bench`. It runs

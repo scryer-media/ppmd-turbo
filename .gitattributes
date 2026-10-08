@@ -6,3 +6,7 @@
 *.ppmd binary
 *.ppmd7a binary
 *.packed binary
+# Generated fuzz seeds and hostile-test fixtures (fuzz/src/seeds.rs).
+fuzz/seeds/** binary
+*.stream binary
+*.payload binary
