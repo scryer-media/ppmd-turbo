@@ -296,35 +296,64 @@ impl Model {
         let (esc_freq, see_index) = self.make_esc_freq2(context_head, suffix_ns, diff);
         let n = diff as usize;
 
-        // The first `n` unmasked states, as the decoder collects them, with
-        // the target's place among them.
-        let mut hi_cnt = 0u32;
-        let mut selected = None;
+        // One branch-free pass over every state, as in the decoder: the
+        // unmasked frequency sum, the unmasked count, and the target's index
+        // and the unmasked sum before it. A consistent model has exactly
+        // `ns - num_masked` unmasked states; any other count falls back to
+        // collecting the first `n`, as the decoder does.
         let esc_count = self.esc_count;
         let alloc = &self.alloc;
         let char_mask = &self.char_mask;
-        let scratch = &mut self.unmasked_scratch[..n];
-        let mut state_index = 0usize;
-        for slot in scratch.iter_mut() {
-            let head = loop {
-                if state_index >= ns as usize {
-                    self.model_fault = true;
-                    return false;
-                }
-                let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
-                if char_mask[head as u8 as usize] != esc_count {
-                    break head;
-                }
-                state_index += 1;
-            };
-            let packed = pack_unmasked_state(state_index, head);
-            let freq = u32::from(unmasked_state_frequency(packed));
-            if selected.is_none() && i32::from(unmasked_state_symbol(packed)) == target {
-                selected = Some((packed, hi_cnt));
-            }
+        let mut hi_cnt = 0u32;
+        let mut found = 0usize;
+        let mut low = 0u32;
+        let mut before = u32::MAX;
+        let mut target_index = usize::MAX;
+        for state_index in 0..ns as usize {
+            let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
+            let unmasked = char_mask[head as u8 as usize] != esc_count;
+            let freq = u32::from(head >> 8) & 0u32.wrapping_sub(u32::from(unmasked));
+            // Only the first unmasked match counts, as in the collecting
+            // loop below.
+            let hit = unmasked & (i32::from(head as u8) == target) & (before != 0);
+            before &= !0u32.wrapping_sub(u32::from(hit));
+            low += freq & before;
+            target_index = if hit { state_index } else { target_index };
             hi_cnt += freq;
-            *slot = packed;
-            state_index += 1;
+            found += usize::from(unmasked);
+        }
+        let consistent = found == n;
+        let mut selected = None;
+        if consistent {
+            if target_index != usize::MAX {
+                let head = alloc.span_read_u16(states_span, target_index * STATE_SIZE);
+                selected = Some((pack_unmasked_state(target_index, head), low));
+            }
+        } else {
+            hi_cnt = 0u32;
+            let scratch = &mut self.unmasked_scratch[..n];
+            let mut state_index = 0usize;
+            for slot in scratch.iter_mut() {
+                let head = loop {
+                    if state_index >= ns as usize {
+                        self.model_fault = true;
+                        return false;
+                    }
+                    let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
+                    if char_mask[head as u8 as usize] != esc_count {
+                        break head;
+                    }
+                    state_index += 1;
+                };
+                let packed = pack_unmasked_state(state_index, head);
+                let freq = u32::from(unmasked_state_frequency(packed));
+                if selected.is_none() && i32::from(unmasked_state_symbol(packed)) == target {
+                    selected = Some((packed, hi_cnt));
+                }
+                hi_cnt += freq;
+                *slot = packed;
+                state_index += 1;
+            }
         }
         let scale = esc_freq + hi_cnt;
 
@@ -346,9 +375,20 @@ impl Model {
         rc.encode(hi_cnt, esc_freq, scale);
         self.see_update_escape(see_index, scale);
 
+        // In a consistent model every state is masked already or one of the
+        // unmasked ones, so stamping all of them is the same mask.
         let char_mask = &mut self.char_mask;
-        for &packed in &self.unmasked_scratch[..n] {
-            char_mask[unmasked_state_symbol(packed) as usize] = esc_count;
+        if consistent {
+            for state_index in 0..ns as usize {
+                let sym = self
+                    .alloc
+                    .span_read_u8(states_span, state_index * STATE_SIZE);
+                char_mask[sym as usize] = esc_count;
+            }
+        } else {
+            for &packed in &self.unmasked_scratch[..n] {
+                char_mask[unmasked_state_symbol(packed) as usize] = esc_count;
+            }
         }
         self.num_masked = ns;
         *validated_suffix = suffix_data;

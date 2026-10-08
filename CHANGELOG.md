@@ -22,6 +22,9 @@ is a released version.
   and an opt-in `7zz` oracle (`tests/encode_oracle_7zz.rs`); the
   `roundtrip_7z` and `roundtrip_carryless` fuzz targets now run the crate's
   encoders.
+- Encode: the escape pass sums the unmasked states and finds the symbol in
+  one branch-free walk, 1.29x faster on binary input, 1.20x on mixed and
+  1.11x on 64 KiB of text.
 
 ## 0.1.0 - 2026-10-08
 

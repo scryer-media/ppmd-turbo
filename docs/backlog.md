@@ -461,6 +461,11 @@ applies to it beyond staying bit-exact.
 - **Unsafe:** Yes, for intrinsics; optional.
 - **Seen in:** 7-Zip unrolled loops; unrar-rs gathers.
 - **Measure:** encode cycles/symbol at orders 2–6 on binary data.
+- **Done (escape pass, scalar), 0.2.0:** the escape pass is one
+  branch-free walk (unmasked sum, count, the first matching state and the
+  sum before it), with the collecting loop kept for an inconsistent model.
+  1 MiB at order 6, cycles: binary 5244M to 4044M (ppmd-rust 2368M), mixed
+  4721M to 3961M (2461M); text 64 KiB 381M to 344M (303M).
 
 ### E4. Share the model fast paths with decode
 
