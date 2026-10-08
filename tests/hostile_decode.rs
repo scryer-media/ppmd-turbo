@@ -96,7 +96,6 @@ fn no_panic_reports_the_input() {
 // Truncation.
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_truncation_never_yields_wrong_output() {
     for f in fixtures_of(Coder::SevenZ) {
         for cut in cut_points(&f.name, f.stream.len()) {
@@ -115,7 +114,6 @@ fn z7_truncation_never_yields_wrong_output() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_truncation_is_bounded() {
     for f in fixtures_of(Coder::CarryLess) {
         for cut in cut_points(&f.name, f.stream.len()) {
@@ -143,7 +141,6 @@ fn rar_truncation_is_bounded() {
 // Bit flips in the first 64 bytes.
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_bit_flips_are_errors_or_full_length() {
     for f in fixtures_of(Coder::SevenZ) {
         for i in 0..f.stream.len().min(64) {
@@ -172,7 +169,6 @@ fn z7_bit_flips_are_errors_or_full_length() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_bit_flips_are_bounded() {
     for f in fixtures_of(Coder::CarryLess) {
         for i in 0..f.stream.len().min(64) {
@@ -198,7 +194,6 @@ fn rar_bit_flips_are_bounded() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_code_all_ones_at_init_is_corrupt() {
     // `Code == 0xFFFFFFFF` after the five init bytes is an error
     // (`Ppmd7z_RangeDec_Init`; backlog test 4).
@@ -216,7 +211,6 @@ fn z7_code_all_ones_at_init_is_corrupt() {
 // Parameters out of range.
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_order_and_memory_out_of_range() {
     let f = fixture("z7-text-o6-m64k");
     let known = Some(f.payload.len() as u64);
@@ -241,7 +235,6 @@ fn z7_order_and_memory_out_of_range() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_order_and_memory_out_of_range() {
     let f = fixture("cl-text-o6-m1-eos");
     // Order 1 is rejected by RAR itself (algorithms.md 5.1); the mapped
@@ -273,7 +266,6 @@ fn rar_order_and_memory_out_of_range() {
 // Tiny arenas and restarts.
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_tiny_arena_high_order_restarts_like_7zip() {
     // 16 KiB of text at order 64 in a 2 KiB arena: the model restarts over
     // and over, exactly where 7-Zip's does, so the stream ppmd-rust wrote
@@ -284,7 +276,6 @@ fn z7_tiny_arena_high_order_restarts_like_7zip() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_tiny_arena_garbage_terminates() {
     let f = fixture("z7-long-o64-m2k");
     let mut rng = Rng::new(0x6A72);
@@ -303,7 +294,6 @@ fn z7_tiny_arena_garbage_terminates() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_restart_storm() {
     // The reset flag on every block: each block rebuilds the model, and the
     // output never depends on what came before.
@@ -330,7 +320,6 @@ fn rar_restart_storm() {
 // Empty input and missing models.
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_zero_length_input() {
     let f = fixture("z7-text-o6-m64k");
     // Nothing asked for: either nothing to do, or the coder's five init
@@ -356,7 +345,6 @@ fn z7_zero_length_input() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_empty_payload_streams() {
     let f = fixture("z7-empty-o6-m64k");
     assert_eq!(decode_7z(&f, &f.stream, Some(0)).expect("sized"), b"");
@@ -365,7 +353,6 @@ fn z7_empty_payload_streams() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_zero_length_block() {
     let f = fixture("cl-text-o6-m1-eos");
     let (r, out) = decode_rar(&f, &[], 100);
@@ -387,7 +374,6 @@ fn rar_zero_length_block() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_no_reset_without_model_is_corrupt() {
     // algorithms.md 5.1: a no-reset block with no model is an error.
     let f = fixture("cl-text-o6-m1-eos");
@@ -399,7 +385,6 @@ fn rar_no_reset_without_model_is_corrupt() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_solid_continuation_after_an_error_does_not_panic() {
     let f = fixture("cl-text-o6-m1-eos");
     let mut dec = RarDecoder::new();
@@ -422,7 +407,6 @@ fn rar_solid_continuation_after_an_error_does_not_panic() {
 // Output size lies.
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_size_larger_than_payload_stops_at_end_marker() {
     let f = fixture("cl-text-o6-m1-eos");
     for remaining in [f.payload.len() as u64 + 1, 1 << 30, u64::MAX] {
@@ -433,7 +417,6 @@ fn rar_size_larger_than_payload_stops_at_end_marker() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn rar_size_larger_than_payload_without_marker_terminates() {
     // No end marker: past the real data the coder reads zero padding until
     // the guard, then reports truncation. It must stop either way.
@@ -457,7 +440,6 @@ fn rar_size_larger_than_payload_without_marker_terminates() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_size_larger_than_payload() {
     let f = fixture("z7-text-o6-m64k");
     let known = Some(f.payload.len() as u64 + 16);
@@ -471,7 +453,6 @@ fn z7_size_larger_than_payload() {
 // The carry-less coder's range below the total.
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn carryless_range_below_total_is_a_fault_not_a_division_by_zero() {
     // After normalisation the carry-less range is at least 2^15 (BOT), and
     // an escape total can reach about 39.8k (255 states near MAX_FREQ plus a
@@ -501,7 +482,6 @@ fn carryless_range_below_total_is_a_fault_not_a_division_by_zero() {
 // 7z end-marker edge cases (algorithms.md 5.2).
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_no_marker_with_known_size_decodes() {
     let f = fixture("z7-text-o6-m64k");
     let out = decode_7z(&f, &f.stream, Some(f.payload.len() as u64)).expect("decodes");
@@ -509,7 +489,6 @@ fn z7_no_marker_with_known_size_decodes() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_marker_with_unknown_size_decodes() {
     for name in ["z7-text-o6-m64k-eos", "z7-ramp-o16-m1m-eos"] {
         let f = fixture(name);
@@ -522,7 +501,6 @@ fn z7_marker_with_unknown_size_decodes() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_marker_before_known_size_is_an_error() {
     let f = fixture("z7-text-o6-m64k-eos");
     let r = decode_7z(&f, &f.stream, Some(f.payload.len() as u64 + 10));
@@ -530,7 +508,6 @@ fn z7_marker_before_known_size_is_an_error() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_data_after_marker_is_not_decoded() {
     // The decoder stops at the marker; trailing bytes are not output. The
     // packed-size check (`consumed == packSize`, algorithms.md 5.2) belongs
@@ -545,7 +522,6 @@ fn z7_data_after_marker_is_not_decoded() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_no_marker_with_unknown_size_is_an_error() {
     // Without a marker or a size the decoder runs past the data: the Extra
     // flag (read past the input) is an error, never silent garbage.

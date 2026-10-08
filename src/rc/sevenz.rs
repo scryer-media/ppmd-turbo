@@ -53,7 +53,7 @@ impl<I: RangeInput> SevenZipRangeDecoder<I> {
             code = (code << 8) | u32::from(input.next_byte());
         }
         if input.zero_bytes_past_eof() != 0 {
-            return Err(Error::Truncated);
+            return Err(input.take_io_error().map_or(Error::Truncated, Error::Io));
         }
         if first != 0 {
             return Err(corrupt("7z range coder: first byte is not zero"));
@@ -235,6 +235,12 @@ impl<O: RangeOutput> SevenZipRangeEncoder<O> {
     /// The output.
     pub fn output(&self) -> &O {
         &self.out
+    }
+
+    /// The output, mutably. Writing to it directly corrupts the stream;
+    /// it is for flushing what the coder has already settled.
+    pub fn output_mut(&mut self) -> &mut O {
+        &mut self.out
     }
 
     /// `Ppmd7z_Flush_RangeEnc` (five `ShiftLow` calls), then flushes the

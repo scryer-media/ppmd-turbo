@@ -55,9 +55,9 @@ fn failed(e: impl fmt::Display) -> CodecError {
     CodecError::Failed(e.to_string())
 }
 
-/// ppmd-turbo's 7z API has not landed. When it does, this calls the 7z
-/// encoder with `end_marker = false`, as 7-Zip writes.
-const TURBO_7Z: &str = "ppmd-turbo's 7z API has not landed";
+/// ppmd-turbo's 7z encoder has not landed. When it does, this calls it with
+/// `end_marker = false`, as 7-Zip writes.
+const TURBO_7Z_ENCODER: &str = "ppmd-turbo's 7z encoder has not landed";
 
 impl Codec {
     /// Encodes `data` with the 7z coder and no end marker, as 7-Zip does.
@@ -69,7 +69,7 @@ impl Codec {
                 enc.write_all(data).map_err(failed)?;
                 enc.finish(false).map_err(failed)
             }
-            Self::Turbo => Err(CodecError::Unavailable(TURBO_7Z)),
+            Self::Turbo => Err(CodecError::Unavailable(TURBO_7Z_ENCODER)),
         }
     }
 
@@ -95,8 +95,62 @@ impl Codec {
                 }
                 Ok(out)
             }
-            Self::Turbo => Err(CodecError::Unavailable(TURBO_7Z)),
+            Self::Turbo => ppmd_turbo::decode_7z(stream, order, mem, Some(size)).map_err(failed),
         }
+    }
+
+    /// Decodes one RAR 2.9-4.x member whose packed data starts with a
+    /// PPMd block that resets the model, through the RAR3 escape layer, to
+    /// exactly `unpacked_len` bytes. Only ppmd-turbo is wired; the
+    /// reference has no RAR framing of its own.
+    pub fn decode_rar_member(
+        self,
+        packed: &[u8],
+        unpacked_len: u64,
+    ) -> Result<Vec<u8>, CodecError> {
+        use ppmd_corpus::rar::{DEFAULT_ESC, Stop, Unescaper, ppm_header};
+        use ppmd_turbo::rar::{MAX_ZERO_BYTES_PAST_EOF, RarDecoder};
+        use ppmd_turbo::rc::RarRangeDecoder;
+
+        if self == Self::Reference {
+            return Err(CodecError::Unavailable(
+                "check-rar compares ppmd-turbo with unrar",
+            ));
+        }
+        let header = ppm_header(packed).ok_or(CodecError::Unavailable(
+            "a member that does not start with a PPMd block",
+        ))?;
+        if !header.reset {
+            return Err(failed("the member's first PPMd block does not reset"));
+        }
+        let limit = usize::try_from(unpacked_len).map_err(failed)?;
+        let mut dec = RarDecoder::new();
+        dec.init_model(header.order, header.mem_mb)
+            .map_err(failed)?;
+        let mut rc = RarRangeDecoder::new(&packed[header.len..]).map_err(failed)?;
+        let mut layer = Unescaper::new(header.esc.unwrap_or(DEFAULT_ESC), limit);
+        while layer.out.len() < limit {
+            let symbol = dec.decode_symbol(&mut rc).map_err(failed)?.ok_or_else(|| {
+                failed(format!("PPMd stream ended after {} symbols", layer.symbols))
+            })?;
+            if rc.zero_bytes_past_eof() > MAX_ZERO_BYTES_PAST_EOF {
+                return Err(failed("the PPMd stream is truncated"));
+            }
+            match layer.push(symbol) {
+                Ok(Some(Stop::Full | Stop::EndOfFile)) => break,
+                Ok(None) => {}
+                // LZ blocks and RarVM filters need a full RAR unpacker.
+                Err(_) => {
+                    return Err(CodecError::Unavailable(
+                        "a member that leaves PPMd (LZ block or RarVM filter)",
+                    ));
+                }
+            }
+        }
+        if layer.out.len() != limit {
+            return Err(failed(format!("{} of {limit} bytes", layer.out.len())));
+        }
+        Ok(layer.out)
     }
 }
 
