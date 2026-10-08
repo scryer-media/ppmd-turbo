@@ -78,6 +78,10 @@ fn checked_block(
     let mut produced = 0u64;
     while produced < block.unpacked_remaining {
         let Some(byte) = dec.decode_symbol(&mut rc).map_err(|e| classify(&e))? else {
+            // An end marker reached on padding is the data running out.
+            if rc.zero_bytes_past_eof() != 0 {
+                return Err(ErrKind::Truncated);
+            }
             break;
         };
         if rc.zero_bytes_past_eof() > MAX_ZERO_BYTES_PAST_EOF {

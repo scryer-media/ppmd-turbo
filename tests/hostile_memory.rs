@@ -104,7 +104,6 @@ fn counting_allocator_counts() {
 }
 
 #[test]
-#[ignore = "awaiting decoder"]
 fn z7_tiny_arena_long_input_stays_within_arena() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let f = fixture("z7-long-o64-m2k");
