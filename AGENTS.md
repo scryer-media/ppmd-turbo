@@ -13,16 +13,13 @@ bit-exact with RARLAB unrar and 7-Zip, and speed.
 
 ## Attribution
 
-Attribution is mandatory. Any algorithm, data layout or technique taken from a
-named person or project is credited by name in three places:
-
-1. at the use site, in a code comment naming the person or project and, where
-   there is one, the reference function or file;
-2. in `docs/algorithms.md`, in the section describing it;
-3. in `ATTRIBUTION.md`.
-
-PPMd variant H is Dmitry Shkarin's design. The 7-Zip `Ppmd7` implementation
-and the 7z range coder are Igor Pavlov's. Others are added as they are taken.
+Credit the few algorithms that conventionally carry their author's name:
+PPMd variant H is Dmitry Shkarin's design; the carry-less range coder is
+Dmitry Subbotin's; the 7-Zip `Ppmd7` implementation is Igor Pavlov's where
+code derives from it. Each is named in `ATTRIBUTION.md` and in a short
+comment where it is used. General-purpose techniques found across open
+source tooling (slice-backed readers, caching, free lists, prefetch, branch
+layout and the like) need no attribution.
 
 ## Correctness rules
 

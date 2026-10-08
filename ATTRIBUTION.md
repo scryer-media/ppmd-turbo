@@ -1,8 +1,8 @@
 # Attribution
 
-Every algorithm, data layout or technique this crate takes from a named person
-or project is listed here, with what was taken and on what terms. The same
-credit appears at the use site in the code and in `docs/algorithms.md`.
+The algorithms this crate uses that conventionally carry their author's name
+are listed here, with what was taken and on what terms. The same credit also
+appears in a short comment where the algorithm is used.
 
 ## Dmitry Shkarin: PPMd variant H
 
