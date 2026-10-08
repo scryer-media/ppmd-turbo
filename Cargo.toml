@@ -37,6 +37,10 @@ serde_json = "1.0.149"
 sha2 = "0.10.9"
 # The 7z container CRCs in tests/differential_binaries.rs.
 crc32fast = "1.5"
+# The conformance suites build the ppmd-rust fixture streams in process when
+# they are not on disk, through the same code as `ppmd-corpus fixtures`. A
+# path-only dev-dependency: cargo drops it from the published manifest.
+ppmd-corpus = { path = "tools/ppmd-corpus" }
 
 # The encoder suites check streams against the bare model and coders.
 [[test]]

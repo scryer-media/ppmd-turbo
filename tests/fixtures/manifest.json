@@ -260,6 +260,7 @@
       },
       "name": "libarchive-ppmd-use-after-free",
       "packed_len": 119,
+      "packed_sha256": "c00831ec35da91f9813b30e7574f61b832358e96ce942a122f2bbeffbff598ba",
       "source": {
         "archive": {
           "file": "test_read_format_rar_ppmd_use_after_free.rar",
@@ -283,6 +284,7 @@
       },
       "name": "libarchive-ppmd-use-after-free2",
       "packed_len": 119,
+      "packed_sha256": "969adf1354e2db69267b764d5053c74460f27d297d0b9b3b9aad3551993c29c9",
       "source": {
         "archive": {
           "file": "test_read_format_rar_ppmd_use_after_free2.rar",
@@ -450,7 +452,7 @@
       "unpacked_len": 262144
     }
   ],
-  "regenerate": "cargo run --locked --release -p ppmd-corpus -- conformance --rar-source <unrar-rs>/tests/fixtures/rar4",
+  "regenerate": "cargo run --locked --release -p ppmd-corpus -- fixtures",
   "schema": "ppmd-turbo-corpus/conformance/1",
   "sevenzip": {
     "banner": "7-Zip (z) 26.01 (arm64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-04-27",

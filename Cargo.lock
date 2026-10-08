@@ -126,6 +126,7 @@ name = "ppmd-turbo"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "ppmd-corpus",
  "ppmd-rust",
  "serde_json",
  "sha2",

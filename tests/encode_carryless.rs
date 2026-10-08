@@ -28,7 +28,9 @@ fn reproduces_every_committed_carryless_stream() {
         .filter(|s| s["coder"] == "carry-less")
     {
         let name = s["name"].as_str().unwrap();
-        let stream = common::read(s);
+        let Some(stream) = common::read(s) else {
+            continue;
+        };
         let order = common::u64_of(s, "order") as u32;
         let mem = common::u64_of(s, "mem") as u32;
         let end_marker = s["end_marker"] == true;

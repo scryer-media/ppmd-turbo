@@ -1,5 +1,6 @@
-//! Building the corpora: the small committed conformance corpus under
-//! `tests/fixtures/`, and the larger benchmark corpora the Go harness
+//! Building the corpora: the small conformance corpus under
+//! `tests/fixtures/` (its manifest is committed, its streams are generated;
+//! see [`crate::fixtures`]), and the larger benchmark corpora the Go harness
 //! generates on demand under `bench/fixtures/<profile>/`.
 //!
 //! Every stream is checked before it is written: ppmd-rust must decode it
@@ -330,8 +331,9 @@ impl Conformance<'_> {
     }
 }
 
-/// Generates the committed conformance corpus into `dir` (normally
-/// `tests/fixtures`). `rar_source` is unrar-rs's `tests/fixtures/rar4`
+/// Generates the conformance corpus and a fresh manifest into `dir`
+/// (normally `tests/fixtures`). This revises the corpus; `fixtures`
+/// regenerates the streams of the committed manifest. `rar_source` is unrar-rs's `tests/fixtures/rar4`
 /// directory, which holds the RARLAB-written archives the RAR members come
 /// from.
 pub fn conformance(dir: &Path, sevenzip: &SevenZip, rar_source: &Path) -> Result<Value, String> {
@@ -351,7 +353,7 @@ pub fn conformance(dir: &Path, sevenzip: &SevenZip, rar_source: &Path) -> Result
     let manifest = json!({
         "schema": CONFORMANCE_SCHEMA,
         "generator": format!("tools/ppmd-corpus {}", env!("CARGO_PKG_VERSION")),
-        "regenerate": "cargo run --locked --release -p ppmd-corpus -- conformance --rar-source <unrar-rs>/tests/fixtures/rar4",
+        "regenerate": "cargo run --locked --release -p ppmd-corpus -- fixtures",
         "sevenzip": {"banner": sevenzip.banner, "version": sevenzip.version},
         "ppmd_rust": "1.5.0",
         "payloads": c.payloads,
@@ -496,9 +498,9 @@ fn base64_line(data: &[u8]) -> Vec<u8> {
 }
 
 /// RARLAB-written members whose data is a single PPMd block: the packed
-/// bytes (block header included) are committed, with the symbol count the
+/// bytes (block header included) are written to `dir`, with the symbol count the
 /// escape layer needs and the digests of both the symbols and the member.
-fn rar_members(dir: &Path, source: &Path) -> Result<Vec<Value>, String> {
+pub fn rar_members(dir: &Path, source: &Path) -> Result<Vec<Value>, String> {
     let volumes = [
         "rar4_ppm_oldmv.rar",
         "rar4_ppm_oldmv.r00",
@@ -546,9 +548,9 @@ fn rar_members(dir: &Path, source: &Path) -> Result<Vec<Value>, String> {
 
 /// libarchive's PPMd regression archives, imported into unrar-rs: hostile
 /// inputs whose headers lie about their sizes. The packed data of the first
-/// file block, cut at the end of the archive, is committed; the suite's only
+/// file block, cut at the end of the archive, is written to `dir`; the suite's only
 /// requirement is that decoding it returns, Ok or Err, without a panic.
-fn hostile(dir: &Path, source: &Path) -> Result<Vec<Value>, String> {
+pub fn hostile(dir: &Path, source: &Path) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
     for (name, archive) in [
         (
@@ -571,7 +573,8 @@ fn hostile(dir: &Path, source: &Path) -> Result<Vec<Value>, String> {
         out.push(json!({
             "name": name, "file": file,
             "source": {"origin": "libarchive test suite (BSD-2-Clause), via unrar-rs tests/fixtures/rar4", "archive": record, "packed_offset": offset},
-            "claimed_unpacked_len": unp, "packed_len": packed.len(), "header": header,
+            "claimed_unpacked_len": unp, "packed_len": packed.len(),
+            "packed_sha256": oracle::sha256_hex(packed), "header": header,
         }));
     }
     Ok(out)
