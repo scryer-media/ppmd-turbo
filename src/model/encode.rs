@@ -353,6 +353,64 @@ impl Model {
             }
         }
 
+        // D11 E2: the decoder's branch-free collection (C1) with the target
+        // picked out on the way: every state goes to the next scratch slot,
+        // the slot advances only on an unmasked state, and the target's low
+        // end sums the unmasked frequencies before it. Symbols are distinct
+        // within a context, so at most one state hits. Any unmasked count
+        // other than `n` falls through to the reference walk below.
+        {
+            let esc_count = self.esc_count;
+            let alloc = &self.alloc;
+            let char_mask = &self.char_mask;
+            let scratch = &mut self.unmasked_scratch;
+            let ns_usize = ns as usize;
+            debug_assert!(ns_usize <= 256);
+            let mut found = 0usize;
+            let mut hi_cnt = 0u32;
+            let mut low = 0u32;
+            let mut hit = 0u32;
+            let mut seen = 0u32;
+            for state_index in 0..ns_usize {
+                let head = alloc.span_read_u16(states_span, state_index * STATE_SIZE);
+                let unmasked = u32::from(char_mask[head as u8 as usize] != esc_count);
+                let is_target = unmasked & u32::from(i32::from(head as u8) == target);
+                let packed = pack_unmasked_state(state_index, head);
+                let freq = u32::from(head >> 8) & unmasked.wrapping_neg();
+                scratch[found & 0xff] = packed;
+                found += unmasked as usize;
+                hi_cnt += freq;
+                low += freq & (seen | is_target).wrapping_sub(1);
+                hit |= packed & is_target.wrapping_neg();
+                seen |= is_target;
+            }
+            if found == n {
+                let scale = esc_freq + hi_cnt;
+                if seen != 0 {
+                    let state_freq = unmasked_state_frequency(hit);
+                    rc.encode(low, u32::from(state_freq), scale);
+                    self.see_update_success(see_index);
+                    return self.update2(
+                        ctx,
+                        context_span,
+                        states_span,
+                        unmasked_state_index(hit),
+                        state_freq,
+                        found_span,
+                    );
+                }
+                rc.encode(hi_cnt, esc_freq, scale);
+                self.see_update_escape(see_index, scale);
+                let char_mask = &mut self.char_mask;
+                for &packed in &self.unmasked_scratch[..n] {
+                    char_mask[unmasked_state_symbol(packed) as usize] = esc_count;
+                }
+                self.num_masked = ns;
+                *validated_suffix = suffix_data;
+                return true;
+            }
+        }
+
         // The first `n` unmasked states, as the decoder collects them, with
         // the target's place among them.
         let mut hi_cnt = 0u32;
