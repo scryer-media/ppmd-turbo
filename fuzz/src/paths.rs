@@ -73,6 +73,11 @@ fn checked_block(
         dec.init_model(block.order, block.mem_mb)
             .map_err(|e| classify(&e))?;
     }
+    // No model is corrupt before the coder reads a byte, whatever is left
+    // to decode.
+    if !dec.has_model() {
+        return Err(ErrKind::Corrupt);
+    }
     let mut rc = CarrylessRangeDecoder::new(trickle_input(block.rc_data, refill))
         .map_err(|e| classify(&e))?;
     let mut produced = 0u64;
@@ -262,6 +267,19 @@ mod tests {
             let mut damaged = input.clone();
             damaged[30] ^= 0xA5;
             check(&damaged);
+        }
+    }
+
+    /// Blocks without a model: corrupt on both sides, before the coder reads
+    /// its four bytes and even with nothing to decode (fuzz regressions).
+    #[test]
+    fn a_block_without_a_model_is_corrupt_on_both_sides() {
+        for unpacked in [Some(0), Some(5), None] {
+            for rc in [&[0xFFu8, 3, 3][..], &[0xFF, 0xFF, 0xFF, 1, 2, 3]] {
+                let mut input = vec![mode(false, 1)];
+                input.extend(RarBlock::seed(true, false, 6, 1, unpacked, rc));
+                check(&input);
+            }
         }
     }
 }
