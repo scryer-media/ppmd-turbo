@@ -98,6 +98,25 @@ impl NodeRef {
 /// Tokens are crate-private, contain no pointer or reference, and are used
 /// only as short-lived capabilities by the context model. All unchecked memory
 /// operations remain confined to `SubAllocator`.
+///
+/// # Invariant the `span_*` accessors rely on
+///
+/// `offset + len <= arena.len()` for the arena of the `SubAllocator` that
+/// minted the token. `validated_model_span` and `validated_tail_span` check it
+/// at runtime; `subspan` and `ValidatedArenaOffset::span` derive a token from
+/// one that already holds it and only `debug_assert!` that the new range stays
+/// inside the old one. The arena's length is fixed for the life of a
+/// `SubAllocator` (`reset` keeps it, a different size builds a new one), and
+/// no token outlives the `decode_symbol` call that minted it, so the bound
+/// keeps holding after `p_text` moves.
+///
+/// The accessors take a `relative` field offset that is likewise only
+/// `debug_assert!`ed against `len`. Memory safety therefore also rests on every
+/// caller passing a field offset and width inside the token, which the model
+/// upholds by construction: fixed field offsets inside a 12-byte context, and
+/// state indices below the count the states token was minted for. Debug and
+/// `cargo fuzz build --debug-assertions` builds check both bounds; release
+/// builds do not.
 #[derive(Clone, Copy)]
 pub(crate) struct ValidatedArenaSpan {
     offset: NonZeroU32,
@@ -352,17 +371,18 @@ impl SubAllocator {
     #[inline(always)]
     pub(crate) fn span_read_u8(&self, span: ValidatedArenaSpan, relative: usize) -> u8 {
         debug_assert!(relative < span.len());
-        // SAFETY: `validated_model_span` proves the entire span is inside the
-        // fixed-size arena. The debug assertion documents the field bound, and
-        // no pointer or reference escapes this expression.
+        // SAFETY: the token lies inside the arena (see `ValidatedArenaSpan`)
+        // and the caller keeps `relative` inside the token, which the debug
+        // assertion checks. No pointer or reference escapes this expression.
         unsafe { *self.arena.as_ptr().add(span.offset() + relative) }
     }
 
     #[inline(always)]
     pub(crate) fn span_read_u16(&self, span: ValidatedArenaSpan, relative: usize) -> u16 {
         debug_assert!(relative.checked_add(2).is_some_and(|end| end <= span.len()));
-        // SAFETY: the checked token covers both bytes. PPMd records are packed,
-        // so the load is explicitly unaligned and the raw pointer stays local.
+        // SAFETY: the token lies inside the arena and the caller keeps both
+        // bytes inside the token (see `ValidatedArenaSpan`). PPMd records are
+        // packed, so the load is unaligned and the raw pointer stays local.
         let value = unsafe {
             self.arena
                 .as_ptr()
@@ -390,8 +410,10 @@ impl SubAllocator {
         );
 
         let mut heads = [0u16; 8];
-        // SAFETY: the validated span covers all 48 bytes loaded by `vld3q_u16`.
-        // AArch64 permits unaligned vector loads, and neither raw pointer escapes.
+        // SAFETY: the caller only takes a batch when `index + 8 <= ns`, so the
+        // 48 bytes loaded by `vld3q_u16` sit inside the states token, which lies
+        // inside the arena (see `ValidatedArenaSpan`). AArch64 permits
+        // unaligned vector loads, and neither raw pointer escapes.
         unsafe {
             let states = vld3q_u16(
                 self.arena
@@ -439,8 +461,10 @@ impl SubAllocator {
                 .is_some_and(|end| end <= span.len())
         );
 
-        // SAFETY: the validated span covers the three contiguous 16-byte loads.
-        // SSSE3 availability is checked once by `Model`, and the shuffle masks
+        // SAFETY: the caller only takes a batch when `index + 8 <= ns`, so the
+        // three contiguous 16-byte loads sit inside the states token, which
+        // lies inside the arena (see `ValidatedArenaSpan`). The caller's
+        // `unsafe` block carries the SSSE3 detection from `Model`; the masks
         // select only the one-byte symbol at the start of each six-byte state.
         unsafe {
             let ptr = self.arena.as_ptr().add(span.offset() + relative);
@@ -473,8 +497,9 @@ impl SubAllocator {
     #[inline(always)]
     pub(crate) fn span_read_u32(&self, span: ValidatedArenaSpan, relative: usize) -> u32 {
         debug_assert!(relative.checked_add(4).is_some_and(|end| end <= span.len()));
-        // SAFETY: the checked token covers all four bytes. The unaligned value
-        // is copied out immediately; no reference into the arena is produced.
+        // SAFETY: the token lies inside the arena and the caller keeps all four
+        // bytes inside the token (see `ValidatedArenaSpan`). The unaligned
+        // value is copied out at once; no reference into the arena is made.
         let value = unsafe {
             self.arena
                 .as_ptr()
@@ -488,9 +513,9 @@ impl SubAllocator {
     #[inline(always)]
     pub(crate) fn span_read_u64(&self, span: ValidatedArenaSpan, relative: usize) -> u64 {
         debug_assert!(relative.checked_add(8).is_some_and(|end| end <= span.len()));
-        // SAFETY: the validated token covers all eight bytes. Context records
-        // are packed, so the value is copied with an unaligned load and no
-        // pointer or reference escapes.
+        // SAFETY: the token lies inside the arena and the caller keeps all
+        // eight bytes inside the token (see `ValidatedArenaSpan`). Context
+        // records are packed, so the load is unaligned and nothing escapes.
         let value = unsafe {
             self.arena
                 .as_ptr()
@@ -504,16 +529,18 @@ impl SubAllocator {
     #[inline(always)]
     pub(crate) fn span_write_u8(&mut self, span: ValidatedArenaSpan, relative: usize, value: u8) {
         debug_assert!(relative < span.len());
-        // SAFETY: the checked token covers this byte and `&mut self` provides
-        // exclusive access for the duration of the write.
+        // SAFETY: the token lies inside the arena and the caller keeps this
+        // byte inside the token (see `ValidatedArenaSpan`); `&mut self` gives
+        // exclusive access for the write.
         unsafe { *self.arena.as_mut_ptr().add(span.offset() + relative) = value };
     }
 
     #[inline(always)]
     pub(crate) fn span_write_u16(&mut self, span: ValidatedArenaSpan, relative: usize, value: u16) {
         debug_assert!(relative.checked_add(2).is_some_and(|end| end <= span.len()));
-        // SAFETY: the checked token covers both bytes and the packed field is
-        // written unaligned without constructing a reference.
+        // SAFETY: the token lies inside the arena and the caller keeps both
+        // bytes inside the token (see `ValidatedArenaSpan`); the packed field
+        // is written unaligned without constructing a reference.
         unsafe {
             self.arena
                 .as_mut_ptr()
@@ -526,7 +553,8 @@ impl SubAllocator {
     #[inline(always)]
     pub(crate) fn span_write_u32(&mut self, span: ValidatedArenaSpan, relative: usize, value: u32) {
         debug_assert!(relative.checked_add(4).is_some_and(|end| end <= span.len()));
-        // SAFETY: the checked token covers all four bytes and the packed field
+        // SAFETY: the token lies inside the arena and the caller keeps all four
+        // bytes inside the token (see `ValidatedArenaSpan`); the packed field
         // is written unaligned without constructing a reference.
         unsafe {
             self.arena
