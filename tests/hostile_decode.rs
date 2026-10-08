@@ -15,7 +15,10 @@ use hostile_support::api::{self, RarDecoder};
 use hostile_support::{
     Coder, Fixture, Kind, Rng, assert_err, cut_points, fixture, fixtures, fixtures_of, no_panic,
 };
-use ppmd_turbo::{PPMD7_MAX_MEM_SIZE, PPMD7_MIN_MEM_SIZE, Result};
+use ppmd_turbo::{Params, Result};
+
+const PPMD7_MIN_MEM_SIZE: u32 = Params::MIN_MEM;
+const PPMD7_MAX_MEM_SIZE: u32 = Params::MAX_MEM;
 
 fn decode_7z(f: &Fixture, stream: &[u8], known: Option<u64>) -> Result<Vec<u8>> {
     no_panic(&format!("{} 7z decode", f.name), stream, || {
@@ -453,6 +456,7 @@ fn z7_size_larger_than_payload() {
 // The carry-less coder's range below the total.
 
 #[test]
+#[cfg(feature = "internals")]
 fn carryless_range_below_total_is_a_fault_not_a_division_by_zero() {
     // After normalisation the carry-less range is at least 2^15 (BOT), and
     // an escape total can reach about 39.8k (255 states near MAX_FREQ plus a

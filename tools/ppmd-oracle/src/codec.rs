@@ -55,10 +55,6 @@ fn failed(e: impl fmt::Display) -> CodecError {
     CodecError::Failed(e.to_string())
 }
 
-/// ppmd-turbo's 7z encoder has not landed. When it does, this calls it with
-/// `end_marker = false`, as 7-Zip writes.
-const TURBO_7Z_ENCODER: &str = "ppmd-turbo's 7z encoder has not landed";
-
 impl Codec {
     /// Encodes `data` with the 7z coder and no end marker, as 7-Zip does.
     pub fn encode_7z(self, data: &[u8], order: u32, mem: u32) -> Result<Vec<u8>, CodecError> {
@@ -69,7 +65,14 @@ impl Codec {
                 enc.write_all(data).map_err(failed)?;
                 enc.finish(false).map_err(failed)
             }
-            Self::Turbo => Err(CodecError::Unavailable(TURBO_7Z_ENCODER)),
+            Self::Turbo => {
+                let params = ppmd_turbo::Params::new(order, mem).map_err(failed)?;
+                let mut writer =
+                    ppmd_turbo::io::SevenZWriter::new(Vec::new(), params).map_err(failed)?;
+                writer.write_all(data).map_err(failed)?;
+                writer.finish().map_err(failed)?;
+                Ok(writer.into_inner())
+            }
         }
     }
 
@@ -95,7 +98,25 @@ impl Codec {
                 }
                 Ok(out)
             }
-            Self::Turbo => ppmd_turbo::decode_7z(stream, order, mem, Some(size)).map_err(failed),
+            Self::Turbo => {
+                let size = usize::try_from(size).map_err(failed)?;
+                let params = ppmd_turbo::Params::new(order, mem).map_err(failed)?;
+                let mut dec =
+                    ppmd_turbo::SevenZDecoder::new(params, Some(size as u64)).map_err(failed)?;
+                dec.set_finish_stream(true);
+                let mut out = vec![0u8; size];
+                let step = dec.decode(stream, true, &mut out).map_err(failed)?;
+                if step.produced != size || step.consumed != stream.len() {
+                    return Err(failed(format!(
+                        "{} of {size} bytes from {} of {} packed bytes ({:?})",
+                        step.produced,
+                        step.consumed,
+                        stream.len(),
+                        step.status
+                    )));
+                }
+                Ok(out)
+            }
         }
     }
 
@@ -109,8 +130,7 @@ impl Codec {
         unpacked_len: u64,
     ) -> Result<Vec<u8>, CodecError> {
         use ppmd_corpus::rar::{DEFAULT_ESC, Stop, Unescaper, ppm_header};
-        use ppmd_turbo::rar::{MAX_ZERO_BYTES_PAST_EOF, RarDecoder};
-        use ppmd_turbo::rc::RarRangeDecoder;
+        use ppmd_turbo::{Params, RarPpmd, RarStatus, Symbol};
 
         if self == Self::Reference {
             return Err(CodecError::Unavailable(
@@ -124,26 +144,47 @@ impl Codec {
             return Err(failed("the member's first PPMd block does not reset"));
         }
         let limit = usize::try_from(unpacked_len).map_err(failed)?;
-        let mut dec = RarDecoder::new();
-        dec.init_model(header.order, header.mem_mb)
-            .map_err(failed)?;
-        let mut rc = RarRangeDecoder::new(&packed[header.len..]).map_err(failed)?;
-        let mut layer = Unescaper::new(header.esc.unwrap_or(DEFAULT_ESC), limit);
-        while layer.out.len() < limit {
-            let symbol = dec.decode_symbol(&mut rc).map_err(failed)?.ok_or_else(|| {
-                failed(format!("PPMd stream ended after {} symbols", layer.symbols))
-            })?;
-            if rc.zero_bytes_past_eof() > MAX_ZERO_BYTES_PAST_EOF {
-                return Err(failed("the PPMd stream is truncated"));
+        let rc = &packed[header.len..];
+        let esc = header.esc.unwrap_or(DEFAULT_ESC);
+        let mut dec = RarPpmd::new();
+        dec.start_block(Some(
+            Params::rar(header.order, header.mem_mb).map_err(failed)?,
+        ))
+        .map_err(failed)?;
+        let mut layer = Unescaper::new(esc, limit);
+        let mut buf = vec![0u8; 1 << 16];
+        let mut pos = 0;
+        // LZ blocks and RarVM filters need a full RAR unpacker.
+        let unavailable =
+            |_| CodecError::Unavailable("a member that leaves PPMd (LZ block or RarVM filter)");
+        'decode: while layer.out.len() < limit {
+            let room = (limit - layer.out.len()).min(buf.len());
+            let step = dec
+                .decode(&rc[pos..], true, &mut buf[..room], esc)
+                .map_err(failed)?;
+            pos += step.consumed;
+            let mut symbols: Vec<u8> = buf[..step.produced].to_vec();
+            match step.status {
+                RarStatus::OutputFull => {}
+                RarStatus::Escape => match dec.next_symbol(&rc[pos..], true).map_err(failed)? {
+                    (n, Symbol::Byte(code)) => {
+                        pos += n;
+                        symbols.extend([esc, code]);
+                    }
+                    (_, other) => return Err(failed(format!("after an escape: {other:?}"))),
+                },
+                other => {
+                    return Err(failed(format!(
+                        "PPMd stream stopped ({other:?}) after {} symbols",
+                        layer.symbols + symbols.len() as u64
+                    )));
+                }
             }
-            match layer.push(symbol) {
-                Ok(Some(Stop::Full | Stop::EndOfFile)) => break,
-                Ok(None) => {}
-                // LZ blocks and RarVM filters need a full RAR unpacker.
-                Err(_) => {
-                    return Err(CodecError::Unavailable(
-                        "a member that leaves PPMd (LZ block or RarVM filter)",
-                    ));
+            for symbol in symbols {
+                if let Some(Stop::Full | Stop::EndOfFile) =
+                    layer.push(symbol).map_err(unavailable)?
+                {
+                    break 'decode;
                 }
             }
         }

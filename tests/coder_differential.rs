@@ -8,73 +8,8 @@
 
 use std::io::Write;
 
-mod api {
-    use ppmd_turbo::model::Model;
-    use ppmd_turbo::rc::CarrylessRangeDecoder;
-    use ppmd_turbo::{Error, Result};
-
-    /// Decodes a raw 7z `PPMD` stream (7z coder): exactly `unpacked_len`
-    /// bytes when given, otherwise up to the end marker.
-    pub fn decode_7z(
-        stream: &[u8],
-        order: u32,
-        mem_size: u32,
-        unpacked_len: Option<u64>,
-    ) -> Result<Vec<u8>> {
-        ppmd_turbo::decode_7z(stream, order, mem_size, unpacked_len)
-    }
-
-    /// Encodes `data` as a raw 7z `PPMD` stream without an end marker, as
-    /// 7-Zip does.
-    ///
-    /// Intended body: `ppmd_turbo::ppmd7::Ppmd7Encoder::new(Vec::new(), order,
-    /// mem_size)?`, `write_all(data)`, `finish(false)`.
-    pub fn encode_7z(data: &[u8], order: u32, mem_size: u32) -> Result<Vec<u8>> {
-        let _ = (data, order, mem_size);
-        todo!("awaiting ppmd_turbo::ppmd7::Ppmd7Encoder")
-    }
-
-    /// Decodes a raw variant H stream coded with the carry-less coder
-    /// (7-Zip's `Ppmd7a`, Shkarin's `.pmd`): the model over
-    /// `CarrylessRangeDecoder::new_7a`. Exactly `unpacked_len` symbols when
-    /// given, otherwise up to the end marker; reading past the input is an
-    /// error, as in 7-Zip.
-    pub fn decode_7a(
-        stream: &[u8],
-        order: u32,
-        mem_size: u32,
-        unpacked_len: Option<u64>,
-    ) -> Result<Vec<u8>> {
-        let mut model = Model::new(order, mem_size)?;
-        let mut rc = CarrylessRangeDecoder::new_7a(stream)?;
-        let mut out = Vec::new();
-        while unpacked_len.is_none_or(|n| (out.len() as u64) < n) {
-            let symbol = model.decode_symbol(&mut rc)?;
-            if rc.zero_bytes_past_eof() != 0 {
-                return Err(Error::Truncated);
-            }
-            match symbol {
-                Some(byte) => out.push(byte),
-                None if unpacked_len.is_none() => break,
-                None => {
-                    return Err(Error::CorruptStream {
-                        detail: "end marker",
-                    });
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Encodes `data` with the carry-less coder, without an end marker.
-    ///
-    /// Intended body: the 7a encoder over
-    /// `ppmd_turbo::rc::CarrylessRangeEncoder::new(Vec::new())`.
-    pub fn encode_7a(data: &[u8], order: u32, mem_size: u32) -> Result<Vec<u8>> {
-        let _ = (data, order, mem_size);
-        todo!("awaiting the 7a encoder")
-    }
-}
+#[path = "common/api.rs"]
+mod api;
 
 /// Text-like bytes with runs, seeded (SplitMix64), invented content only.
 fn sample(len: usize, seed: u64) -> Vec<u8> {
@@ -135,12 +70,11 @@ fn sevenz_streams_from_ppmd_rust_decode() {
 }
 
 #[test]
-#[ignore = "awaiting encoder"]
 fn sevenz_encoding_is_byte_identical_to_ppmd_rust() {
     for (seed, (order, mem)) in PARAMS.into_iter().enumerate() {
         let data = sample(200_000, 100 + seed as u64);
         let want = ppmd_rust_7z(&data, order, mem);
-        let got = api::encode_7z(&data, order, mem).unwrap();
+        let got = api::encode_7z(&data, order, mem, false).unwrap();
         assert!(got == want, "order {order}, mem {mem}");
     }
 }
@@ -150,18 +84,17 @@ fn carryless_streams_from_ppmd_rust_decode() {
     for (seed, (order, mem)) in PARAMS.into_iter().enumerate() {
         let data = sample(200_000, 200 + seed as u64);
         let stream = ppmd_rust_7a(&data, order, mem);
-        let got = api::decode_7a(&stream, order, mem, Some(data.len() as u64)).unwrap();
+        let got = api::decode_carryless(&stream, order, mem, Some(data.len() as u64)).unwrap();
         assert!(got == data, "order {order}, mem {mem}");
     }
 }
 
 #[test]
-#[ignore = "awaiting encoder"]
 fn carryless_encoding_is_byte_identical_to_ppmd_rust() {
     for (seed, (order, mem)) in PARAMS.into_iter().enumerate() {
         let data = sample(200_000, 300 + seed as u64);
         let want = ppmd_rust_7a(&data, order, mem);
-        let got = api::encode_7a(&data, order, mem).unwrap();
+        let got = api::encode_carryless(&data, order, mem, false).unwrap();
         assert!(got == want, "order {order}, mem {mem}");
     }
 }

@@ -36,8 +36,8 @@ fn manifest_matches_the_committed_streams() {
         }
         let order = u64_of(s, "order") as u32;
         let mem = u64_of(s, "mem") as u32;
-        if !(ppmd_turbo::PPMD7_MIN_ORDER..=ppmd_turbo::PPMD7_MAX_ORDER).contains(&order)
-            || !(ppmd_turbo::PPMD7_MIN_MEM_SIZE..=ppmd_turbo::PPMD7_MAX_MEM_SIZE).contains(&mem)
+        if !(ppmd_turbo::Params::MIN_ORDER..=ppmd_turbo::Params::MAX_ORDER).contains(&order)
+            || !(ppmd_turbo::Params::MIN_MEM..=ppmd_turbo::Params::MAX_MEM).contains(&mem)
         {
             failures.push(format!("{name}: order {order} / mem {mem} out of range"));
         }
@@ -176,8 +176,8 @@ fn out_of_range_parameters_are_rejected() {
     let s = common::stream(&manifest, &"text-1k.o6.m64k.7zz.ppmd".into());
     let data = read(s);
     let len = Some(u64_of(s, "payload_len"));
-    let min_mem = ppmd_turbo::PPMD7_MIN_MEM_SIZE;
-    let max_mem = ppmd_turbo::PPMD7_MAX_MEM_SIZE;
+    let min_mem = ppmd_turbo::Params::MIN_MEM;
+    let max_mem = ppmd_turbo::Params::MAX_MEM;
     for (order, mem) in [
         (0, 1 << 16),
         (1, 1 << 16),

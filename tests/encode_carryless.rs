@@ -1,21 +1,18 @@
 //! The carry-less encoder: raw PPMd streams over Subbotin's coder, checked
 //! for correctness only. Every stream round-trips through the crate's
-//! carry-less decoder and through `RarDecoder`, and matches ppmd-rust's
+//! carry-less decoder and through `RarPpmd`, and matches ppmd-rust's
 //! `Ppmd7aEncoder` (Shkarin's coder as 7-Zip's `Ppmd7a` reads it) byte for
 //! byte. No RAR framing is written or read here.
 
 mod common;
 mod encode_support;
 
-use std::io::Write;
-
+use common::api::{RarDecoder, decode_carryless, encode_carryless};
 use encode_support::{
     exhausting_payload, first_difference, payloads, reference_carryless,
     reference_decode_carryless, turbo_decode_carryless,
 };
-use ppmd_turbo::carryless::{CarrylessEncoder, encode_carryless};
-use ppmd_turbo::rar::RarDecoder;
-use ppmd_turbo::rc::RarRangeDecoder;
+use ppmd_turbo::{CarrylessEncoder, ErrorKind, Params};
 
 /// Every carry-less stream in the fixture manifest is reproduced byte for
 /// byte from its payload (recovered through ppmd-rust and checked against
@@ -82,7 +79,8 @@ fn byte_identical_to_ppmd_rust_across_the_grid() {
     common::report(&failures, checked);
 }
 
-/// Round trips through the crate's model over `CarrylessRangeDecoder`.
+/// Round trips through the crate's model over `CarrylessRangeDecoder` and
+/// through `CarrylessDecoder`.
 #[test]
 #[cfg_attr(miri, ignore = "slow under Miri")]
 fn round_trips_through_the_carryless_decoder() {
@@ -94,14 +92,17 @@ fn round_trips_through_the_carryless_decoder() {
                 let what = format!("{name} o={order} mem={mem} eos={end_marker}");
                 assert!(back.data == data, "{what}");
                 assert_eq!(back.end_marker, end_marker, "{what}");
+                let len = (!end_marker).then_some(data.len() as u64);
+                let stepped = decode_carryless(&stream, order, mem, len).unwrap();
+                assert!(stepped == data, "{what}: CarrylessDecoder");
             }
         }
     }
 }
 
-/// Round trips through RAR's decoder: `decode_block` (stopping at the
-/// end marker, or at the symbol count) and `decode_symbol` over a
-/// `RarRangeDecoder`. RAR declares the arena in whole MiB.
+/// Round trips through RAR's decoder: `decode` (stopping at the end
+/// marker, or at the symbol count) and `next_symbol`. RAR declares the
+/// arena in whole MiB.
 #[test]
 #[cfg_attr(miri, ignore = "slow under Miri")]
 fn round_trips_through_the_rar_decoder() {
@@ -127,13 +128,9 @@ fn round_trips_through_the_rar_decoder() {
             assert!(out == data, "{what}: decode_block by count");
 
             let mut rar = RarDecoder::new();
-            rar.init_model(order, mem_mb).unwrap();
-            let mut rc = RarRangeDecoder::new(&marked[..]).unwrap();
-            let mut out = Vec::new();
-            while let Some(b) = rar.decode_symbol(&mut rc).unwrap() {
-                out.push(b);
-            }
-            assert!(out == data, "{what}: decode_symbol");
+            let params = Params::rar(order, mem_mb).unwrap();
+            let out = rar.decode_symbols(Some(params), &marked).unwrap();
+            assert!(out == data, "{what}: next_symbol");
         }
     }
 }
@@ -165,19 +162,21 @@ fn arena_exhaustion_round_trips() {
     assert!(out == big, "RAR decoder after arena exhaustion");
 }
 
-/// The `Write` adapter matches the slice entry.
+/// One call into a buffer that fits writes what the uneven pieces write.
 #[test]
 #[cfg_attr(miri, ignore = "slow under Miri")]
-fn the_write_adapter_matches_the_slice_entry() {
+fn one_call_matches_uneven_pieces() {
     for (name, data) in payloads() {
         for end_marker in [false, true] {
-            let mut enc = CarrylessEncoder::new(Vec::new(), 8, 1 << 20).unwrap();
-            for chunk in data.chunks(501) {
-                enc.write_all(chunk).unwrap();
-            }
-            enc.flush().unwrap();
+            let mut enc = CarrylessEncoder::new(Params::new(8, 1 << 20).unwrap()).unwrap();
+            let mut out = vec![0u8; data.len() * 2 + 64];
+            let step = enc.encode(&data, &mut out).unwrap();
+            assert_eq!(step.consumed, data.len());
+            let fin = enc.finish(&mut out[step.produced..], end_marker).unwrap();
+            assert!(fin.done);
+            out.truncate(step.produced + fin.produced);
             assert_eq!(
-                enc.finish(end_marker).unwrap(),
+                out,
                 encode_carryless(&data, 8, 1 << 20, end_marker).unwrap(),
                 "{name} eos={end_marker}"
             );
@@ -189,14 +188,14 @@ fn the_write_adapter_matches_the_slice_entry() {
 #[test]
 fn rejects_out_of_range_parameters() {
     for (order, mem) in [(1u32, 1u32 << 20), (65, 1 << 20), (6, 2047)] {
-        assert!(matches!(
-            CarrylessEncoder::new(Vec::new(), order, mem),
-            Err(ppmd_turbo::Error::InvalidParameters)
-        ));
-        assert!(matches!(
-            encode_carryless(b"x", order, mem, false),
-            Err(ppmd_turbo::Error::InvalidParameters)
-        ));
+        assert_eq!(
+            Params::new(order, mem).unwrap_err().kind,
+            ErrorKind::InvalidParameters
+        );
+        assert_eq!(
+            encode_carryless(b"x", order, mem, false).unwrap_err().kind,
+            ErrorKind::InvalidParameters
+        );
     }
 }
 

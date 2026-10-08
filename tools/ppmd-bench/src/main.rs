@@ -81,6 +81,9 @@ struct Args {
 enum Failure {
     Usage(String),
     Codec(String),
+    /// Exit code 3: an operation a codec does not provide. Every
+    /// operation is wired today; the harness still reads the code.
+    #[allow(dead_code)]
     NotImplemented(String),
 }
 
