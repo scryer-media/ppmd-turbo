@@ -14,7 +14,7 @@ readme = "README.md"
 # Repository scaffolding that has no business in the crate archive.
 exclude = [
     ".github/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md",
-    "bench/", "docs/", "fuzz/", "tools/", "rust-toolchain.toml", "rustfmt.toml",
+    "bench/", "docs/", "fuzz/", "tests/", "tools/", "rust-toolchain.toml", "rustfmt.toml",
 ]
 
 [features]
@@ -27,7 +27,7 @@ exclude = [
 # their dependencies never reach this crate's own graph. The fuzz harness is
 # its own workspace, built on nightly by cargo-fuzz.
 [workspace]
-members = []
+members = ["tools/ppmd-corpus"]
 exclude = ["fuzz"]
 resolver = "3"
 

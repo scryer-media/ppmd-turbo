@@ -1,0 +1,17 @@
+[package]
+name = "ppmd-corpus"
+description = "Generates and checks ppmd-turbo's conformance and benchmark corpora"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/scryer-media/ppmd-turbo"
+publish = false
+
+[dependencies]
+crc32fast = "1.5.0"
+# The oracle for both range coders (7z and carry-less). A tool dependency
+# only: it must never become a dependency of the crate.
+ppmd-rust = "=1.5.0"
+serde_json = "1.0.149"
+sha2 = "0.10.9"
