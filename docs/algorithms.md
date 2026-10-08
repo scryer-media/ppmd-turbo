@@ -579,6 +579,58 @@ The 7z method writes no end marker (`PpmdEncoder.cpp:166`).
 The **encoder** for the carry-less coder is the mirror image. It exists only
 for the `.pmd`/7a framing (see the RAR licensing note in 5.1).
 
+### 4.3 ppmd-turbo's implementation (`src/rc/`)
+
+- **Generic, not dynamic.** Each coder is generic over its input
+  (`RangeInput`) or output (`RangeOutput`), and the model is generic over the
+  coder (`RangeDecoder`, `RangeEncoder`). After monomorphization there is no
+  call through a trait object anywhere on the per-symbol or per-byte path.
+- **Input buffering.** A normalization step reads one byte with a single
+  comparison against the end of the current buffer. Refills are `#[cold]`
+  and out of line. There are three backings:
+  - `SliceInput` borrows the whole stream and never refills;
+  - `ReadInput` owns a refill buffer (64 KiB by default) over
+    `std::io::Read`, so an unbuffered file costs one `read` per refill;
+  - `SourceInput` copies a 256-byte window out of a `ByteSource` shared
+    with another reader (RAR's LZ bit stream). On drop it consumes exactly
+    the bytes the coder took.
+
+  No `unsafe` is needed. The slice and `Vec` lookups use `get(pos)`, whose
+  bounds check is the end-of-buffer test, and the window index is masked
+  to its power-of-two size.
+- **Past the end of the input** every backing feeds zeros and counts them,
+  as unrar (`read_byte_or_zero`) and 7-Zip (its `Extra` flag) do. The
+  framing reads the count: RAR tolerates a little padding mid-block, 7z
+  none. A prefix of a valid stream therefore decodes exactly as the prefix
+  followed by zeros does, and reports how many zeros it used.
+- **Batch decoding** (backlog D1/D2). The coder registers are plain fields
+  and every operation is `#[inline(always)]`. A batch loop in the model
+  decodes any number of symbols against the current buffer and goes back
+  to a trait only to refill, once per buffer.
+- **Normalization schedule.** The 7z coder applies exactly the reference's
+  step counts: two after a decode and after a binary miss, one after a
+  binary hit. The step at the top of the escape loop is applied eagerly at
+  the end of the escape decode; nothing reads the coder in between, so the
+  same bytes are read at the same points. The carry-less coder normalizes
+  with Subbotin's loop after every operation, which is idempotent.
+- **Corrupt scale.** A range scaled to zero means a total past the range,
+  a zero total or a zero symbol size. Either decoder records it as a sticky
+  fault instead of dividing by zero, or, for the carry-less coder, instead
+  of normalizing forever. It leaves `range = 1` so later arithmetic stays
+  defined, and the model reports `CorruptStream`. The carry-less coder's
+  RAR-style `get_current_count` returns the error directly. The encoders
+  fault on the same conditions, and `finish` reports the fault.
+- **Initialization.**
+  - The 7z decoder rejects a non-zero first byte and a code of
+    `0xFFFFFFFF`, as `Ppmd7z_RangeDec_Init` does.
+  - The carry-less decoder accepts any code, as unrar does. `new_7a` adds
+    `Ppmd7a_RangeDec_Init`'s `0xFFFFFFFF` check.
+  - Either decoder returns `Truncated` when the input is shorter than its
+    initialization.
+- **Resuming.** `RangeCoderState` saves and restores the carry-less
+  registers across RAR solid members, without re-reading the four
+  initialization bytes.
+
 ---
 
 ## 5. Framings

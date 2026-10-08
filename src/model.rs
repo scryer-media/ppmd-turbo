@@ -747,7 +747,7 @@ impl Model {
         if bs as u32 > BIN_SCALE {
             return false;
         }
-        if rc.decode_bit(u32::from(bs), BIN_SCALE) == 0 {
+        if rc.decode_bit(u32::from(bs)) == 0 {
             // Symbol found.
             self.found_state = ctx + CTX_ONE_SYM as u32;
             *found_span = Some(context_span.subspan(CTX_ONE_SYM, STATE_SIZE));
