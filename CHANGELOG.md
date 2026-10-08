@@ -3,6 +3,26 @@
 All notable changes to this project are documented in this file. Each heading
 is a released version.
 
+## 0.2.0 - 2026-10-09
+
+- PPMd variant H encoding: `Model::encode_symbol` codes a byte or the end
+  marker through any `rc::RangeEncoder`, driving the model through the same
+  update, SEE and rescale code the decoder uses. Derived from 7-Zip's
+  `Ppmd7z_EncodeSymbol` and Dmitry Shkarin's variant H encoder.
+- The 7z encoder: `Ppmd7Encoder` (over any `std::io::Write`, with
+  `finish(with_end_marker)`) and `encode_7z` for a slice, next to the
+  decoder in `ppmd7`. Output is byte-identical to 7-Zip's, checked against
+  7-Zip 26.01 and ppmd-rust 1.5.0 across orders 2-64 and arenas from 2 KiB,
+  through repeated arena restarts.
+- `carryless::CarrylessEncoder` and `encode_carryless`: raw carry-less
+  streams (no RAR framing) for round-trip testing of the carry-less and RAR
+  decoders. A correctness tool, not a tuned encoder.
+- `output_mut` on `SevenZipRangeEncoder` and `CarrylessRangeEncoder`.
+- Encoder test suites (`tests/encode_7z.rs`, `tests/encode_carryless.rs`)
+  and an opt-in `7zz` oracle (`tests/encode_oracle_7zz.rs`); the
+  `roundtrip_7z` and `roundtrip_carryless` fuzz targets now run the crate's
+  encoders.
+
 ## 0.1.0 - 2026-10-08
 
 - Initial crate skeleton.

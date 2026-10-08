@@ -15,8 +15,10 @@
 //! The crate is pre-release and the API is unstable until 1.0. Decoding is
 //! implemented for both framings: 7z ([`Ppmd7Decoder`] through
 //! [`std::io::Read`], or [`decode_7z`] for a stream in memory) and RAR
-//! ([`rar`]: RAR 2.9 through 4.x; RAR5 has no PPMd). Both encoders are still
-//! to come.
+//! ([`rar`]: RAR 2.9 through 4.x; RAR5 has no PPMd). The 7z encoder
+//! ([`Ppmd7Encoder`], or [`encode_7z`]) writes streams byte-identical to
+//! 7-Zip's. [`carryless`] writes raw carry-less streams for round-trip
+//! testing only; it never writes RAR blocks or archives.
 //!
 //! ```
 //! use std::io::Read;
@@ -35,6 +37,7 @@
 //! fuzz target over every decoder and encoder entry point.
 
 pub(crate) mod alloc;
+pub mod carryless;
 pub mod error;
 pub mod model;
 pub mod ppmd7;
@@ -43,7 +46,7 @@ pub mod rc;
 pub(crate) mod see;
 
 pub use error::{Error, Result};
-pub use ppmd7::{Ppmd7Decoder, decode_7z};
+pub use ppmd7::{Ppmd7Decoder, Ppmd7Encoder, decode_7z, encode_7z};
 
 /// The smallest model order variant H accepts (`PPMD7_MIN_ORDER` in 7-Zip).
 pub const PPMD7_MIN_ORDER: u32 = 2;
