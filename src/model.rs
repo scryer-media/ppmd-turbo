@@ -933,6 +933,9 @@ impl Model {
             // SAFETY: `p[0..to - from]` is the state array's tail from
             // `from`; the tier was detected on this CPU.
             match self.tier {
+                simd::x86::Tier::Avx512 => unsafe {
+                    simd::x86::sum_avx512(p, to - from, char_mask)
+                },
                 simd::x86::Tier::Avx2 => unsafe { simd::x86::sum_avx2(p, to - from, char_mask) },
                 simd::x86::Tier::Ssse3 => unsafe { simd::x86::sum_ssse3(p, to - from, char_mask) },
                 simd::x86::Tier::Scalar => {
@@ -956,7 +959,7 @@ impl Model {
     }
 
     /// The escape decode's selection over a wide context: skips the whole
-    /// batches of 16 states whose unmasked total `count` reaches, taking
+    /// batches of states (16 or 32 by tier) whose unmasked total `count` reaches, taking
     /// it off `count`, and returns the first state left to walk.
     #[inline(never)]
     fn skip_wide(&self, char_mask: &[u8; 256], from: usize, to: usize, count: &mut u32) -> usize {
@@ -980,6 +983,9 @@ impl Model {
             let p = self.a.ptr(from, to - from);
             // SAFETY: as in `masked_sum_wide`.
             from + match self.tier {
+                simd::x86::Tier::Avx512 => unsafe {
+                    simd::x86::skip_avx512(p, to - from, char_mask, count)
+                },
                 simd::x86::Tier::Avx2 => unsafe {
                     simd::x86::skip_avx2(p, to - from, char_mask, count)
                 },

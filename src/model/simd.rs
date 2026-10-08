@@ -148,12 +148,15 @@ pub(super) mod x86 {
         Scalar,
         Ssse3,
         Avx2,
+        Avx512,
     }
 
     impl Tier {
         /// The best tier this CPU supports.
         pub(crate) fn detect() -> Self {
-            if is_x86_feature_detected!("avx2") {
+            if is_x86_feature_detected!("avx512vbmi") && is_x86_feature_detected!("avx512bw") {
+                Tier::Avx512
+            } else if is_x86_feature_detected!("avx2") {
                 Tier::Avx2
             } else if is_x86_feature_detected!("ssse3") {
                 Tier::Ssse3
@@ -426,6 +429,134 @@ pub(super) mod x86 {
         }
     }
 
+    /// `vpermb` controls for 32 states: byte `off` of states 0..22 from
+    /// the first two 64-byte loads, of states 22..32 from the third.
+    const fn perm(off: usize, third: bool) -> [u8; 64] {
+        let mut m = [0u8; 64];
+        let mut k = 0;
+        while k < 32 {
+            let p = 6 * k + off;
+            m[k] = if third {
+                if p >= 128 { (p - 128) as u8 } else { 0 }
+            } else if p < 128 {
+                p as u8
+            } else {
+                0
+            };
+            k += 1;
+        }
+        m
+    }
+
+    static P_SYM01: [u8; 64] = perm(0, false);
+    static P_SYM2: [u8; 64] = perm(0, true);
+    static P_FREQ01: [u8; 64] = perm(1, false);
+    static P_FREQ2: [u8; 64] = perm(1, true);
+
+    /// Lanes of the third load in a 32-state batch: states 22..32.
+    const THIRD: u64 = ((1u64 << 32) - 1) & !((1u64 << 22) - 1);
+    /// The 32 live lanes.
+    const LIVE: u64 = (1u64 << 32) - 1;
+
+    /// AVX-512 VBMI: the mask's four 64-byte quarters.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+    #[inline]
+    unsafe fn quarters(char_mask: &[u8; 256]) -> [__m512i; 4] {
+        // SAFETY: four 64-byte loads of the 256-byte mask.
+        unsafe {
+            let p = char_mask.as_ptr();
+            [
+                _mm512_loadu_si512(p.cast()),
+                _mm512_loadu_si512(p.add(64).cast()),
+                _mm512_loadu_si512(p.add(128).cast()),
+                _mm512_loadu_si512(p.add(192).cast()),
+            ]
+        }
+    }
+
+    /// AVX-512 VBMI: the unmasked frequencies of the 32 states at `p` in
+    /// lanes 0..32, zero above.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+    #[inline]
+    unsafe fn batch_avx512(p: *const u8, q: &[__m512i; 4]) -> __m512i {
+        // SAFETY: the caller guarantees 192 readable bytes at `p`; every
+        // intrinsic is enabled here.
+        unsafe {
+            let l0 = _mm512_loadu_si512(p.cast());
+            let l1 = _mm512_loadu_si512(p.add(64).cast());
+            let l2 = _mm512_loadu_si512(p.add(128).cast());
+            let ld = |c: &[u8; 64]| _mm512_loadu_si512(c.as_ptr().cast());
+            let syms = _mm512_mask_permutexvar_epi8(
+                _mm512_maskz_permutex2var_epi8(LIVE & !THIRD, l0, ld(&P_SYM01), l1),
+                THIRD,
+                ld(&P_SYM2),
+                l2,
+            );
+            let freqs = _mm512_mask_permutexvar_epi8(
+                _mm512_maskz_permutex2var_epi8(LIVE & !THIRD, l0, ld(&P_FREQ01), l1),
+                THIRD,
+                ld(&P_FREQ2),
+                l2,
+            );
+            let lo = _mm512_permutex2var_epi8(q[0], syms, q[1]);
+            let hi = _mm512_permutex2var_epi8(q[2], syms, q[3]);
+            let mask = _mm512_mask_blend_epi8(_mm512_movepi8_mask(syms), lo, hi);
+            _mm512_and_si512(freqs, mask)
+        }
+    }
+
+    /// AVX-512 VBMI: as [`sum_ssse3`], 32 states per batch.
+    ///
+    /// # Safety
+    ///
+    /// AVX-512 F, BW and VBMI must be present; otherwise as [`sum_ssse3`].
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+    pub(crate) unsafe fn sum_avx512(p: *const u8, len: usize, char_mask: &[u8; 256]) -> u32 {
+        // SAFETY: every batch lies inside `p[0..len]`; the features are
+        // enabled.
+        unsafe {
+            let q = quarters(char_mask);
+            let mut acc = _mm512_setzero_si512();
+            let mut s = 0;
+            while s + 2 * BATCH_BYTES <= len {
+                let b = batch_avx512(p.add(s), &q);
+                acc = _mm512_add_epi64(acc, _mm512_sad_epu8(b, _mm512_setzero_si512()));
+                s += 2 * BATCH_BYTES;
+            }
+            _mm512_reduce_add_epi64(acc) as u32 + tail(p, s, len, char_mask)
+        }
+    }
+
+    /// AVX-512 VBMI: as [`skip_ssse3`], 32 states per batch.
+    ///
+    /// # Safety
+    ///
+    /// As [`sum_avx512`].
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+    pub(crate) unsafe fn skip_avx512(
+        p: *const u8,
+        len: usize,
+        char_mask: &[u8; 256],
+        count: &mut u32,
+    ) -> usize {
+        // SAFETY: every batch lies inside `p[0..len]`; the features are
+        // enabled.
+        unsafe {
+            let q = quarters(char_mask);
+            let mut s = 0;
+            while s + 2 * BATCH_BYTES <= len {
+                let b = batch_avx512(p.add(s), &q);
+                let b = _mm512_reduce_add_epi64(_mm512_sad_epu8(b, _mm512_setzero_si512())) as u32;
+                if *count < b {
+                    break;
+                }
+                *count -= b;
+                s += 2 * BATCH_BYTES;
+            }
+            s
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -472,6 +603,17 @@ pub(super) mod x86 {
                 let total = want + 1;
                 let count = next() % total;
                 let p = states.as_ptr();
+                if tier == Tier::Avx512 {
+                    // SAFETY: AVX-512 F/BW/VBMI are present; `states` holds
+                    // `ns` states.
+                    let got = unsafe { sum_avx512(p, states.len(), &mask) };
+                    assert_eq!(got, want, "avx512 sum, round {round}");
+                    let (mut c0, mut c1) = (count, count);
+                    let w = scalar_skip(&states, &mask, &mut c0, 192);
+                    // SAFETY: as above.
+                    let g = unsafe { skip_avx512(p, states.len(), &mask, &mut c1) };
+                    assert_eq!((g, c1), (w, c0), "avx512 skip, round {round}");
+                }
                 if tier != Tier::Scalar {
                     // SAFETY: SSSE3 is present; `states` holds `ns` states.
                     let got = unsafe { sum_ssse3(p, states.len(), &mask) };
@@ -482,7 +624,7 @@ pub(super) mod x86 {
                     let g = unsafe { skip_ssse3(p, states.len(), &mask, &mut c1) };
                     assert_eq!((g, c1), (w, c0), "ssse3 skip, round {round}");
                 }
-                if tier == Tier::Avx2 {
+                if matches!(tier, Tier::Avx2 | Tier::Avx512) {
                     // SAFETY: AVX2 is present; `states` holds `ns` states.
                     let got = unsafe { sum_avx2(p, states.len(), &mask) };
                     assert_eq!(got, want, "avx2 sum, round {round}");
