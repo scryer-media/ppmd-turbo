@@ -3,6 +3,12 @@
 All notable changes to this project are documented in this file. Each heading
 is a released version.
 
+## 0.1.1 - 2026-10-09
+
+- Licensed under Apache-2.0 alone. 0.1.0 was published as `MIT OR
+  Apache-2.0`; the MIT option is withdrawn from this version on, in line with
+  the other scryer-media library crates.
+
 ## 0.1.0 - 2026-10-09
 
 - PPMd variant H model, sub-allocator and SEE: a direct, bit-exact
