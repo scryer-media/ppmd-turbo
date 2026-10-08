@@ -11,9 +11,15 @@
 /logs/
 /SHA256SUMS
 
-# Benchmark fixtures and results are generated locally.
-/bench/**/fixtures/
-/bench/**/results/
+# Benchmark fixtures are generated locally. Results are too, except each
+# run's report.md and report.json, which are committed as the record.
+/bench/fixtures/
+/bench/results/**
+!/bench/results/*/
+!/bench/results/*/report.md
+!/bench/results/*/report.json
+/bench/ppmd-turbo-bench/ppmd-turbo-bench
+/bench/ppmd-turbo-bench/ppmd-turbo-bench.exe
 
 # Rust profiling/coverage
 /coverage/
