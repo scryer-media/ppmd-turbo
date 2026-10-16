@@ -1,8 +1,8 @@
 name: ci
 
-# fmt, clippy, tests on every desktop platform, Miri, a short deterministic
-# fuzz run of every target, the hostile tests under AddressSanitizer, docs,
-# MSRV and packaging. fuzz-extended.yml runs the long campaigns on demand.
+# fmt, clippy, tests on every desktop platform, the unsafe-code lanes (Miri,
+# Memcheck and AddressSanitizer; see docs/unsafe-validation.md), a short
+# deterministic fuzz run of every target, docs, MSRV and packaging. fuzz-extended.yml runs the long campaigns on demand.
 # `ci-complete` is the one required check: it fails when any lane does.
 
 on:
@@ -26,6 +26,8 @@ env:
   # nightly regression is not mistaken for a finding.
   NIGHTLY_TOOLCHAIN: nightly-2026-09-01
   CARGO_FUZZ_VERSION: 0.13.2
+  # The tests Miri runs, before discovery drops the ones cfg(miri) ignores.
+  MIRI_SELECTION: kind(lib) | binary(coder_differential) | binary(encode_carryless)
 
 jobs:
   fmt:
@@ -172,10 +174,101 @@ jobs:
       - name: Doctests, default features
         run: cargo test --doc --locked --no-fail-fast
 
-  miri:
-    name: miri-x86_64
+  # The unsafe-code lanes. docs/unsafe-validation.md says what each one
+  # covers and what stays uninstrumented; `unsafe-complete` requires them all.
+  # The instrumented native lanes run the release build: debug builds check
+  # every arena access with `debug_assert!`, so only the release build reaches
+  # the unchecked accessors that Memcheck and ASan are there to watch. The
+  # binary-oracle tests (7zz, unrar) are ignored and stay out.
+  unsafe-valgrind:
+    name: unsafe-valgrind-${{ matrix.platform }}
+    needs: fixtures
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+    env:
+      PPMD_TURBO_REQUIRE_FIXTURES: "1"
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
+      # Symbols and line tables, so a Memcheck report names the code.
+      CARGO_PROFILE_RELEASE_STRIP: "false"
+      CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Install Valgrind
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends valgrind
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fixtures
+      - name: Every test in the crate under Memcheck, release build
+        run: cargo nextest run --locked --release --all-features --no-fail-fast
+
+  # AddressSanitizer with an instrumented standard library. The crate has no
+  # threads of its own, so there is no ThreadSanitizer lane.
+  unsafe-asan:
+    name: unsafe-asan-${{ matrix.platform }}
+    needs: fixtures
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    env:
+      PPMD_TURBO_REQUIRE_FIXTURES: "1"
+      RUSTFLAGS: -Zsanitizer=address
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+          components: rust-src
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fixtures
+      # `--target` keeps any build script and proc macro uninstrumented.
+      - name: Every test in the crate under ASan, release build
+        run: cargo "+$NIGHTLY_TOOLCHAIN" nextest run -Zbuild-std --target "$TARGET" --locked --release --all-features --no-fail-fast
+
+  # Miri, one job per test, discovered from the cfg(miri) build so that a new
+  # test in the selection gets its own job without editing this file. The
+  # conformance and coder-differential suites are compiled out under Miri;
+  # the hostile suites and encode_7z decode whole streams and take Miri past
+  # the job limit a test. All of them run under Memcheck and ASan above.
+  unsafe-miri-plan:
+    name: unsafe-miri-plan
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -187,18 +280,54 @@ jobs:
       - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-nextest@0.9.143
-      - name: Set up Miri
-        run: cargo "+$NIGHTLY_TOOLCHAIN" miri setup
-      - name: Miri
+      - name: Discover every test Miri runs
+        id: plan
+        run: |
+          cargo "+$NIGHTLY_TOOLCHAIN" miri nextest list --locked --all-features \
+            --message-format json -E "$MIRI_SELECTION" > "$RUNNER_TEMP/miri-tests.json"
+          python3 .github/scripts/miri-matrix.py "$RUNNER_TEMP/miri-tests.json" "$GITHUB_OUTPUT"
+
+  unsafe-miri:
+    name: unsafe-miri-${{ matrix.binary }}-${{ matrix.test }}
+    needs: unsafe-miri-plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.unsafe-miri-plan.outputs.matrix) }}
+    env:
+      # Isolation stays on: nothing Miri runs reads a file or a clock.
+      MIRIFLAGS: -Zmiri-strict-provenance
+      MIRI_BINARY: ${{ matrix.binary }}
+      MIRI_TEST: ${{ matrix.test }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+          components: miri, rust-src
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: One test under Miri
+        run: |
+          cargo "+$NIGHTLY_TOOLCHAIN" miri nextest run --locked --all-features --no-fail-fast \
+            -E "binary_id($MIRI_BINARY) & test(=$MIRI_TEST)"
+
+  unsafe-complete:
+    name: unsafe-complete
+    if: always()
+    needs: [unsafe-valgrind, unsafe-asan, unsafe-miri-plan, unsafe-miri]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # A skipped or cancelled lane is as much a gap as a failed one.
+      - name: Require every native and Miri safety lane
         env:
-          # Isolation stays off as before; the lanes Miri runs read no
-          # fixture files and no clock.
-          MIRIFLAGS: -Zmiri-disable-isolation
-        # Miri runs the unit tests, which cover every unsafe path in the
-        # model and the coders, plus the two small coder suites. The corpus,
-        # conformance and hostile suites decode whole streams and ran past
-        # the two-hour job limit under Miri; the native lanes run them.
-        run: cargo "+$NIGHTLY_TOOLCHAIN" miri nextest run --locked --all-features -j "$(nproc)" -E 'kind(lib) | binary(coder_differential) | binary(encode_carryless)'
+          RESULTS: ${{ toJSON(needs) }}
+        run: python3 -c 'import json, os; assert all(job["result"] == "success" for job in json.loads(os.environ["RESULTS"]).values()), os.environ["RESULTS"]'
 
   # The fuzz harness library, including the seed generator's own checks
   # (the fixtures job checks the generated seeds against their digests).
@@ -303,30 +432,6 @@ jobs:
           path: fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
 
-  # The hostile-input tests under AddressSanitizer. Only the test crate is
-  # instrumented (`--target` keeps build scripts and proc macros plain).
-  asan:
-    name: asan-linux-x86_64
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
-        with:
-          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
-      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
-        with:
-          tool: cargo-nextest@0.9.143
-      - name: Hostile tests under ASan
-        env:
-          RUSTFLAGS: -Zsanitizer=address
-        run: |
-          cargo "+$NIGHTLY_TOOLCHAIN" nextest run --locked --all-features \
-            --target x86_64-unknown-linux-gnu --no-fail-fast \
-            --test hostile_decode --test hostile_memory
-
   msrv:
     name: msrv
     runs-on: ubuntu-24.04
@@ -364,7 +469,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [fmt, clippy, docs, fixtures, test, miri, fuzz-harness, fuzz, asan, msrv, package]
+    needs: [fmt, clippy, docs, fixtures, test, unsafe-complete, fuzz-harness, fuzz, msrv, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

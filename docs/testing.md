@@ -7,14 +7,15 @@ iteration counts, no sleeps and no clocks.
 
 | layer | where | runs in |
 |---|---|---|
-| unit and conformance tests | `src/`, `tests/conformance_*.rs`, `tests/fixtures/` | `cargo test`, every platform |
+| unit and conformance tests | `src/`, `tests/conformance_*.rs`, `tests/fixtures/` | `cargo nextest run` and `cargo test --doc`, every platform |
 | encoder tests | `tests/encode_7z.rs`, `tests/encode_carryless.rs` | `cargo nextest run`, every platform; Miri runs the small cases |
-| hostile-input tests | `tests/hostile_decode.rs`, `tests/hostile_memory.rs`, `tests/hostile_fixtures/` | `cargo nextest run`, Miri, ASan |
+| hostile-input tests | `tests/hostile_decode.rs`, `tests/hostile_memory.rs`, `tests/hostile_fixtures/` | `cargo nextest run`, Memcheck, ASan |
 | fuzzing, ten targets | `fuzz/` | nine in the `fuzz` CI lane (short) and `fuzz-extended.yml` (long); `chunking_invariance` on demand |
 | in-process differential | the fuzz targets, against ppmd-rust 1.5.0 | with fuzzing |
 | out-of-process oracles | `tools/ppmd-oracle/`, `tests/differential_binaries.rs`, `tests/encode_oracle_7zz.rs` | on demand, against `7zz` and `unrar` |
-| Miri | `MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run` | the `miri-x86_64` CI lane |
-| AddressSanitizer | the hostile tests, and every fuzz target | the `asan-linux-x86_64` and `fuzz-*` CI lanes |
+| Miri | the library, `coder_differential` and `encode_carryless`, one job per test | the `unsafe-miri` CI lanes |
+| Memcheck | every test in the crate, release build | the `unsafe-valgrind-*` CI lanes |
+| AddressSanitizer | every test in the crate, release build, and every fuzz target | the `unsafe-asan-*` and `fuzz-*` CI lanes |
 
 ## Hostile-input tests
 
@@ -134,19 +135,22 @@ cargo test --locked --manifest-path fuzz/Cargo.toml --lib -- --ignored regenerat
 ## Miri
 
 ```sh
-MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri nextest run --locked --all-features
+MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri nextest run --locked --all-features \
+  -E 'kind(lib) | binary(coder_differential) | binary(encode_carryless)'
 ```
 
-Isolation is off because the hostile tests read their fixtures from
-`tests/`; nothing in the suite reads a clock or the environment. The vector
-state searches are compiled out under Miri, so it checks the scalar paths.
-Long loops run shortened under `cfg(miri)`, and the corpus conformance and
-coder-differential suites are left out (`#![cfg(not(miri))]`): each takes
-Miri over half an hour, and the same decoders run under Miri through the
-hostile and library tests. The unchecked arena accessors in `src/alloc.rs`
-rely on a caller invariant that only debug assertions check (see
-`ValidatedArenaSpan`); `cargo +nightly fuzz build --debug-assertions` runs the
-fuzz targets with those checks on.
+CI discovers that selection under `cfg(miri)` and runs each test in a job of
+its own; [unsafe-validation.md](unsafe-validation.md) has the lanes and what
+they leave out. Isolation stays on: nothing in the selection reads a file or
+a clock. The vector state searches are compiled out under Miri, so it checks
+the scalar paths. Long loops run shortened under `cfg(miri)`, the corpus
+conformance and coder-differential suites are left out
+(`#![cfg(not(miri))]`), and the hostile suites and `encode_7z` are outside
+the selection because their cases each take Miri past the job limit. The
+unchecked arena accessors in `src/alloc.rs` rely on a caller invariant that
+only debug assertions check; `cargo +nightly fuzz build --debug-assertions`
+runs the fuzz targets with those checks on, and the Memcheck and ASan lanes
+run the release build, where they are compiled out.
 
 ## Out-of-process oracles
 
