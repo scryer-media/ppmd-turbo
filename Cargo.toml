@@ -79,5 +79,32 @@ inherits = "release"
 strip = false
 debug = 1
 
+# Tests need no debuginfo. Without it, and without incremental state, a cold
+# `cargo test --workspace --all-features --no-run` is 3.9 s instead of 5.1 s
+# (12 CPU-s instead of 19); the test run is not slower.
+[profile.test]
+debug = 0
+split-debuginfo = "off"
+incremental = false
+
+# Dev and test builds optimise only what dominates test time; debug assertions
+# and overflow checks stay on, so the arena's `debug_assert!` bounds checks
+# still run. Measured once per configuration on an Apple M5 Max: cold is
+# `cargo test --workspace --all-features --no-run` from an empty target
+# directory, the run is `cargo nextest run --workspace --all-features` with the
+# fixtures on disk, warm is the rebuild after touching src/model.rs.
+#
+# ppmd-turbo itself: the run takes 5.4 s instead of 14.5 s (13 CPU-s instead of
+# 69), for 1.3 s more cold build (5.3 s instead of 3.9 s) and 4.4 s more warm
+# rebuild (5.2 s instead of 0.9 s), because every test binary is optimised too.
+#
+# Measured and left out, because none saved more than it cost. With the
+# override above in place: ppmd-rust, the oracle (run 5.2 s), sha2, the fixture
+# digests (run 5.6 s), and ppmd-corpus, the in-process fixture builders (run
+# 5.3 s and 8 CPU-s instead of 13, for 1.7 s and 6 CPU-s more cold build).
+# ppmd-rust alone, without it, saved nothing either (run 25.2 s).
+[profile.dev.package.ppmd-turbo]
+opt-level = 3
+
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

@@ -7,14 +7,15 @@ iteration counts, no sleeps and no clocks.
 
 | layer | where | runs in |
 |---|---|---|
-| unit and conformance tests | `src/`, `tests/conformance_*.rs`, `tests/fixtures/` | `cargo test`, every platform |
-| encoder tests | `tests/encode_7z.rs`, `tests/encode_carryless.rs` | `cargo test`, every platform; Miri runs the small cases |
-| hostile-input tests | `tests/hostile_decode.rs`, `tests/hostile_memory.rs`, `tests/hostile_fixtures/` | `cargo test`, Miri, ASan |
-| fuzzing, ten targets | `fuzz/` | nine in the `fuzz` CI lane (short) and `fuzz-extended.yml` (long); `chunking_invariance` on demand |
+| unit and conformance tests | `src/`, `tests/conformance_*.rs`, `tests/fixtures/` | `cargo nextest run` and `cargo test --doc`, every platform |
+| encoder tests | `tests/encode_7z.rs`, `tests/encode_carryless.rs` | `cargo nextest run`, every platform; Miri runs the small cases |
+| hostile-input tests | `tests/hostile_decode.rs`, `tests/hostile_memory.rs`, `tests/hostile_fixtures/` | `cargo nextest run`, Memcheck, ASan |
+| fuzzing, ten targets | `fuzz/` | all ten in the `fuzz` CI lane (short) and `fuzz-extended.yml` (long) |
 | in-process differential | the fuzz targets, against ppmd-rust 1.5.0 | with fuzzing |
 | out-of-process oracles | `tools/ppmd-oracle/`, `tests/differential_binaries.rs`, `tests/encode_oracle_7zz.rs` | on demand, against `7zz` and `unrar` |
-| Miri | `MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run` | the `miri-x86_64` CI lane |
-| AddressSanitizer | the hostile tests, and every fuzz target | the `asan-linux-x86_64` and `fuzz-*` CI lanes |
+| Miri | the library, `coder_differential` and `encode_carryless`, one job per test | the `unsafe-miri` CI lanes |
+| Memcheck | every test in the crate, release build | the `unsafe-valgrind-*` CI lanes |
+| AddressSanitizer | every test in the crate, release build, and every fuzz target | the `unsafe-asan-*` and `fuzz-*` CI lanes |
 
 ## Hostile-input tests
 
@@ -82,8 +83,8 @@ drives each step codec through input and output pieces chosen by a seeded
 generator, so a failing input reproduces its own split points.
 `range_coders`, `checked_vs_unchecked` and `model_ops` also call the model
 and the coders through `ppmd_turbo::internals` directly.
-`chunking_invariance` has no committed seeds and is not in the CI matrices;
-run it by hand.
+`chunking_invariance` has no committed seeds; both fuzz workflows start it
+from an empty corpus.
 
 Memory per iteration is bounded: decode arenas cap at 64 MiB, round-trip
 arenas at 16 MiB, RAR arenas at 16 MiB, generated payloads at 16 KiB and
@@ -99,10 +100,11 @@ cargo +nightly fuzz run decode_7z fuzz/corpus/decode_7z fuzz/seeds/decode_7z -- 
   -runs=20000 -seed=1 -rss_limit_mb=2048
 ```
 
-CI runs each of the nine seeded targets on x86_64 and aarch64 Linux from
-its seeds, with `-seed=1` and a fixed `-runs` per target (20000 for the
-decoders, 5000 for the round trips, 2000 for `structure_7z`, 50000 for
-`range_coders`, 10000 for `checked_vs_unchecked` and 5000 for `model_ops`).
+CI runs each of the ten targets on x86_64 and aarch64 Linux, the nine
+seeded ones from their seeds, with `-seed=1` and a fixed `-runs` per target
+(20000 for the decoders, 5000 for the round trips, 2000 for `structure_7z`,
+50000 for `range_coders`, 10000 for `checked_vs_unchecked`, 5000 for
+`model_ops` and 20000 for `chunking_invariance`).
 `fuzz-extended.yml` is
 dispatch-only. It takes `runs` and `seed` inputs, uploads crashes and the
 grown corpus, and can also run the `7zz` oracles.
@@ -123,8 +125,25 @@ cargo test --locked --manifest-path fuzz/Cargo.toml --lib -- --ignored regenerat
 1. Download the `fuzz-findings-*` artifact and reproduce:
    `cargo +nightly fuzz run <target> crash-<sha>`.
 2. Minimise it: `cargo +nightly fuzz tmin <target> crash-<sha>`.
-3. Commit the minimised input as `fuzz/regressions/<target>/<what-it-is>`.
-   Both fuzz workflows replay that directory on every run.
+3. Add the minimised input to `REGRESSIONS` in `fuzz/src/seeds.rs` as a
+   byte literal, `(<target>, <what-it-is>, &[..])`, then regenerate the
+   seeds (the command above) and refresh the digest list the `fixtures` CI
+   job checks every generated file against:
+
+   ```sh
+   cargo run --locked --release -p ppmd-corpus -- fixtures --sevenzip 7zz --write-digests
+   ```
+
+   The refresh needs a full run with every oracle present (`7zz`, and the
+   RAR source archives the manifest names, which the tool looks for in
+   `target/ppmd-corpus/rar-sources` unless `--rar-source` points at them);
+   without it the `fixtures` job fails with
+   `not in tools/ppmd-corpus/fixtures.sha256`. Commit the
+   updated `tools/ppmd-corpus/fixtures.sha256` with the literal. The
+   generator writes the regression to `fuzz/regressions/<target>/<what-it-is>`,
+   which both fuzz workflows replay on every run; that directory is
+   gitignored and the `hygiene` lane rejects anything tracked under it, so a
+   regression is never committed as a file.
 4. Add a named case to `tests/hostile_decode.rs` that pins down the root
    cause in decoder terms (parameters and stream, printed in hex on
    failure). The fuzz input format is a harness detail; the hostile test is
@@ -134,19 +153,22 @@ cargo test --locked --manifest-path fuzz/Cargo.toml --lib -- --ignored regenerat
 ## Miri
 
 ```sh
-MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri nextest run --locked --all-features
+MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri nextest run --locked --all-features \
+  -E 'kind(lib) | binary(coder_differential) | binary(encode_carryless)'
 ```
 
-Isolation is off because the hostile tests read their fixtures from
-`tests/`; nothing in the suite reads a clock or the environment. The vector
-state searches are compiled out under Miri, so it checks the scalar paths.
-Long loops run shortened under `cfg(miri)`, and the corpus conformance and
-coder-differential suites are left out (`#![cfg(not(miri))]`): each takes
-Miri over half an hour, and the same decoders run under Miri through the
-hostile and library tests. The unchecked arena accessors in `src/alloc.rs`
-rely on a caller invariant that only debug assertions check (see
-`ValidatedArenaSpan`); `cargo +nightly fuzz build --debug-assertions` runs the
-fuzz targets with those checks on.
+CI discovers that selection under `cfg(miri)` and runs each test in a job of
+its own; [unsafe-validation.md](unsafe-validation.md) has the lanes and what
+they leave out. Isolation stays on: nothing in the selection reads a file or
+a clock. The vector state searches are compiled out under Miri, so it checks
+the scalar paths. Long loops run shortened under `cfg(miri)`, the corpus
+conformance and coder-differential suites are left out
+(`#![cfg(not(miri))]`), and the hostile suites and `encode_7z` are outside
+the selection because their cases each take Miri past the job limit. The
+unchecked arena accessors in `src/alloc.rs` rely on a caller invariant that
+only debug assertions check; `cargo +nightly fuzz build --debug-assertions`
+runs the fuzz targets with those checks on, and the Memcheck and ASan lanes
+run the release build, where they are compiled out.
 
 ## Out-of-process oracles
 
@@ -175,7 +197,7 @@ cargo run --locked --release -p ppmd-oracle -- tools
 cargo run --locked --release -p ppmd-oracle -- check-7z --codec reference
 cargo run --locked --release -p ppmd-oracle -- check-7z --codec turbo [FILE...]
 cargo run --locked --release -p ppmd-oracle -- check-rar ARCHIVE...
-PPMD_TURBO_ORACLES=1 cargo test --locked --release --test differential_binaries -- --ignored
+PPMD_TURBO_ORACLES=1 cargo nextest run --locked --release --test differential_binaries --run-ignored only
 ```
 
 `tests/differential_binaries.rs` includes the tool's container code by path.
@@ -194,7 +216,7 @@ byte-identical to 7-Zip 26.01's, and 7-Zip extracts ppmd-turbo's streams at
 orders up to 64 and arenas down to 2 KiB, which its own encoder refuses.
 
 ```sh
-PPMD_TURBO_ORACLES=1 cargo test --locked --release --test encode_oracle_7zz -- --ignored
+PPMD_TURBO_ORACLES=1 cargo nextest run --locked --release --test encode_oracle_7zz --run-ignored only
 ```
 
 `check-rar` extracts every non-solid PPMd member with ppmd-turbo

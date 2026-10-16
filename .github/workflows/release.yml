@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: The version being released
@@ -124,9 +124,16 @@ jobs:
             echo "::error::ci-complete on $GITHUB_SHA is '${conclusion:-absent}', not success; wait for ci.yml or fix it"
             exit 1
           fi
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        if: github.event_name == 'push'
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Test
         if: github.event_name == 'push'
-        run: cargo test --locked --workspace --all-features --no-fail-fast
+        run: cargo nextest run --locked --workspace --all-features --no-fail-fast
+      - name: Doctests
+        if: github.event_name == 'push'
+        run: cargo test --doc --locked --workspace --all-features --no-fail-fast
       # semver-checks needs a published baseline. The first release has none,
       # so the check starts with the second.
       - name: Is there a published baseline
@@ -161,7 +168,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       # The first release is uploaded from the maintainer's machine, because
