@@ -154,13 +154,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: fixtures
+      # Nextest runs every test in its own process, so one test's crash or
+      # leaked state cannot hide another's result. It does not run doctests;
+      # `cargo test --doc` does, for each feature set.
       - name: Test all features
-        run: cargo test --locked --workspace --all-features --no-fail-fast
+        run: cargo nextest run --locked --workspace --all-features --no-fail-fast
+      - name: Doctests, all features
+        run: cargo test --doc --locked --workspace --all-features --no-fail-fast
       - name: Test default features
-        run: cargo test --locked --no-fail-fast
+        run: cargo nextest run --locked --no-fail-fast
+      - name: Doctests, default features
+        run: cargo test --doc --locked --no-fail-fast
 
   miri:
     name: miri-x86_64
@@ -176,7 +186,7 @@ jobs:
           components: miri, rust-src
       - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.143
       - name: Set up Miri
         run: cargo "+$NIGHTLY_TOOLCHAIN" miri setup
       - name: Miri
@@ -204,10 +214,13 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Clippy
         run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
       - name: Harness tests
-        run: cargo test --locked --manifest-path fuzz/Cargo.toml --lib
+        run: cargo nextest run --locked --manifest-path fuzz/Cargo.toml --lib --no-fail-fast
 
   # A short, deterministic run of every target on both 64-bit Linux
   # architectures: a fixed libFuzzer seed and a fixed iteration count per
@@ -303,13 +316,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Hostile tests under ASan
         env:
           RUSTFLAGS: -Zsanitizer=address
-          RUSTDOCFLAGS: -Zsanitizer=address
         run: |
-          cargo "+$NIGHTLY_TOOLCHAIN" test --locked --all-features \
-            --target x86_64-unknown-linux-gnu \
+          cargo "+$NIGHTLY_TOOLCHAIN" nextest run --locked --all-features \
+            --target x86_64-unknown-linux-gnu --no-fail-fast \
             --test hostile_decode --test hostile_memory
 
   msrv:

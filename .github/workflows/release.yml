@@ -124,9 +124,16 @@ jobs:
             echo "::error::ci-complete on $GITHUB_SHA is '${conclusion:-absent}', not success; wait for ci.yml or fix it"
             exit 1
           fi
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        if: github.event_name == 'push'
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Test
         if: github.event_name == 'push'
-        run: cargo test --locked --workspace --all-features --no-fail-fast
+        run: cargo nextest run --locked --workspace --all-features --no-fail-fast
+      - name: Doctests
+        if: github.event_name == 'push'
+        run: cargo test --doc --locked --workspace --all-features --no-fail-fast
       # semver-checks needs a published baseline. The first release has none,
       # so the check starts with the second.
       - name: Is there a published baseline

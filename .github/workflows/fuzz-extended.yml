@@ -117,12 +117,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Install 7-Zip
         run: brew install sevenzip
       - name: Differential tests
         env:
           PPMD_TURBO_ORACLES: "1"
-        run: cargo test --locked --release --test differential_binaries -- --ignored
+        run: cargo nextest run --locked --release --test differential_binaries --run-ignored only --no-fail-fast
       - name: Oracle CLI, reference codec (validates the oracle)
         run: cargo run --locked --release -p ppmd-oracle -- check-7z --codec reference
       - name: Oracle CLI, ppmd-turbo

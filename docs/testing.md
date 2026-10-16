@@ -8,8 +8,8 @@ iteration counts, no sleeps and no clocks.
 | layer | where | runs in |
 |---|---|---|
 | unit and conformance tests | `src/`, `tests/conformance_*.rs`, `tests/fixtures/` | `cargo test`, every platform |
-| encoder tests | `tests/encode_7z.rs`, `tests/encode_carryless.rs` | `cargo test`, every platform; Miri runs the small cases |
-| hostile-input tests | `tests/hostile_decode.rs`, `tests/hostile_memory.rs`, `tests/hostile_fixtures/` | `cargo test`, Miri, ASan |
+| encoder tests | `tests/encode_7z.rs`, `tests/encode_carryless.rs` | `cargo nextest run`, every platform; Miri runs the small cases |
+| hostile-input tests | `tests/hostile_decode.rs`, `tests/hostile_memory.rs`, `tests/hostile_fixtures/` | `cargo nextest run`, Miri, ASan |
 | fuzzing, ten targets | `fuzz/` | nine in the `fuzz` CI lane (short) and `fuzz-extended.yml` (long); `chunking_invariance` on demand |
 | in-process differential | the fuzz targets, against ppmd-rust 1.5.0 | with fuzzing |
 | out-of-process oracles | `tools/ppmd-oracle/`, `tests/differential_binaries.rs`, `tests/encode_oracle_7zz.rs` | on demand, against `7zz` and `unrar` |
@@ -175,7 +175,7 @@ cargo run --locked --release -p ppmd-oracle -- tools
 cargo run --locked --release -p ppmd-oracle -- check-7z --codec reference
 cargo run --locked --release -p ppmd-oracle -- check-7z --codec turbo [FILE...]
 cargo run --locked --release -p ppmd-oracle -- check-rar ARCHIVE...
-PPMD_TURBO_ORACLES=1 cargo test --locked --release --test differential_binaries -- --ignored
+PPMD_TURBO_ORACLES=1 cargo nextest run --locked --release --test differential_binaries --run-ignored only
 ```
 
 `tests/differential_binaries.rs` includes the tool's container code by path.
@@ -194,7 +194,7 @@ byte-identical to 7-Zip 26.01's, and 7-Zip extracts ppmd-turbo's streams at
 orders up to 64 and arenas down to 2 KiB, which its own encoder refuses.
 
 ```sh
-PPMD_TURBO_ORACLES=1 cargo test --locked --release --test encode_oracle_7zz -- --ignored
+PPMD_TURBO_ORACLES=1 cargo nextest run --locked --release --test encode_oracle_7zz --run-ignored only
 ```
 
 `check-rar` extracts every non-solid PPMd member with ppmd-turbo
