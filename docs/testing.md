@@ -127,11 +127,23 @@ cargo test --locked --manifest-path fuzz/Cargo.toml --lib -- --ignored regenerat
 2. Minimise it: `cargo +nightly fuzz tmin <target> crash-<sha>`.
 3. Add the minimised input to `REGRESSIONS` in `fuzz/src/seeds.rs` as a
    byte literal, `(<target>, <what-it-is>, &[..])`, then regenerate the
-   seeds (the command above). The generator writes it to
-   `fuzz/regressions/<target>/<what-it-is>`, which both fuzz workflows
-   replay on every run. That directory is gitignored and the `hygiene` lane
-   rejects anything tracked under it: a regression is never committed as a
-   file.
+   seeds (the command above) and refresh the digest list the `fixtures` CI
+   job checks every generated file against:
+
+   ```sh
+   cargo run --locked --release -p ppmd-corpus -- fixtures --sevenzip 7zz --write-digests
+   ```
+
+   The refresh needs a full run with every oracle present (`7zz`, and the
+   RAR source archives the manifest names, which the tool looks for in
+   `target/ppmd-corpus/rar-sources` unless `--rar-source` points at them);
+   without it the `fixtures` job fails with
+   `not in tools/ppmd-corpus/fixtures.sha256`. Commit the
+   updated `tools/ppmd-corpus/fixtures.sha256` with the literal. The
+   generator writes the regression to `fuzz/regressions/<target>/<what-it-is>`,
+   which both fuzz workflows replay on every run; that directory is
+   gitignored and the `hygiene` lane rejects anything tracked under it, so a
+   regression is never committed as a file.
 4. Add a named case to `tests/hostile_decode.rs` that pins down the root
    cause in decoder terms (parameters and stream, printed in hex on
    failure). The fuzz input format is a harness detail; the hostile test is
