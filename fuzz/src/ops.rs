@@ -12,8 +12,10 @@
 //! - nothing panics, reads out of bounds or runs unbounded, whatever the
 //!   model went through before;
 //! - every failure has the documented class: parameter checks are
-//!   [`ErrKind::InvalidParameters`] and leave the model untouched, a symbol
-//!   without a model is [`ErrKind::Corrupt`], and a decode is only ever
+//!   [`ErrKind::InvalidParameters`] and leave the model untouched, a block
+//!   start without a model is [`ErrKind::Corrupt`], a RAR decode with no
+//!   block started since `new` or `forget` is
+//!   [`ErrKind::InvalidParameters`], and any other decode is only ever
 //!   corrupt or truncated;
 //! - **a restart forgets everything**: after any history, starting the
 //!   model again (`start_block` with parameters, reusing its arena,
@@ -147,7 +149,8 @@ fn drive<R: RangeDecoder>(
 /// Decodes up to `n` symbols through the RAR decoder from `data`: after a
 /// block start when `start`, else continuing whatever state it is in, through
 /// `decode` with escape `esc` or one `next_symbol` call at a time. Every
-/// failure is corrupt or truncated (or a repeated earlier failure).
+/// failure is corrupt or truncated (or a repeated earlier failure), except
+/// that a decode with no model and no block start is the caller's mistake.
 fn rar_symbols(rar: &mut RarPpmd, data: &[u8], start: bool, symbols: bool, esc: u8, n: usize) {
     let had_model = rar.has_model();
     if start && let Err(e) = rar.start_block(None) {
@@ -197,7 +200,8 @@ fn rar_symbols(rar: &mut RarPpmd, data: &[u8], start: bool, symbols: bool, esc: 
             Err(e) => {
                 let kind = classify(&e);
                 assert!(
-                    matches!(kind, ErrKind::Corrupt | ErrKind::Truncated),
+                    matches!(kind, ErrKind::Corrupt | ErrKind::Truncated)
+                        || (kind == ErrKind::InvalidParameters && !had_model && !start),
                     "a symbol decode failed as {kind:?}"
                 );
                 break;

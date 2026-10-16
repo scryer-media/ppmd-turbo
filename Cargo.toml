@@ -1,6 +1,6 @@
 [package]
 name = "ppmd-turbo"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97.1"
 authors = ["NZB Man"]
@@ -19,7 +19,7 @@ exclude = [
 
 [features]
 default = ["std"]
-# The io adapters, std::error::Error and run-time SIMD detection.
+# The io adapters, the io::Error conversion and run-time SIMD detection.
 std = []
 # The engine, for the crate's own fuzz targets, benches and differential
 # tests. Hidden and unstable.

@@ -24,7 +24,7 @@
 //! `low ^ (low + 0)` is always below `TOP`, so the reference loop would
 //! shift in bytes forever.
 
-use super::{BIN_TOTAL, BIN_TOTAL_BITS, BOT, TOP, corrupt};
+use super::{BIN_TOTAL, BIN_TOTAL_BITS, BOT, TOP, corrupt, internal};
 use super::{IntoRangeInput, RangeDecoder, RangeEncoder, RangeInput, RangeOutput};
 use crate::error::{Error, Result};
 
@@ -385,11 +385,12 @@ impl<O: RangeOutput> CarrylessRangeEncoder<O> {
 
     /// [`flush`](Self::flush), then returns the output.
     ///
-    /// Errors: corrupt if the coder faulted (see [`RangeEncoder::faulted`]).
+    /// Errors: [`ErrorKind::Internal`](crate::ErrorKind::Internal) if the
+    /// coder faulted (see [`RangeEncoder::faulted`]).
     pub fn finish(mut self) -> Result<O> {
         self.flush();
         if self.faulted {
-            return Err(corrupt(
+            return Err(internal(
                 "carry-less range encoder: frequency total past the range",
             ));
         }
@@ -643,7 +644,7 @@ mod tests {
         assert!(matches!(
             e.finish(),
             Err(Error {
-                kind: crate::ErrorKind::Corrupt(_),
+                kind: crate::ErrorKind::Internal(_),
                 ..
             })
         ));

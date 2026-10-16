@@ -62,10 +62,17 @@ pub(crate) const BIN_TOTAL_BITS: u32 = 14;
 /// `PPMD_BIN_SCALE`.
 pub(crate) const BIN_TOTAL: u32 = 1 << BIN_TOTAL_BITS;
 
-/// The error a coder fault becomes.
+/// The error a decoder's coder fault becomes: the stream is corrupt.
 #[cold]
 pub(crate) fn corrupt(detail: &'static str) -> crate::Error {
     crate::Error::corrupt(detail)
+}
+
+/// The error an encoder's coder fault becomes: the model it encodes from
+/// never produces one, so it is the codec's own failure, not the data's.
+#[cold]
+pub(crate) fn internal(detail: &'static str) -> crate::Error {
+    crate::Error::internal(detail)
 }
 
 /// The operations the context model decodes symbols through.

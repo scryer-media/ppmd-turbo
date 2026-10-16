@@ -326,7 +326,8 @@ impl<C: DecodeCoder> StreamDecoder<C> {
                 self.phase = Phase::EndMarker;
                 Ok(progress(consumed, produced, SevenZStatus::EndMarker))
             }
-            Ok(Stop::Escape) => self.fail(Error::corrupt("unexpected escape stop")),
+            // The 7z run never looks for an escape byte, so it cannot stop at one.
+            Ok(Stop::Escape) => self.fail(Error::internal("escape stop in a 7z stream")),
         }
     }
 }
@@ -547,7 +548,7 @@ impl<C: EncodeCoder> StreamEncoder<C> {
 
     fn check_queue(&mut self) -> Result<()> {
         if self.queue.overflowed() {
-            return Err(self.fail(Error::corrupt("encoder emitted past its per-symbol bound")));
+            return Err(self.fail(Error::internal("encoder emitted past its per-symbol bound")));
         }
         Ok(())
     }
