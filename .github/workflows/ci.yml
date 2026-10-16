@@ -353,7 +353,7 @@ jobs:
 
   # A short, deterministic run of every target on both 64-bit Linux
   # architectures: a fixed libFuzzer seed and a fixed iteration count per
-  # target, starting from the generated seeds. cargo-fuzz builds with
+  # target, starting from the generated seeds where the target has them. cargo-fuzz builds with
   # AddressSanitizer. A crash fails the lane; the input is kept as an
   # artifact.
   fuzz:
@@ -375,6 +375,7 @@ jobs:
           - range_coders
           - checked_vs_unchecked
           - model_ops
+          - chunking_invariance
         include:
           - platform: linux-x86_64
             runner: ubuntu-24.04
@@ -399,6 +400,10 @@ jobs:
             runs: 10000
           - target: model_ops
             runs: 5000
+          # No seeds: libFuzzer grows its inputs from empty, so the early runs
+          # are short; 20000 is about 8 s on an Apple M5 Max.
+          - target: chunking_invariance
+            runs: 20000
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -417,7 +422,11 @@ jobs:
           RUNS: ${{ matrix.runs }}
         run: |
           mkdir -p "fuzz/corpus/$TARGET"
-          corpora=("fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET")
+          corpora=("fuzz/corpus/$TARGET")
+          # chunking_invariance has no committed seeds and starts empty.
+          if [ -d "fuzz/seeds/$TARGET" ]; then
+            corpora+=("fuzz/seeds/$TARGET")
+          fi
           # Minimised past crashes replay first, on every run.
           if [ -d "fuzz/regressions/$TARGET" ]; then
             corpora+=("fuzz/regressions/$TARGET")

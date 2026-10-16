@@ -10,7 +10,7 @@ iteration counts, no sleeps and no clocks.
 | unit and conformance tests | `src/`, `tests/conformance_*.rs`, `tests/fixtures/` | `cargo nextest run` and `cargo test --doc`, every platform |
 | encoder tests | `tests/encode_7z.rs`, `tests/encode_carryless.rs` | `cargo nextest run`, every platform; Miri runs the small cases |
 | hostile-input tests | `tests/hostile_decode.rs`, `tests/hostile_memory.rs`, `tests/hostile_fixtures/` | `cargo nextest run`, Memcheck, ASan |
-| fuzzing, ten targets | `fuzz/` | nine in the `fuzz` CI lane (short) and `fuzz-extended.yml` (long); `chunking_invariance` on demand |
+| fuzzing, ten targets | `fuzz/` | all ten in the `fuzz` CI lane (short) and `fuzz-extended.yml` (long) |
 | in-process differential | the fuzz targets, against ppmd-rust 1.5.0 | with fuzzing |
 | out-of-process oracles | `tools/ppmd-oracle/`, `tests/differential_binaries.rs`, `tests/encode_oracle_7zz.rs` | on demand, against `7zz` and `unrar` |
 | Miri | the library, `coder_differential` and `encode_carryless`, one job per test | the `unsafe-miri` CI lanes |
@@ -83,8 +83,8 @@ drives each step codec through input and output pieces chosen by a seeded
 generator, so a failing input reproduces its own split points.
 `range_coders`, `checked_vs_unchecked` and `model_ops` also call the model
 and the coders through `ppmd_turbo::internals` directly.
-`chunking_invariance` has no committed seeds and is not in the CI matrices;
-run it by hand.
+`chunking_invariance` has no committed seeds; both fuzz workflows start it
+from an empty corpus.
 
 Memory per iteration is bounded: decode arenas cap at 64 MiB, round-trip
 arenas at 16 MiB, RAR arenas at 16 MiB, generated payloads at 16 KiB and
@@ -100,10 +100,11 @@ cargo +nightly fuzz run decode_7z fuzz/corpus/decode_7z fuzz/seeds/decode_7z -- 
   -runs=20000 -seed=1 -rss_limit_mb=2048
 ```
 
-CI runs each of the nine seeded targets on x86_64 and aarch64 Linux from
-its seeds, with `-seed=1` and a fixed `-runs` per target (20000 for the
-decoders, 5000 for the round trips, 2000 for `structure_7z`, 50000 for
-`range_coders`, 10000 for `checked_vs_unchecked` and 5000 for `model_ops`).
+CI runs each of the ten targets on x86_64 and aarch64 Linux, the nine
+seeded ones from their seeds, with `-seed=1` and a fixed `-runs` per target
+(20000 for the decoders, 5000 for the round trips, 2000 for `structure_7z`,
+50000 for `range_coders`, 10000 for `checked_vs_unchecked`, 5000 for
+`model_ops` and 20000 for `chunking_invariance`).
 `fuzz-extended.yml` is
 dispatch-only. It takes `runs` and `seed` inputs, uploads crashes and the
 grown corpus, and can also run the `7zz` oracles.

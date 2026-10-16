@@ -53,6 +53,7 @@ jobs:
           - range_coders
           - checked_vs_unchecked
           - model_ops
+          - chunking_invariance
         include:
           - platform: linux-x86_64
             runner: ubuntu-24.04
@@ -80,7 +81,11 @@ jobs:
             *[!0-9]*|"") echo "runs and seed must be decimal integers" >&2; exit 2 ;;
           esac
           mkdir -p "fuzz/corpus/$TARGET"
-          corpora=("fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET")
+          corpora=("fuzz/corpus/$TARGET")
+          # chunking_invariance has no committed seeds and starts empty.
+          if [ -d "fuzz/seeds/$TARGET" ]; then
+            corpora+=("fuzz/seeds/$TARGET")
+          fi
           # Minimised past crashes replay first, on every run.
           if [ -d "fuzz/regressions/$TARGET" ]; then
             corpora+=("fuzz/regressions/$TARGET")
