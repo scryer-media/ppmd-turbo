@@ -17,9 +17,9 @@ is a released version.
 
     Input alone never causes `Internal`. It converts to `io::ErrorKind::Other`.
   - `RarPpmd::decode` with no block started since `new` or `forget` now
-    fails with `InvalidParameters`, because the caller is at fault. It used
-    to fail with `Corrupt`. `start_block(None)` with no model is still
-    `Corrupt`.
+    fails with `InvalidParameters`, because the caller is at fault, and
+    leaves the decoder as it was. It used to fail with `Corrupt` and poison
+    the decoder. `start_block(None)` with no model is still `Corrupt`.
   - `ErrorKind::AllocationFailed` and `ErrorKind::MemoryLimit` are
     `#[non_exhaustive]`. Build them with `ErrorKind::allocation_failed` and
     `ErrorKind::memory_limit`, and match them with `{ .. }`.
