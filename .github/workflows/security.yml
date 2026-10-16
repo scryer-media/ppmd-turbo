@@ -14,7 +14,7 @@ permissions:
 jobs:
   cargo-audit:
     name: cargo-audit
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - name: Checkout code
@@ -35,7 +35,7 @@ jobs:
 
   zizmor:
     name: zizmor
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     # The repository is private without GitHub Code Security, so code
     # scanning cannot take a SARIF upload. zizmor reports in the job log
