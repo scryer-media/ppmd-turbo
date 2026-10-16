@@ -192,8 +192,9 @@ impl SevenZEncoder {
     /// queued, then one symbol per input byte while `out` has room. An
     /// empty `out` takes nothing.
     ///
-    /// Errors: corrupt if the model went inconsistent, which a correct
-    /// encoder never does; invalid parameters after [`finish`](Self::finish)
+    /// Errors: [`ErrorKind::Internal`](crate::ErrorKind::Internal) if the
+    /// model went inconsistent, which a correct encoder never does; invalid
+    /// parameters after [`finish`](Self::finish)
     /// has started. Errors are sticky until [`reset`](Self::reset).
     pub fn encode(&mut self, input: &[u8], out: &mut [u8]) -> Result<Progress<()>> {
         self.inner.encode(input, out)

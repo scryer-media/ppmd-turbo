@@ -14,7 +14,7 @@ use super::{
     CTX_ONE_STATE, EXP_ESCAPE, INT_BITS, Model, SS, STATE_SIZE, hi_bits_flag3, update_prob_1,
 };
 use crate::error::Result;
-use crate::rc::{RangeEncoder, corrupt};
+use crate::rc::{RangeEncoder, internal};
 
 impl Model {
     /// Encodes one symbol: `Some(byte)` for a byte, `None` for the end
@@ -25,14 +25,14 @@ impl Model {
     /// to decode. The coder normalizes on every call, as [`RangeEncoder`]
     /// requires.
     ///
-    /// Errors: [`ErrorKind::Corrupt`](crate::ErrorKind::Corrupt) if the
+    /// Errors: [`ErrorKind::Internal`](crate::ErrorKind::Internal) if the
     /// coder met a range scaled to zero, which a model driven only through
     /// this method never produces.
     #[inline(always)]
     pub fn encode_symbol<E: RangeEncoder>(&mut self, rc: &mut E, sym: Option<u8>) -> Result<()> {
         self.encode_char(rc, sym.map_or(crate::SYM_END, i32::from));
         if rc.faulted() {
-            return Err(corrupt("frequency total exceeds the encoder's range"));
+            return Err(internal("frequency total exceeds the encoder's range"));
         }
         Ok(())
     }

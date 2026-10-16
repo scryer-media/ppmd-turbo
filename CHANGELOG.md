@@ -3,6 +3,34 @@
 All notable changes to this project are documented in this file. Each heading
 is a released version.
 
+## 0.2.0 - 2026-10-16
+
+- Breaking: every failure has its own `ErrorKind`, and each kind maps to
+  the `io::ErrorKind` of its class.
+  - New `ErrorKind::Internal(&'static str)` for a failure of the codec's own
+    invariants. These sites used to report `Corrupt` and now report
+    `Internal`:
+    - an encoder's range coder faulting, reported by `encode_symbol` and by
+      the range encoders' `finish`;
+    - a 7z encoder emitting past its per-symbol bound;
+    - a 7z decode stopping at an escape.
+
+    Input alone never causes `Internal`. It converts to `io::ErrorKind::Other`.
+  - `RarPpmd::decode` with no block started since `new` or `forget` now
+    fails with `InvalidParameters`, because the caller is at fault. It used
+    to fail with `Corrupt`. `start_block(None)` with no model is still
+    `Corrupt`.
+  - `ErrorKind::AllocationFailed` and `ErrorKind::MemoryLimit` are
+    `#[non_exhaustive]`. Build them with `ErrorKind::allocation_failed` and
+    `ErrorKind::memory_limit`, and match them with `{ .. }`.
+  - `Error` is `#[non_exhaustive]`. Build it with `Error::new`. Its `kind`
+    and `at` fields stay public.
+- `Error::is_resource_error()` is true for `MemoryLimit` and
+  `AllocationFailed`, alongside `is_data_error()`.
+- `Error` implements `core::error::Error` without the `std` feature. It
+  has no `source()`: its Display is the whole chain. The `io::Error` it
+  converts to gives it back with `downcast::<Error>()`.
+
 ## 0.1.1 - 2026-10-09
 
 - Licensed under Apache-2.0 alone. 0.1.0 was published as `MIT OR

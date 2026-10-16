@@ -290,8 +290,10 @@ impl RarPpmd {
             State::ModelEnd => return Ok(Err(Stopped::ModelEnd(0))),
             State::Ready => {}
         }
+        // `start_block(None)` without a model has already failed, so this is
+        // a decode with no block started since `new` or `forget`.
         if self.model.is_none() {
-            return Err(self.fail(Error::corrupt("PPMd block without model initialization")));
+            return Err(self.fail(Error::invalid_parameters()));
         }
         if !self.awaiting_init {
             return Ok(Ok(0));
@@ -320,8 +322,9 @@ impl RarPpmd {
     /// `consumed` again on the next call. With `input_is_last`, the coder
     /// reads zeros past the input up to the padding allowance.
     ///
-    /// Errors: a corrupt stream without a model or for a corrupt symbol;
-    /// truncation when the block's four initialization bytes are missing
+    /// Errors: invalid parameters with no block started since
+    /// [`new`](Self::new) or [`forget`](Self::forget); a corrupt stream for a
+    /// corrupt symbol; truncation when the block's four initialization bytes are missing
     /// from the last input, a byte needs more padding than allowed, or the
     /// end marker is met on padding.
     pub fn decode(
@@ -524,7 +527,7 @@ mod tests {
         assert_eq!(ppmd.next_symbol(&[0; 8], true), Err(e));
         ppmd.forget();
         let e = ppmd.decode(&[0; 8], true, &mut [0; 4], 2).unwrap_err();
-        assert!(matches!(e.kind, ErrorKind::Corrupt(_)));
+        assert_eq!(e.kind, ErrorKind::InvalidParameters);
     }
 
     #[test]

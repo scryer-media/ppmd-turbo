@@ -2,7 +2,9 @@
 //!
 //! The crate performs no I/O, so nothing here wraps an I/O error: a call
 //! fails because the stream is corrupt or truncated, because the parameters
-//! are out of range, or because the model's memory could not be had.
+//! or the order of calls are wrong, because the model's memory could not be
+//! had, or because one of the codec's own invariants failed. Each is its own
+//! [`ErrorKind`], and an [`Error`] has no `source()`: it is the whole chain.
 //!
 //! **Progress invariant.** Every step call returns a [`Progress`] that says
 //! how many input bytes it took and how many output bytes it wrote. A call
@@ -46,17 +48,39 @@ pub enum ErrorKind {
     /// a call came in an order the codec does not allow.
     InvalidParameters,
     /// The model's memory could not be allocated.
+    #[non_exhaustive]
     AllocationFailed {
         /// Bytes asked of the allocator.
         bytes: u64,
     },
     /// The model would need more memory than the caller allowed.
+    #[non_exhaustive]
     MemoryLimit {
         /// Bytes the stream's parameters need.
         required: u64,
         /// The caller's limit.
         limit: u64,
     },
+    /// One of the codec's own invariants failed: an encoder's range coder
+    /// faulted, or a step stopped in a way its framing cannot. Input alone
+    /// never causes it. The text says which, for diagnostics only.
+    Internal(&'static str),
+}
+
+impl ErrorKind {
+    /// [`ErrorKind::AllocationFailed`] for `bytes` asked of the allocator.
+    #[inline]
+    #[must_use]
+    pub const fn allocation_failed(bytes: u64) -> Self {
+        Self::AllocationFailed { bytes }
+    }
+
+    /// [`ErrorKind::MemoryLimit`]: `required` bytes needed, `limit` allowed.
+    #[inline]
+    #[must_use]
+    pub const fn memory_limit(required: u64, limit: u64) -> Self {
+        Self::MemoryLimit { required, limit }
+    }
 }
 
 /// An error from a decoder or encoder, with the stream position it was found
@@ -64,7 +88,9 @@ pub enum ErrorKind {
 ///
 /// Errors are `Copy`: after one, the codec repeats it on every later call
 /// until it is reset, so a caller that retries sees exactly the same error.
+/// Build one with [`Error::new`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Error {
     /// What went wrong.
     pub kind: ErrorKind,
@@ -75,6 +101,7 @@ pub struct Error {
 impl Error {
     /// An error of `kind` at the start of the stream.
     #[inline]
+    #[must_use]
     pub const fn new(kind: ErrorKind) -> Self {
         Self {
             kind,
@@ -106,6 +133,18 @@ impl Error {
         matches!(self.kind, ErrorKind::Corrupt(_) | ErrorKind::Truncated)
     }
 
+    /// Whether memory refused the model ([`ErrorKind::MemoryLimit`] or
+    /// [`ErrorKind::AllocationFailed`]), as opposed to the data, the
+    /// parameters or the codec. A container reports these as a resource
+    /// limit rather than as damage.
+    #[inline]
+    pub const fn is_resource_error(&self) -> bool {
+        matches!(
+            self.kind,
+            ErrorKind::MemoryLimit { .. } | ErrorKind::AllocationFailed { .. }
+        )
+    }
+
     #[cold]
     #[inline(never)]
     pub(crate) const fn corrupt(detail: &'static str) -> Self {
@@ -122,6 +161,12 @@ impl Error {
     #[inline(never)]
     pub(crate) const fn invalid_parameters() -> Self {
         Self::new(ErrorKind::InvalidParameters)
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) const fn internal(detail: &'static str) -> Self {
+        Self::new(ErrorKind::Internal(detail))
     }
 
     /// The same error at `at`.
@@ -150,6 +195,7 @@ impl fmt::Display for Error {
                 f,
                 "the PPMd model needs {required} bytes, more than the {limit}-byte limit"
             )?,
+            ErrorKind::Internal(detail) => write!(f, "internal PPMd codec failure: {detail}")?,
         }
         write!(
             f,
@@ -159,14 +205,13 @@ impl fmt::Display for Error {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// Errors as [`std::io::Error`]s, for code that drives a codec through
 /// `Read` or `Write`: a corrupt stream is `InvalidData`, a truncated one
-/// `UnexpectedEof`, bad parameters `InvalidInput`, and a memory refusal
-/// `OutOfMemory`. The [`Error`] stays inside and can be recovered with
-/// `get_ref()` and `downcast_ref::<Error>()`.
+/// `UnexpectedEof`, bad parameters `InvalidInput`, a memory refusal
+/// `OutOfMemory`, and an internal failure `Other`. The [`Error`] stays inside
+/// and can be recovered with `downcast::<Error>()`.
 #[cfg(feature = "std")]
 impl From<Error> for std::io::Error {
     fn from(e: Error) -> Self {
@@ -176,6 +221,7 @@ impl From<Error> for std::io::Error {
             ErrorKind::Truncated => Io::UnexpectedEof,
             ErrorKind::InvalidParameters => Io::InvalidInput,
             ErrorKind::AllocationFailed { .. } | ErrorKind::MemoryLimit { .. } => Io::OutOfMemory,
+            ErrorKind::Internal(_) => Io::Other,
         };
         std::io::Error::new(kind, e)
     }
@@ -202,26 +248,128 @@ pub struct Progress<S> {
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
     use super::*;
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
 
-    #[test]
-    fn display_avoids_the_words_downstream_classifiers_match() {
-        let kinds = [
+    fn every_kind() -> [ErrorKind; 7] {
+        [
             ErrorKind::Corrupt("model pointer or frequency out of bounds"),
             ErrorKind::Corrupt("7z range coder: first byte is not zero"),
             ErrorKind::Truncated,
             ErrorKind::InvalidParameters,
-            ErrorKind::AllocationFailed { bytes: 1 << 30 },
-            ErrorKind::MemoryLimit {
-                required: 1 << 30,
-                limit: 1 << 20,
-            },
-        ];
-        for kind in kinds {
+            ErrorKind::allocation_failed(1 << 30),
+            ErrorKind::memory_limit(1 << 30, 1 << 20),
+            ErrorKind::Internal("escape stop in a 7z stream"),
+        ]
+    }
+
+    fn chain(e: &(dyn core::error::Error + 'static)) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut next = Some(e);
+        while let Some(e) = next {
+            out.push(e.to_string());
+            next = e.source();
+        }
+        out
+    }
+
+    #[test]
+    fn display_avoids_the_words_downstream_classifiers_match() {
+        for kind in every_kind() {
             let text = Error::new(kind).to_string().to_ascii_lowercase();
             for word in ["method", "unsupported", "password", "encrypted"] {
                 assert!(!text.contains(word), "{text}");
             }
+        }
+    }
+
+    #[test]
+    fn display_is_lowercase_text_without_trailing_punctuation() {
+        for kind in every_kind() {
+            let text = Error::new(kind).to_string();
+            let first = text.chars().next().unwrap();
+            assert!(!first.is_uppercase(), "{text}");
+            assert!(!text.ends_with(['.', '!', '?']), "{text}");
+            assert_ne!(text, alloc::format!("{:?}", Error::new(kind)));
+        }
+    }
+
+    #[test]
+    fn an_error_is_its_own_whole_chain() {
+        let at = Position {
+            input: 7,
+            output: 9,
+        };
+        let cases = [
+            (
+                ErrorKind::Corrupt("bad symbol"),
+                "corrupt PPMd stream: bad symbol (at input byte 7, output byte 9)",
+            ),
+            (
+                ErrorKind::Truncated,
+                "truncated PPMd stream (at input byte 7, output byte 9)",
+            ),
+            (
+                ErrorKind::InvalidParameters,
+                "invalid PPMd parameters (at input byte 7, output byte 9)",
+            ),
+            (
+                ErrorKind::allocation_failed(4096),
+                "could not allocate 4096 bytes for the PPMd model (at input byte 7, output byte 9)",
+            ),
+            (
+                ErrorKind::memory_limit(4096, 1024),
+                "the PPMd model needs 4096 bytes, more than the 1024-byte limit (at input byte 7, output byte 9)",
+            ),
+            (
+                ErrorKind::Internal("range coder fault"),
+                "internal PPMd codec failure: range coder fault (at input byte 7, output byte 9)",
+            ),
+        ];
+        for (kind, text) in cases {
+            let e = Error::new(kind).at(at);
+            assert_eq!(chain(&e), [text]);
+        }
+    }
+
+    #[test]
+    fn the_error_crosses_threads_and_lives_forever() {
+        fn assert_bounds<T: Send + Sync + 'static>() {}
+        assert_bounds::<Error>();
+        assert_bounds::<ErrorKind>();
+    }
+
+    #[test]
+    fn the_constructors_build_the_structured_variants() {
+        assert_eq!(
+            ErrorKind::allocation_failed(5),
+            ErrorKind::AllocationFailed { bytes: 5 }
+        );
+        assert_eq!(
+            ErrorKind::memory_limit(8, 2),
+            ErrorKind::MemoryLimit {
+                required: 8,
+                limit: 2
+            }
+        );
+        let e = Error::new(ErrorKind::Truncated);
+        assert_eq!(e.kind(), ErrorKind::Truncated);
+        assert_eq!(e.position(), Position::default());
+    }
+
+    #[test]
+    fn each_kind_falls_in_exactly_one_class() {
+        for kind in every_kind() {
+            let e = Error::new(kind);
+            let data = matches!(kind, ErrorKind::Corrupt(_) | ErrorKind::Truncated);
+            let resource = matches!(
+                kind,
+                ErrorKind::AllocationFailed { .. } | ErrorKind::MemoryLimit { .. }
+            );
+            assert_eq!(e.is_data_error(), data, "{kind:?}");
+            assert_eq!(e.is_resource_error(), resource, "{kind:?}");
         }
     }
 
@@ -233,7 +381,9 @@ mod tests {
             (ErrorKind::Corrupt("x"), Io::InvalidData),
             (ErrorKind::Truncated, Io::UnexpectedEof),
             (ErrorKind::InvalidParameters, Io::InvalidInput),
-            (ErrorKind::AllocationFailed { bytes: 1 }, Io::OutOfMemory),
+            (ErrorKind::allocation_failed(1), Io::OutOfMemory),
+            (ErrorKind::memory_limit(2, 1), Io::OutOfMemory),
+            (ErrorKind::Internal("x"), Io::Other),
         ] {
             let e = Error::new(kind).at(Position {
                 input: 3,
@@ -241,8 +391,9 @@ mod tests {
             });
             let converted = std::io::Error::from(e);
             assert_eq!(converted.kind(), io);
-            let inner = converted.get_ref().unwrap().downcast_ref::<Error>();
-            assert_eq!(inner, Some(&e));
+            assert_eq!(converted.to_string(), e.to_string());
+            assert_eq!(chain(&converted), [e.to_string()]);
+            assert_eq!(converted.downcast::<Error>().unwrap(), e);
         }
     }
 }

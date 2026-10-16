@@ -53,10 +53,10 @@
 //!
 //! # Features
 //!
-//! - `std` (default): the [`io`] adapters, `std::error::Error`, the
-//!   `io::Error` conversion and run-time x86 SIMD detection. Without it the
-//!   crate builds on `core` and `alloc`, choosing SIMD tiers at compile
-//!   time; this is checked, not promised.
+//! - `std` (default): the [`io`] adapters, the `io::Error` conversion and
+//!   run-time x86 SIMD detection. Without it the crate builds on `core` and
+//!   `alloc`, choosing SIMD tiers at compile time; this is checked, not
+//!   promised. [`Error`] implements `core::error::Error` either way.
 //! - `internals`: the engine, for the crate's own fuzz targets, benches and
 //!   differential tests. Hidden and unstable.
 //!

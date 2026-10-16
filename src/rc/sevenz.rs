@@ -21,7 +21,7 @@
 //! step counts makes the coder exact whatever totals the model hands it.
 
 use super::{BIN_TOTAL_BITS, IntoRangeInput, RangeDecoder, RangeEncoder, RangeInput, RangeOutput};
-use super::{TOP, corrupt};
+use super::{TOP, corrupt, internal};
 use crate::error::{Error, Result};
 
 /// The 7z decoder's registers, kept by a step decoder between calls.
@@ -321,11 +321,12 @@ impl<O: RangeOutput> SevenZipRangeEncoder<O> {
 
     /// [`flush`](Self::flush), then returns the output.
     ///
-    /// Errors: corrupt if the coder faulted (see [`RangeEncoder::faulted`]).
+    /// Errors: [`ErrorKind::Internal`](crate::ErrorKind::Internal) if the
+    /// coder faulted (see [`RangeEncoder::faulted`]).
     pub fn finish(mut self) -> Result<O> {
         self.flush();
         if self.faulted {
-            return Err(corrupt("7z range encoder: frequency total past the range"));
+            return Err(internal("7z range encoder: frequency total past the range"));
         }
         Ok(self.out)
     }
@@ -596,7 +597,7 @@ mod tests {
         assert!(matches!(
             e.finish(),
             Err(Error {
-                kind: crate::ErrorKind::Corrupt(_),
+                kind: crate::ErrorKind::Internal(_),
                 ..
             })
         ));
