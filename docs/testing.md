@@ -125,8 +125,13 @@ cargo test --locked --manifest-path fuzz/Cargo.toml --lib -- --ignored regenerat
 1. Download the `fuzz-findings-*` artifact and reproduce:
    `cargo +nightly fuzz run <target> crash-<sha>`.
 2. Minimise it: `cargo +nightly fuzz tmin <target> crash-<sha>`.
-3. Commit the minimised input as `fuzz/regressions/<target>/<what-it-is>`.
-   Both fuzz workflows replay that directory on every run.
+3. Add the minimised input to `REGRESSIONS` in `fuzz/src/seeds.rs` as a
+   byte literal, `(<target>, <what-it-is>, &[..])`, then regenerate the
+   seeds (the command above). The generator writes it to
+   `fuzz/regressions/<target>/<what-it-is>`, which both fuzz workflows
+   replay on every run. That directory is gitignored and the `hygiene` lane
+   rejects anything tracked under it: a regression is never committed as a
+   file.
 4. Add a named case to `tests/hostile_decode.rs` that pins down the root
    cause in decoder terms (parameters and stream, printed in hex on
    failure). The fuzz input format is a harness detail; the hostile test is
