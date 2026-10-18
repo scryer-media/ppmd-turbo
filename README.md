@@ -1,33 +1,34 @@
 # ppmd-turbo
 
-PPMd variant H (7-Zip's "Ppmd7") compression and decompression in Rust,
-bit-exact with 7-Zip and RAR, performance-first.
+Fast PPMd compression for Rust. It reads and writes the PPMd that 7z
+archives use and reads the PPMd inside RAR 2.9 to 4.x archives, with output
+identical to 7-Zip's and unrar's.
 
-It covers the variant H context model, sub-allocator and secondary escape
-estimation, both range coders that carry it (RAR's carry-less coder and
-7-Zip's LZMA-style coder) and both framings (RAR's block stream and the 7z
-`PPMD` method).
+```toml
+[dependencies]
+ppmd-turbo = "0.2"
+```
 
-## Status
-
-Pre-release. The API is unstable until 1.0.
+PPMd here is variant H, the one 7-Zip calls "Ppmd7". The crate has no
+dependencies, and without its default `std` feature it builds as `no_std`.
+The API can still change before 1.0.
 
 | Format | Decode | Encode |
 | --- | --- | --- |
-| RAR 2.9-4.x PPMd blocks (RAR3) | implemented | out of scope by design; a raw carry-less encoder exists for round-trip tests only |
-| RAR5 | not applicable: RAR5 has no PPMd | not applicable |
-| 7z `PPMD` method | implemented | implemented |
+| 7z `PPMD` method | yes | yes |
+| RAR 2.9 to 4.x PPMd blocks | yes | no: writing RAR is out of scope |
+| RAR5 | RAR5 has no PPMd | – |
 
-RAR streams decode to exactly what unrar produces; 7z output is byte-identical
-to 7-Zip's for the same order and memory size, decoding and encoding.
+7z output is byte-identical to 7-Zip's for the same order and memory size,
+and RAR streams decode to exactly what unrar produces.
 
 ## Usage
 
-Every codec is a step machine over caller slices: a call takes an input
-slice and an output slice, returns how many bytes it consumed and produced
-and why it stopped, and never keeps caller bytes. A container drives it from
-its own buffers; `ppmd_turbo::io` wraps the 7z pair in `BufRead` and
-`Write` adapters for code that wants streams.
+Each codec takes an input buffer and an output buffer, reports how much of
+each it used and why it stopped, and keeps none of your bytes. A container
+drives it from its own buffers. For code that wants streams,
+`ppmd_turbo::io` wraps the 7z encoder and decoder as `Write` and `BufRead`
+adapters.
 
 ```rust
 use ppmd_turbo::{Params, SevenZDecoder, SevenZEncoder, SevenZStatus};
@@ -48,58 +49,57 @@ assert_eq!(step.status, SevenZStatus::ReachedSize);
 assert_eq!(&out[..], &data[..]);
 ```
 
-`RarPpmd` decodes RAR 2.9-4.x PPMd blocks for an unpacker that owns the
-RAR framing: `start_block` per block header, `decode` for literals up to the
-escape character, and `next_symbol` for the command bytes after it.
-`Params::memory_footprint` is the exact heap a codec allocates, and an
-`Arena` can move from one codec to the next.
+`RarPpmd` decodes RAR's PPMd blocks for a RAR reader that handles the rest
+of the format: `start_block` for each block header, `decode` for the data,
+and `next_symbol` for the command bytes after an escape.
+
+`Params::memory_footprint` is exactly how much memory a codec will
+allocate, and an `Arena` can be handed from one codec to the next instead of
+allocating again.
+
+Every failure is an `Error` with a kind (corrupt data, bad parameters, a
+memory limit, and so on) and the position in the stream where it happened.
 
 ## Testing
 
-Beyond unit and conformance tests, every decoder and encoder entry point is
-covered as follows:
+Besides unit tests and comparisons with 7-Zip and unrar:
 
-- hostile-input tests: truncation, bit flips, out-of-range parameters,
-  restart storms, size lies and an exact heap footprint under a counting
-  allocator;
-- eight cargo-fuzz targets, differential against ppmd-rust 1.5.0, including
-  one that checks arbitrary input and output splits decode and encode as
-  one piece does;
-- Miri and AddressSanitizer lanes;
-- out-of-process checks against `7zz` and `unrar` (`tools/ppmd-oracle`).
+- hostile input: truncation, flipped bits, out-of-range parameters, false
+  sizes, and a check that the memory used is exactly what
+  `memory_footprint` said;
+- ten fuzz targets, several of them comparing results with ppmd-rust 1.5.0,
+  one checking that input and output split anywhere decode and encode the
+  same as in one piece;
+- Miri, Valgrind and AddressSanitizer over the `unsafe` code;
+- separate-process checks against `7zz` and `unrar` (`tools/ppmd-oracle`).
 
 ### Fixtures
 
-The repository holds no binary files. Every fixture stream, fuzz seed and
-fuzz regression is generated from committed recipes, and one command writes
-them all:
+The repository holds no binary files. Every test file and fuzz seed is
+generated from committed recipes, by one command:
 
 ```sh
 cargo run --locked --release -p ppmd-corpus -- fixtures
 ```
 
-It encodes the ppmd-rust rows in process, has 7-Zip's `7zz` write the 7-Zip
-rows, fetches the RARLAB-written and libarchive source archives of the three
-RAR rows by digest from rarpar's published test corpus (or reads them from
-`--rar-source DIR`), runs the fuzz crate's seed generator
-(`fuzz/src/seeds.rs`), and checks every file against
-`tools/ppmd-corpus/fixtures.sha256`. A missing `7zz` or source skips those
-rows with a note; `--require-all` makes that an error, as CI does.
+It writes the 7-Zip files with `7zz`, fetches the RAR test archives by
+digest from rarpar's published test corpus (or reads them from
+`--rar-source DIR`), and checks every file against
+`tools/ppmd-corpus/fixtures.sha256`. A missing `7zz` or archive skips those
+files with a note; `--require-all` makes that an error, as CI does.
 
-`cargo test` needs none of it to run: the ppmd-rust and hostile fixtures are
-built in memory through the same code, and the `7zz` and RAR rows are skipped
-until the command has written them (set `PPMD_TURBO_REQUIRE_FIXTURES=1` to
-fail instead).
-
-See [docs/testing.md](docs/testing.md).
+`cargo test` runs without them: the files that need no outside tool are
+built in memory, and the `7zz` and RAR tests are skipped until the command
+has written their files. Set `PPMD_TURBO_REQUIRE_FIXTURES=1` to fail
+instead. More in [docs/testing.md](docs/testing.md).
 
 ## Benchmarks
 
-The harness is a Go program under `bench/ppmd-turbo-bench`. It runs
-`tools/ppmd-bench` (ppmd-turbo and ppmd-rust), 7-Zip's `7zz` and, where
-installed, RARLAB's `unrar` as separate processes over a generated corpus, and
-records wall time, CPU time and peak RSS. Ratios are written reference/ours, so
-a ratio above 1 means ppmd-turbo is better.
+`bench/ppmd-turbo-bench` is a Go program that runs ppmd-turbo and ppmd-rust
+(through `tools/ppmd-bench`), 7-Zip's `7zz` and, where installed, `unrar`, each
+as its own process, and records wall time, CPU time and peak memory. Ratios
+are the reference's number divided by ppmd-turbo's, so above 1 means
+ppmd-turbo did better.
 
 ```sh
 cargo build --locked --release -p ppmd-bench -p ppmd-corpus
@@ -108,10 +108,10 @@ cargo build --locked --release -p ppmd-bench -p ppmd-corpus
 ./bench/ppmd-turbo-bench/ppmd-turbo-bench run --profile quick --machine <label>
 ```
 
-Profiles are `quick`, `full` and `fleet`; reports land in
-`bench/results/<machine>-<profile>/`. Only the 7z coder is benchmarked for
-encoding. See [docs/benchmarking.md](docs/benchmarking.md) for the corpora,
-the RAR inputs and how to read a report.
+The run profiles are `quick`, `full` and `fleet`, and reports land in
+`bench/results/<machine>-<profile>/`. Encoding is benchmarked for 7z only.
+[docs/benchmarking.md](docs/benchmarking.md) has the inputs and how to read
+a report.
 
 ## Credits
 

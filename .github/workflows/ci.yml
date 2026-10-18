@@ -37,7 +37,7 @@ jobs:
   # contributor's machine; this checks the tree whatever the hook saw.
   hygiene:
     name: hygiene
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -91,7 +91,7 @@ jobs:
 
   fmt:
     name: fmt
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -113,9 +113,9 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - platform: macos-aarch64
             runner: macos-15
           - platform: windows-x86_64
@@ -135,7 +135,7 @@ jobs:
 
   docs:
     name: docs
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       RUSTDOCFLAGS: -D warnings
@@ -154,7 +154,7 @@ jobs:
   # tools/ppmd-corpus/fixtures.sha256, so no row is silently skipped.
   fixtures:
     name: fixtures
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -197,9 +197,9 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - platform: macos-aarch64
             runner: macos-15
           - platform: macos-x86_64
@@ -249,9 +249,9 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
     env:
       PPMD_TURBO_REQUIRE_FIXTURES: "1"
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
@@ -289,10 +289,10 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             target: x86_64-unknown-linux-gnu
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             target: aarch64-unknown-linux-gnu
     env:
       PPMD_TURBO_REQUIRE_FIXTURES: "1"
@@ -324,7 +324,7 @@ jobs:
   # the job limit a test. All of them run under Memcheck and ASan above.
   unsafe-miri-plan:
     name: unsafe-miri-plan
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -349,7 +349,7 @@ jobs:
   unsafe-miri:
     name: unsafe-miri-${{ matrix.binary }}-${{ matrix.test }}
     needs: unsafe-miri-plan
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -379,7 +379,7 @@ jobs:
     name: unsafe-complete
     if: always()
     needs: [unsafe-valgrind, unsafe-asan, unsafe-miri-plan, unsafe-miri]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       # A skipped or cancelled lane is as much a gap as a failed one.
@@ -392,7 +392,7 @@ jobs:
   # (the fixtures job checks the generated seeds against their digests).
   fuzz-harness:
     name: fuzz-harness
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -437,9 +437,9 @@ jobs:
           - chunking_invariance
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           # Iterations sized to about a minute each on a hosted runner.
           - target: decode_7z
             runs: 20000
@@ -502,7 +502,7 @@ jobs:
 
   msrv:
     name: msrv
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -522,7 +522,7 @@ jobs:
 
   package:
     name: package
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -538,7 +538,7 @@ jobs:
     name: ci-complete
     if: always()
     needs: [hygiene, fmt, clippy, docs, fixtures, test, unsafe-complete, fuzz-harness, fuzz, msrv, package]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       # Every required lane must have succeeded: a skipped lane is as much a
