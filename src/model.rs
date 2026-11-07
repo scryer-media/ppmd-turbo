@@ -1151,16 +1151,22 @@ impl Model {
                 if wide {
                     s = self.skip_wide(&char_mask, stats, end, &mut count);
                 }
+                // As `Ppmd7Dec.c` walks it: subtract, step, and test the
+                // sign, one branch a state. `count < hi_cnt`, a sum of
+                // byte frequencies, so it fits an `i32`, and the state
+                // that takes it below zero is the one it falls in.
+                let mut left = count as i32;
                 loop {
                     let f = self.freq_at(s) & char_mask[self.sym_at(s) as usize] as u32;
-                    if count < f {
+                    left -= f as i32;
+                    s += SS;
+                    if left < 0 {
                         break;
                     }
-                    count -= f;
-                    s += SS;
                 }
+                s -= SS;
                 let freq = self.freq_at(s);
-                rc.decode(hi - count, freq);
+                rc.decode(hi - (left + freq as i32) as u32, freq);
                 self.see.get(see).update();
                 self.found_state = s as u32;
                 let sym = self.sym_at(s);
