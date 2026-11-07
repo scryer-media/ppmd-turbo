@@ -371,6 +371,24 @@ impl Arena {
         }
     }
 
+    /// Asks the cache for the line holding `off`, a record the model reads
+    /// soon. A hint only: it changes no byte and no result, and on targets
+    /// without the hint it does nothing.
+    #[inline(always)]
+    pub(crate) fn prefetch(&self, off: u32) {
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        {
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let p = self.base.as_ptr().wrapping_add(off as usize);
+            // SAFETY: a prefetch reads nothing the program can see and
+            // never faults, whatever the address; `wrapping_add` keeps the
+            // address computation itself defined.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(p.cast_const().cast()) }
+        }
+        #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+        let _ = off;
+    }
+
     /// Swaps the 6-byte records at `a` and `b`.
     #[inline(always)]
     pub(crate) fn swap6(&mut self, a: u32, b: u32) {

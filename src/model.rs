@@ -489,6 +489,9 @@ impl Model {
         let fs = self.found_state;
         let fs_sym = self.sym(fs);
         let mc = self.min_context;
+        // `FoundState`'s successor is usually the next context: start its
+        // record on its way while the suffix's frequencies are updated.
+        self.a.prefetch(self.successor(fs));
 
         if self.freq(fs) < MAX_FREQ / 4 && self.suffix(mc) != 0 {
             // Update the frequency in the suffix context.
