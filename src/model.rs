@@ -592,7 +592,7 @@ impl Model {
                             return;
                         };
                         let old_ptr = self.stats(c);
-                        self.a.copy(old_ptr, ptr, old_nu * UNIT_SIZE);
+                        self.a.copy_units(old_ptr, ptr, old_nu);
                         self.a.insert_node(old_ptr, i);
                         self.set_stats(c, ptr);
                     }
@@ -737,7 +737,7 @@ impl Model {
                     if self.a.has_free(i1) {
                         let ptr = self.a.remove_node(i1);
                         self.set_stats(mc, ptr);
-                        self.a.copy(stats, ptr, n1 * UNIT_SIZE);
+                        self.a.copy_units(stats, ptr, n1);
                         self.a.insert_node(stats, i0);
                     } else {
                         self.a.split_block(stats, i0, i1);
