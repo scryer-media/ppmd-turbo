@@ -187,6 +187,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "megabytes read a byte at a time; the advice is compiled out under Miri"
+    )]
     fn arenas_around_huge_page_sizes_are_zeroed_and_whole() {
         const HUGE: u64 = 2 << 20;
         for bytes in [1, HUGE - 1, HUGE, HUGE + 1, 5 * HUGE + 3] {
