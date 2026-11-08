@@ -11,14 +11,22 @@ Every `unsafe` block carries a `// SAFETY:` proof. They are in four places:
 
 - `src/arena.rs`: fallible allocation. `try_zeroed` takes a zeroed block from
   the global allocator and hands it to a `Vec<u8>`; `try_box` does the same
-  for a `Box<T>`. A refused allocation is an error, never an abort.
+  for a `Box<T>`. A refused allocation is an error, never an abort. On
+  Linux with `std`, `advise_huge_pages` declares `madvise` itself and asks
+  for transparent huge pages over the whole 2 MiB pages inside a fresh
+  arena; the advice changes how the kernel backs the range, never its
+  bytes, and its result is ignored.
 - `src/alloc.rs`: the model's arena. The `Vec<u8>` is taken apart into its
   raw parts and rebuilt in `into_vec` and `Drop`; `Send` and `Sync` are
   implemented by hand; and the accessors (`at`, `ptr`, the byte, `u16`,
-  `u32` and six-byte state reads and writes, `copy`, `swap`) address the
+  `u32` and six-byte state reads and writes, `copy`, `copy_units`, which
+  moves whole 12-byte units as one 8-byte and one 4-byte unaligned read and
+  write, and `swap`) address the
   arena through one pointer without bounds checks in release builds. Every
   offset comes from the model's own records, and debug builds check each
-  access with `debug_assert!`.
+  access with `debug_assert!`. `prefetch` hands an arena address to
+  `_mm_prefetch` on x86-64; a prefetch reads nothing the program sees and
+  cannot fault.
 - `src/model/simd.rs`: the escape-path kernels that sum and skip masked
   state frequencies, NEON on little-endian ARM64 and SSSE3, AVX2 and
   AVX-512 (VBMI and BW) on x86-64. They read 16 or 32 six-byte states at a
@@ -60,6 +68,11 @@ used, and no test is retried.
 ## Not instrumented
 
 What no lane above checks, so that a pass is not read as more than it is:
+
+- **The huge-page advice and the prefetch hint under Miri.** Both are
+  compiled out under `cfg(miri)`. Neither changes a byte the model reads:
+  the arena tests check a fresh arena around every huge-page boundary is
+  zeroed and whole, and every bit-exactness test runs with both on.
 
 - **The SIMD kernels under Miri.** They are compiled out under `cfg(miri)`
   (`not(miri)` on every kernel), so Miri checks the scalar escape path only.
