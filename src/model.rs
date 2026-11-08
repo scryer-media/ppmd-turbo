@@ -489,6 +489,9 @@ impl Model {
         let fs = self.found_state;
         let fs_sym = self.sym(fs);
         let mc = self.min_context;
+        // `FoundState`'s successor is usually the next context: start its
+        // record on its way while the suffix's frequencies are updated.
+        self.a.prefetch(self.successor(fs));
 
         if self.freq(fs) < MAX_FREQ / 4 && self.suffix(mc) != 0 {
             // Update the frequency in the suffix context.
@@ -592,7 +595,7 @@ impl Model {
                             return;
                         };
                         let old_ptr = self.stats(c);
-                        self.a.copy(old_ptr, ptr, old_nu * UNIT_SIZE);
+                        self.a.copy_units(old_ptr, ptr, old_nu);
                         self.a.insert_node(old_ptr, i);
                         self.set_stats(c, ptr);
                     }
@@ -737,7 +740,7 @@ impl Model {
                     if self.a.has_free(i1) {
                         let ptr = self.a.remove_node(i1);
                         self.set_stats(mc, ptr);
-                        self.a.copy(stats, ptr, n1 * UNIT_SIZE);
+                        self.a.copy_units(stats, ptr, n1);
                         self.a.insert_node(stats, i0);
                     } else {
                         self.a.split_block(stats, i0, i1);
@@ -1151,16 +1154,22 @@ impl Model {
                 if wide {
                     s = self.skip_wide(&char_mask, stats, end, &mut count);
                 }
+                // As `Ppmd7Dec.c` walks it: subtract, step, and test the
+                // sign, one branch a state. `count < hi_cnt`, a sum of
+                // byte frequencies, so it fits an `i32`, and the state
+                // that takes it below zero is the one it falls in.
+                let mut left = count as i32;
                 loop {
                     let f = self.freq_at(s) & char_mask[self.sym_at(s) as usize] as u32;
-                    if count < f {
+                    left -= f as i32;
+                    s += SS;
+                    if left < 0 {
                         break;
                     }
-                    count -= f;
-                    s += SS;
                 }
+                s -= SS;
                 let freq = self.freq_at(s);
-                rc.decode(hi - count, freq);
+                rc.decode(hi - (left + freq as i32) as u32, freq);
                 self.see.get(see).update();
                 self.found_state = s as u32;
                 let sym = self.sym_at(s);

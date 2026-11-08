@@ -70,11 +70,55 @@ pub(crate) fn try_zeroed(bytes: u64) -> Result<Vec<u8>> {
     if ptr.is_null() {
         return Err(alloc_failed(bytes));
     }
+    advise_huge_pages(ptr, len);
     // SAFETY: `ptr` came from the global allocator, which `Vec` uses, with
     // the layout of `[u8; len]` (alignment 1, `len` bytes); every byte is
     // initialized (zeroed); length and capacity are both `len`.
     Ok(unsafe { Vec::from_raw_parts(ptr, len, len) })
 }
+
+/// Asks Linux to back the whole 2 MiB pages inside a fresh allocation with
+/// transparent huge pages, as 7-Zip's `BigAlloc` does for its PPMd arena.
+///
+/// The model reaches all over its arena, so with 4 KiB pages a large arena
+/// misses the TLB on a good share of its accesses; on a kernel whose
+/// huge-page mode is `madvise` (the common default) only an advised range
+/// gets huge pages. The advice changes how the kernel backs the memory,
+/// never its contents, and the pages are still faulted in lazily, now
+/// 2 MiB at a time. A kernel that refuses the advice leaves the arena as it
+/// was, so the result is ignored. The head and tail outside whole huge
+/// pages keep small pages.
+#[cfg(all(target_os = "linux", feature = "std", not(miri)))]
+fn advise_huge_pages(ptr: *mut u8, len: usize) {
+    const HUGE_PAGE: usize = 2 << 20;
+    // `MADV_HUGEPAGE` in `<linux/mman.h>`, the same value on every
+    // architecture.
+    const MADV_HUGEPAGE: core::ffi::c_int = 14;
+    unsafe extern "C" {
+        fn madvise(
+            addr: *mut core::ffi::c_void,
+            len: usize,
+            advice: core::ffi::c_int,
+        ) -> core::ffi::c_int;
+    }
+    let addr = ptr as usize;
+    let Some(start) = addr.checked_next_multiple_of(HUGE_PAGE) else {
+        return;
+    };
+    let end = (addr + len) & !(HUGE_PAGE - 1);
+    if end <= start {
+        return;
+    }
+    let first = ptr.wrapping_add(start - addr);
+    // SAFETY: `[start, end)` lies inside the `len`-byte allocation at
+    // `ptr`, starts on a page boundary, and is a whole number of pages.
+    // `MADV_HUGEPAGE` reads and writes no byte of it: it only sets how the
+    // kernel backs the range, and the bytes read the same either way.
+    let _ = unsafe { madvise(first.cast(), end - start, MADV_HUGEPAGE) };
+}
+
+#[cfg(not(all(target_os = "linux", feature = "std", not(miri))))]
+fn advise_huge_pages(_ptr: *mut u8, _len: usize) {}
 
 /// Grows or shrinks `buf` to exactly `len` bytes, reusing its allocation
 /// when its capacity already covers `len`, otherwise allocating a fresh
@@ -140,5 +184,24 @@ mod tests {
         fit(&mut buf, 8192).unwrap();
         assert_eq!(buf.len(), 8192);
         assert!(Arena::try_new(0).unwrap().capacity() == 0);
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "megabytes read a byte at a time; the advice is compiled out under Miri"
+    )]
+    fn arenas_around_huge_page_sizes_are_zeroed_and_whole() {
+        const HUGE: u64 = 2 << 20;
+        for bytes in [1, HUGE - 1, HUGE, HUGE + 1, 5 * HUGE + 3] {
+            let mut buf = try_zeroed(bytes).unwrap();
+            assert_eq!(buf.len() as u64, bytes);
+            assert!(buf.iter().all(|&b| b == 0), "{bytes} bytes not zeroed");
+            let last = buf.len() - 1;
+            buf[last] = 0x5A;
+            assert_eq!(buf[last], 0x5A);
+            buf[0] = 0xA5;
+            assert_eq!(buf[0], 0xA5);
+        }
     }
 }

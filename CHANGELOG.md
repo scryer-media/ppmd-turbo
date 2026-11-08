@@ -3,6 +3,24 @@
 All notable changes to this project are documented in this file. Each heading
 is a released version.
 
+## 0.2.1 - 2026-11-07
+
+- 7z PPMd (variant H) decodes 16% faster on an x86 performance core, ahead
+  of 7-Zip's own decoder: a 7z PPMd fixture decodes in 32.4 s against 38.7 s
+  for 0.2.0 and 36.6 s for `7zz t` on an i5-1240P P-core, pinned. Output is
+  unchanged, byte for byte. On arm64 (an M-series Mac) the decode is no
+  slower. Four changes:
+  - The arena asks Linux for transparent huge pages over its whole 2 MiB
+    pages, as 7-Zip's `BigAlloc` does. On a kernel whose huge-page mode is
+    `madvise` (the common default), the 4 KiB pages missed the TLB on a large
+    share of the model's accesses: 90.6 million page walks per decode
+    against 7-Zip's 112 thousand. Other targets are unchanged.
+  - The found state's successor is prefetched before the suffix frequency
+    update that precedes its use (x86-64).
+  - State units are copied inline as one 8-byte and one 4-byte move instead
+    of through `memmove`.
+  - The escape's symbol choice walks the states with one branch per state.
+
 ## 0.2.0 - 2026-10-16
 
 - Breaking: every failure has its own `ErrorKind`, and each kind maps to

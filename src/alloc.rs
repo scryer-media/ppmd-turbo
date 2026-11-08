@@ -336,14 +336,57 @@ impl Arena {
         unsafe { self.at(off, 4).cast::<u32>().write_unaligned(v) }
     }
 
-    /// `memmove` of `len` bytes from `src` to `dst`.
-    #[inline]
-    pub(crate) fn copy(&mut self, src: u32, dst: u32, len: u32) {
-        let s = self.at(src, len as usize);
-        let d = self.at(dst, len as usize);
-        // SAFETY: both ranges are inside the allocation (see `at`);
-        // `ptr::copy` allows overlap.
-        unsafe { core::ptr::copy(s, d, len as usize) }
+    /// Copies `nu` whole units from the block at `src` to the block at `dst`
+    /// (`MEM_12_CPY`). The callers copy a live block into one just taken
+    /// from the allocator, so the two never overlap.
+    ///
+    /// One unit per step, as an 8-byte and a 4-byte move, inline: the
+    /// blocks are short (at most 128 units), and a call to the C library's
+    /// `memmove` cost more than the copy itself. The two moves differ in
+    /// size, so the compiler keeps the loop rather than turning it back
+    /// into that call.
+    #[inline(always)]
+    pub(crate) fn copy_units(&mut self, src: u32, dst: u32, nu: u32) {
+        let len = (nu * UNIT_SIZE) as usize;
+        debug_assert!(
+            src as usize + len <= dst as usize || dst as usize + len <= src as usize,
+            "unit blocks {src} and {dst} overlap"
+        );
+        let s = self.at(src, len).cast_const();
+        let d = self.at(dst, len);
+        let mut i = 0;
+        while i < len {
+            // SAFETY: `i + UNIT_SIZE <= len`, so both moves stay inside the
+            // two `len`-byte ranges, which lie inside the allocation (see
+            // `at`); the reads are unaligned reads of initialized bytes. Each
+            // unit is read in full before it is written, so the copy is
+            // correct even if the blocks did overlap with `dst` below `src`.
+            unsafe {
+                let lo = s.add(i).cast::<u64>().read_unaligned();
+                let hi = s.add(i + 8).cast::<u32>().read_unaligned();
+                d.add(i).cast::<u64>().write_unaligned(lo);
+                d.add(i + 8).cast::<u32>().write_unaligned(hi);
+            }
+            i += UNIT_SIZE as usize;
+        }
+    }
+
+    /// Asks the cache for the line holding `off`, a record the model reads
+    /// soon. A hint only: it changes no byte and no result, and on targets
+    /// without the hint it does nothing.
+    #[inline(always)]
+    pub(crate) fn prefetch(&self, off: u32) {
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        {
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let p = self.base.as_ptr().wrapping_add(off as usize);
+            // SAFETY: a prefetch reads nothing the program can see and
+            // never faults, whatever the address; `wrapping_add` keeps the
+            // address computation itself defined.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(p.cast_const().cast()) }
+        }
+        #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+        let _ = off;
     }
 
     /// Swaps the 6-byte records at `a` and `b`.
