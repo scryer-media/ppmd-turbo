@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file. Each heading
 is a released version.
 
-## 0.2.2 - unreleased
+## 0.2.2 - 2026-11-09
 
 - A caller can supply the memory for a model's arena, so a very large model
   can live in a memory-mapped scratch file instead of RAM.
