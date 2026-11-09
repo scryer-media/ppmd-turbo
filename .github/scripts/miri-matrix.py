@@ -24,8 +24,14 @@ ALLOWED_BINARIES = {
 
 # Every module that holds `unsafe` must keep tests in the selection: the
 # arena's raw parts (alloc), the fallible allocation (arena), and the model
-# that addresses the arena without bounds checks in release builds.
-REQUIRED_LIB_PREFIXES = ("alloc::tests::", "arena::tests::", "model::tests::")
+# that addresses the arena without bounds checks in release builds. The
+# lent-arena tests (arena::caller_memory_tests) cover caller memory.
+REQUIRED_LIB_PREFIXES = (
+    "alloc::tests::",
+    "arena::tests::",
+    "arena::caller_memory_tests::",
+    "model::tests::",
+)
 
 # GitHub's limit on the jobs one matrix may expand to.
 MAX_JOBS = 256

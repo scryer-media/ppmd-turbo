@@ -153,9 +153,24 @@ impl RarPpmd {
     /// `allocator`; see [`Arena::with_allocator`]. A model in use keeps its
     /// memory until a block needs an arena it does not fit. The arena limit
     /// ([`set_arena_limit`](Self::set_arena_limit)) still applies to caller
-    /// memory.
+    /// memory. The ceiling on one lent arena starts at
+    /// [`Arena::DEFAULT_MAX_LENT`]; see
+    /// [`set_arena_max_lent`](Self::set_arena_max_lent).
     pub fn set_arena_allocator(&mut self, ram_limit: u64, allocator: Arc<dyn ArenaAllocator>) {
-        let source = Arena::with_allocator(ram_limit, allocator).source;
+        self.set_source(Arena::with_allocator(ram_limit, allocator).source);
+    }
+
+    /// The largest arena the allocator set by
+    /// [`set_arena_allocator`](Self::set_arena_allocator) is asked for; see
+    /// [`Arena::with_max_lent`]. A block whose arena is over it fails
+    /// [`start_block`](Self::start_block) with [`ErrorKind::MemoryLimit`]
+    /// without asking. No effect before an allocator is set.
+    pub fn set_arena_max_lent(&mut self, max_lent: u64) {
+        let source = (Arena::with_source(self.source.take()).with_max_lent(max_lent)).source;
+        self.set_source(source);
+    }
+
+    fn set_source(&mut self, source: Option<ArenaSource>) {
         if let Some(model) = self.model.as_mut() {
             model.set_arena_source(source.clone());
         }
@@ -862,12 +877,32 @@ mod tests {
         assert_eq!(alloc.allocs(), 0);
         // Past the limit: the allocator refuses, the decoder is poisoned.
         let e = ppmd.start_block(Some(rar(8, 2))).unwrap_err();
-        assert_eq!(e.kind, ErrorKind::AllocationFailed { bytes: 2 << 20 });
+        assert_eq!(e.kind, ErrorKind::allocation_failed(2 << 20));
         assert_eq!(alloc.allocs(), 1);
         assert_eq!(ppmd.start_block(None), Err(e));
         // Within the limit again: the crate's own memory.
         ppmd.start_block(Some(rar(8, 1))).unwrap();
         assert!(!ppmd.model.as_ref().unwrap().arena_is_caller_memory());
         assert_eq!(alloc.allocs(), 1);
+    }
+
+    #[test]
+    fn a_block_over_the_lent_ceiling_is_refused_without_asking() {
+        let alloc = TestAllocator::new(Mode::Garbage);
+        let mut ppmd = RarPpmd::new();
+        ppmd.set_arena_allocator(0, alloc.clone());
+        ppmd.set_arena_max_lent(1 << 20);
+        ppmd.start_block(Some(rar(8, 1))).unwrap();
+        assert_eq!(alloc.allocs(), 1);
+        let e = ppmd.start_block(Some(rar(8, 2))).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::memory_limit(2 << 20, 1 << 20));
+        assert_eq!(alloc.allocs(), 1);
+        // A ceiling set before any allocator does nothing, and a later
+        // allocator starts at the default ceiling.
+        let mut ppmd = RarPpmd::new();
+        ppmd.set_arena_max_lent(0);
+        ppmd.set_arena_allocator(0, alloc.clone());
+        ppmd.start_block(Some(rar(8, 1))).unwrap();
+        assert_eq!(alloc.allocs(), 2);
     }
 }

@@ -33,10 +33,9 @@
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 
-use alloc_crate::boxed::Box;
 use alloc_crate::vec::Vec;
 
-use crate::arena::{ArenaMemory, ArenaSource, Storage, fresh_storage};
+use crate::arena::{ArenaSource, Lent, Storage, fresh_storage};
 use crate::error::Result;
 
 /// Size of one allocation unit in bytes.
@@ -95,7 +94,7 @@ const EMPTY_NODE: u16 = 0;
 /// The model's arena and the allocator state over it.
 ///
 /// The memory is either a `Vec<u8>` taken apart into its raw parts or the
-/// caller's [`ArenaMemory`]; either way the hot accessors address it through
+/// caller's [`ArenaMemory`](crate::ArenaMemory); either way the hot accessors address it through
 /// one pointer, and the memory can be handed back
 /// ([`into_arena`](Self::into_arena)) for a later model to reuse.
 /// Allocation is fallible (`crate::arena`): a refused arena is an error,
@@ -107,7 +106,7 @@ pub(crate) struct Arena {
     /// Bytes in use: `align_offset + size`.
     len: usize,
     /// The memory's capacity: the `Vec`'s, for rebuilding it, or the
-    /// caller memory's length.
+    /// length the caller memory was asked for.
     capacity: usize,
     /// The size requested (`p->Size`).
     size: u32,
@@ -120,15 +119,15 @@ pub(crate) struct Arena {
     free_list: [u32; NUM_INDEXES],
     /// The caller's memory `base` points into, or `None` when `base`,
     /// `len` and `capacity` are the crate's own `Vec`.
-    caller: Option<Box<dyn ArenaMemory>>,
+    caller: Option<Lent>,
     /// Where an arena above the in-RAM limit comes from on a rebuild.
     source: Option<ArenaSource>,
 }
 
 // SAFETY: the arena's memory is reached only through `&self`/`&mut self`;
 // nothing else holds the pointer (for caller memory, `ArenaMemory`'s
-// contract promises it, and `ArenaMemory: Send`), so moving the owner to
-// another thread moves sole access with it.
+// contract promises it, and `Lent: Send`), so moving the owner to another
+// thread moves sole access with it.
 unsafe impl Send for Arena {}
 // SAFETY: as above; `&Arena` exposes reads of the arena only, and never
 // touches `caller` or `source` (they are read only through `&mut self` or by
@@ -171,7 +170,8 @@ impl Arena {
     /// the glue pass's read past the guard stamp is discarded), so a reused
     /// arena's old bytes, or caller memory's, change nothing.
     ///
-    /// Errors: allocation failed, or caller memory of the wrong length.
+    /// Errors: allocation failed, an arena to lend over the ceiling, or
+    /// caller memory of the wrong length.
     pub(crate) fn try_new(size: u32, arena: crate::Arena) -> Result<Self> {
         debug_assert!(size >= crate::PPMD7_MIN_MEM_SIZE);
         let len = Self::arena_bytes(size);
@@ -247,6 +247,9 @@ impl Arena {
     /// `storage` fitted to exactly `len` bytes when it is reusable,
     /// otherwise fresh storage (the old is freed first).
     fn fit(storage: Storage, len: usize, source: Option<&ArenaSource>) -> Result<Storage> {
+        if let Some(src) = source {
+            src.admit(len)?;
+        }
         if !Self::reusable(storage.capacity(), len) {
             drop(storage);
             return fresh_storage(len, source);
@@ -257,7 +260,7 @@ impl Arena {
                 crate::arena::fit(&mut buf, len)?;
                 Ok(Storage::Owned(buf))
             }
-            Storage::Caller(mem) => Ok(Storage::Caller(mem)),
+            Storage::Caller(lent) => Ok(Storage::Caller(lent)),
         }
     }
 
@@ -274,14 +277,13 @@ impl Arena {
                 let base = NonNull::new(buf.as_mut_ptr()).unwrap_or(NonNull::dangling());
                 (base, buf.len(), buf.capacity(), None)
             }
-            Storage::Caller(mut mem) => {
-                let capacity = mem.len();
+            Storage::Caller(lent) => {
+                // The pointer and length were taken once, and checked, when
+                // the allocator returned the memory.
+                let capacity = lent.len();
                 let len = Self::arena_bytes(size);
                 assert!(len <= capacity, "caller memory shorter than its arena");
-                // Non-null: checked when the allocator returned it, and
-                // `ArenaMemory` promises the same pointer every time.
-                let base = NonNull::new(mem.as_mut_ptr()).unwrap_or(NonNull::dangling());
-                (base, len, capacity, Some(mem))
+                (lent.ptr(), len, capacity, Some(lent))
             }
         };
         let mut arena = Self {

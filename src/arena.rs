@@ -5,65 +5,208 @@ use alloc_crate::alloc::{Layout, alloc, alloc_zeroed};
 use alloc_crate::boxed::Box;
 use alloc_crate::sync::Arc;
 use alloc_crate::vec::Vec;
+use core::panic::AssertUnwindSafe;
+use core::ptr::NonNull;
 
 use crate::error::{Error, ErrorKind, Result};
 
-/// Memory the caller owns, lent to one model for its arena.
+/// Memory an [`ArenaAllocator`] lends a model for its arena.
 ///
-/// An [`ArenaAllocator`] returns one when the crate asks it for an arena
-/// (for example a memory-mapped scratch file, for a model too large to keep
-/// in RAM). The model drops it when it is done with it: when the codec is
-/// dropped, when a restart needs an arena of another size, or when the
-/// [`Arena`] holding it is dropped.
+/// The crate calls [`ArenaMemory::as_mut_ptr`] and [`ArenaMemory::len`]
+/// once each, when it receives the value, and reads and writes through that
+/// pointer until it drops the value: when the codec is dropped, when a
+/// restart needs an arena of another size, or when the [`Arena`] holding it
+/// is dropped.
 ///
 /// # Safety
 ///
-/// An implementation promises, from the moment the allocator returns it
-/// until it is dropped:
+/// An implementation must guarantee all of the following, from the call to
+/// [`ArenaMemory::as_mut_ptr`] until the value is dropped:
 ///
-/// - [`as_mut_ptr`](Self::as_mut_ptr) returns the same non-null pointer
-///   every time, to exactly [`len`](Self::len) bytes that are readable,
-///   writable and initialized (any values: the memory need not be zeroed);
-/// - nothing else reads or writes those bytes while the crate holds the
-///   value, and moving the value (the crate moves the `Box`) does not move
-///   them;
-/// - `len` never changes.
+/// - the pointer is non-null and valid for reads and writes of `len()`
+///   bytes, which is at least the `len` [`ArenaAllocator::allocate`] was
+///   asked for; the crate uses exactly the first `len` asked for;
+/// - those bytes are initialized, to any value: they need not be zero;
+/// - the address is stable until drop, including when the `Box` holding
+///   the value moves: the memory is not moved, unmapped, remapped or freed;
+/// - the memory is exclusive to the crate until drop: nothing else reads
+///   or writes it, as with a `&mut [u8]`.
 ///
-/// No result depends on a byte the model has not written, so the starting
-/// contents do not matter: garbage decodes exactly as zeros do. (The
-/// sub-allocator's glue pass reads the two bytes after the guard stamp it
-/// writes at the free-space boundary and discards them, as 7-Zip's does, so
-/// the bytes must be initialized, though not to any value.)
+/// Dropping the value releases the memory; the crate does not touch it
+/// afterwards. No result depends on a byte the model has not written, so
+/// the starting contents do not matter: garbage decodes exactly as zeros
+/// do. (The sub-allocator's glue pass reads the two bytes after the guard
+/// stamp it writes at the free-space boundary and discards them, as
+/// 7-Zip's does, which is why the bytes must be initialized, though not to
+/// any value.)
 pub unsafe trait ArenaMemory: Send {
-    /// The start of the memory.
+    /// The start of the memory. Called once.
     fn as_mut_ptr(&mut self) -> *mut u8;
-    /// Bytes the memory holds.
+
+    /// How many bytes [`ArenaMemory::as_mut_ptr`] points at: at least the
+    /// `len` asked for. Called once.
     fn len(&self) -> usize;
-    /// Whether the memory holds no bytes.
+
+    /// Whether [`ArenaMemory::len`] is zero.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
 
-/// The error an [`ArenaAllocator`] returns. The crate reports it as
-/// [`ErrorKind::AllocationFailed`]; the allocator keeps or logs the detail.
-/// An `std::io::Error` converts into it with `?` or `.into()`.
+/// The error an [`ArenaAllocator`] returns.
+///
+/// It is boxed, not an `std::io::Error`, because the crate builds without
+/// `std` and the allocator API is part of that build. An `io::Error`
+/// converts into it with `?` or `.into()`, and with the `std` feature its
+/// `io::ErrorKind` reaches the caller in
+/// [`ErrorKind::AllocationFailed`] (and through `io::Error::from`). The
+/// error itself is dropped: an [`Error`] is `Copy` and cannot hold it, so
+/// the allocator logs or keeps any other detail.
 pub type ArenaAllocError = Box<dyn core::error::Error + Send + Sync>;
 
-/// Supplies the memory for arenas larger than an in-RAM limit; see
+/// A source of caller memory for model arenas; see
 /// [`Arena::with_allocator`].
+///
+/// Asked once for each arena a model needs that is over the in-RAM limit
+/// and at or under the ceiling ([`Arena::with_max_lent`]): when a codec is
+/// built, and again when a reset or a RAR block restart needs an arena of
+/// another size, larger or smaller, that the memory in hand cannot back.
+///
+/// # Concurrency
+///
+/// [`ArenaAllocator::allocate`] can be called from any thread, and from
+/// several at once when codecs sharing one allocator run on several
+/// threads. The crate starts no threads of its own: a codec asks on the
+/// thread that calls it, and holds at most one lent arena at a time, the
+/// new one being asked for while the old one is still held.
 pub trait ArenaAllocator: Send + Sync {
-    /// Memory for an arena of exactly `len` bytes. Memory of any other
-    /// length is [`ErrorKind::ArenaMemoryLength`]; an error is
-    /// [`ErrorKind::AllocationFailed`].
+    /// Returns memory for an arena of `len` bytes, or the error that
+    /// stopped it, which the crate reports as
+    /// [`ErrorKind::AllocationFailed`]. Memory shorter than `len`, longer
+    /// than `isize::MAX`, or at a null address is
+    /// [`ErrorKind::ArenaMemoryLength`] and is dropped at once.
+    ///
+    /// # Errors
+    ///
+    /// Whatever stops the allocator: no disk space, a failed map, a quota.
     fn allocate(&self, len: usize) -> core::result::Result<Box<dyn ArenaMemory>, ArenaAllocError>;
 }
 
 /// Where arenas above an in-RAM limit come from.
-#[derive(Clone)]
 pub(crate) struct ArenaSource {
     ram_limit: u64,
-    allocator: Arc<dyn ArenaAllocator>,
+    max_lent: u64,
+    // `AssertUnwindSafe` keeps the codecs that hold a source `UnwindSafe`
+    // and `RefUnwindSafe`, as they are without one; the crate only ever
+    // calls `allocate`, and keeps no state of the allocator's.
+    allocator: AssertUnwindSafe<Arc<dyn ArenaAllocator>>,
+}
+
+impl Clone for ArenaSource {
+    fn clone(&self) -> Self {
+        Self {
+            ram_limit: self.ram_limit,
+            max_lent: self.max_lent,
+            allocator: AssertUnwindSafe(Arc::clone(&self.allocator)),
+        }
+    }
+}
+
+impl ArenaSource {
+    /// Whether an arena of `len` bytes is the allocator's to provide.
+    fn lends(&self, len: usize) -> bool {
+        len as u64 > self.ram_limit
+    }
+
+    /// `Err` with [`ErrorKind::MemoryLimit`] when an arena of `len` bytes
+    /// would be lent and is over the ceiling.
+    pub(crate) fn admit(&self, len: usize) -> Result<()> {
+        if self.lends(len) && len as u64 > self.max_lent {
+            return Err(Error::new(ErrorKind::memory_limit(
+                len as u64,
+                self.max_lent,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Asks the allocator for `len` bytes and checks what it gave back
+    /// against the part of the [`ArenaMemory`] contract it can check. A
+    /// length over the ceiling or over `isize::MAX` is refused without
+    /// asking; memory that fails the check is dropped before the error
+    /// returns.
+    fn lend(&self, len: usize) -> Result<Lent> {
+        self.admit(len)?;
+        if isize::try_from(len).is_err() {
+            return Err(alloc_failed(len as u64));
+        }
+        let mut mem = self
+            .allocator
+            .allocate(len)
+            .map_err(|e| refused(len as u64, &*e))?;
+        let ptr = mem.as_mut_ptr();
+        let provided = mem.len();
+        // A length over `isize::MAX` cannot describe real memory: refused
+        // before any slice is built over it.
+        match NonNull::new(ptr) {
+            Some(ptr) if provided >= len && isize::try_from(provided).is_ok() => Ok(Lent {
+                ptr,
+                len,
+                _owner: AssertUnwindSafe(mem),
+            }),
+            _ => Err(Error::new(ErrorKind::ArenaMemoryLength {
+                requested: len as u64,
+                provided: provided as u64,
+            })),
+        }
+    }
+}
+
+/// [`ErrorKind::AllocationFailed`] for an allocator's error, keeping an
+/// `io::Error`'s kind.
+#[cold]
+fn refused(bytes: u64, e: &(dyn core::error::Error + Send + Sync + 'static)) -> Error {
+    #[cfg(feature = "std")]
+    let kind = ErrorKind::AllocationFailed {
+        bytes,
+        io_kind: e.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+    };
+    #[cfg(not(feature = "std"))]
+    let kind = {
+        let _ = e;
+        ErrorKind::allocation_failed(bytes)
+    };
+    Error::new(kind)
+}
+
+/// Caller memory, checked once when the allocator returned it: `len` (the
+/// length asked for, which the arena uses) bytes at `ptr`, owned by
+/// `_owner`.
+pub(crate) struct Lent {
+    ptr: NonNull<u8>,
+    len: usize,
+    _owner: AssertUnwindSafe<Box<dyn ArenaMemory>>,
+}
+
+// SAFETY: the owner is `Send` (`ArenaMemory: Send`), and `ptr` points into
+// memory the contract makes exclusive to its holder, so sending the value
+// sends sole access with it.
+unsafe impl Send for Lent {}
+// SAFETY: a `&Lent` gives out only the copied `ptr` and `len`; nothing
+// reaches the owner through it, and writing through `ptr` takes the
+// arena's `&mut`.
+unsafe impl Sync for Lent {}
+
+impl Lent {
+    /// The start of the memory.
+    pub(crate) fn ptr(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    /// The bytes the arena may use: the length asked for.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
 }
 
 /// The memory behind an arena.
@@ -71,8 +214,9 @@ pub(crate) enum Storage {
     /// The crate's own zeroed allocation, as a `Vec` whose length is the
     /// arena in use.
     Owned(Vec<u8>),
-    /// The caller's memory, all of it available to the arena.
-    Caller(Box<dyn ArenaMemory>),
+    /// The caller's memory, the length it was asked for available to the
+    /// arena.
+    Caller(Lent),
 }
 
 impl Storage {
@@ -80,7 +224,7 @@ impl Storage {
     pub(crate) fn capacity(&self) -> usize {
         match self {
             Self::Owned(buf) => buf.capacity(),
-            Self::Caller(mem) => mem.len(),
+            Self::Caller(lent) => lent.len(),
         }
     }
 }
@@ -89,27 +233,9 @@ impl Storage {
 /// and `len` is above its in-RAM limit, otherwise a zeroed allocation.
 pub(crate) fn fresh_storage(len: usize, source: Option<&ArenaSource>) -> Result<Storage> {
     match source {
-        Some(src) if len as u64 > src.ram_limit => {
-            let mem = src
-                .allocator
-                .allocate(len)
-                .map_err(|_| alloc_failed(len as u64))?;
-            check_memory(mem, len).map(Storage::Caller)
-        }
+        Some(src) if src.lends(len) => src.lend(len).map(Storage::Caller),
         _ => try_zeroed(len as u64).map(Storage::Owned),
     }
-}
-
-/// `mem` when it holds exactly `len` bytes at a non-null address.
-fn check_memory(mut mem: Box<dyn ArenaMemory>, len: usize) -> Result<Box<dyn ArenaMemory>> {
-    let provided = mem.len();
-    if provided != len || mem.as_mut_ptr().is_null() {
-        return Err(Error::new(ErrorKind::ArenaMemoryLength {
-            requested: len as u64,
-            provided: provided as u64,
-        }));
-    }
-    Ok(mem)
 }
 
 /// The memory a model's sub-allocator works in.
@@ -132,6 +258,11 @@ pub struct Arena {
 }
 
 impl Arena {
+    /// The default ceiling on one lent arena: the largest arena a model can
+    /// lay out, for [`Params::MAX_MEM`](crate::Params::MAX_MEM).
+    pub const DEFAULT_MAX_LENT: u64 =
+        crate::alloc::Arena::arena_bytes(crate::Params::MAX_MEM) as u64;
+
     /// Allocates `bytes` of zeroed memory.
     ///
     /// Errors: [`ErrorKind::AllocationFailed`] when the allocator refuses,
@@ -145,8 +276,10 @@ impl Arena {
 
     /// An empty arena that takes a model's memory from the crate's own
     /// allocation, as today, when the arena is `ram_limit` bytes or less,
-    /// and from `allocator` when it is larger. The limit counts the arena
-    /// alone: the memory size plus up to three bytes of alignment.
+    /// and from `allocator` when it is larger, up to the ceiling
+    /// ([`with_max_lent`](Self::with_max_lent), by default
+    /// [`DEFAULT_MAX_LENT`](Self::DEFAULT_MAX_LENT)). The limits count the
+    /// arena alone: the memory size plus up to three bytes of alignment.
     ///
     /// A codec built over it keeps the rule for every later restart, and
     /// its `into_arena` hands the rule on with the memory. Caller memory is
@@ -156,9 +289,22 @@ impl Arena {
             storage: Storage::Owned(Vec::new()),
             source: Some(ArenaSource {
                 ram_limit,
-                allocator,
+                max_lent: Self::DEFAULT_MAX_LENT,
+                allocator: AssertUnwindSafe(allocator),
             }),
         }
+    }
+
+    /// Sets the largest arena the allocator is asked for. A model whose
+    /// arena is over the in-RAM limit and over `max_lent` is refused with
+    /// [`ErrorKind::MemoryLimit`], and the allocator is never asked. No
+    /// effect on an arena without an allocator.
+    #[must_use]
+    pub fn with_max_lent(mut self, max_lent: u64) -> Self {
+        if let Some(src) = &mut self.source {
+            src.max_lent = max_lent;
+        }
+        self
     }
 
     /// The bytes this arena holds.
@@ -191,13 +337,14 @@ impl core::fmt::Debug for Arena {
             .field("capacity", &self.capacity())
             .field("caller_memory", &self.is_caller_memory())
             .field("ram_limit", &self.source.as_ref().map(|s| s.ram_limit))
+            .field("max_lent", &self.source.as_ref().map(|s| s.max_lent))
             .finish()
     }
 }
 
 #[cold]
 fn alloc_failed(bytes: u64) -> Error {
-    Error::new(ErrorKind::AllocationFailed { bytes })
+    Error::new(ErrorKind::allocation_failed(bytes))
 }
 
 /// `bytes` of zeroed memory as a `Vec` whose length is its capacity, or
@@ -308,7 +455,7 @@ mod tests {
     #[test]
     fn a_refused_size_is_an_error_not_an_abort() {
         let e = Arena::try_new(u64::MAX).unwrap_err();
-        assert_eq!(e.kind, ErrorKind::AllocationFailed { bytes: u64::MAX });
+        assert_eq!(e.kind, ErrorKind::allocation_failed(u64::MAX));
         let e = Arena::try_new(isize::MAX as u64 + 1).unwrap_err();
         assert!(matches!(e.kind, ErrorKind::AllocationFailed { .. }));
     }
@@ -369,18 +516,32 @@ pub(crate) mod testing {
             .collect()
     }
 
-    /// Caller memory on the heap, counting its drops.
+    /// Caller memory on the heap, counting its drops and the calls to
+    /// `as_mut_ptr` and `len`.
     pub(crate) struct HeapMemory {
         ptr: *mut u8,
         len: usize,
+        /// What `len` reports, when it is not the allocation's length.
+        claimed: Option<usize>,
         drops: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
     }
 
     impl HeapMemory {
-        pub(crate) fn new(bytes: Vec<u8>, drops: Arc<AtomicUsize>) -> Self {
+        pub(crate) fn new(
+            bytes: Vec<u8>,
+            drops: Arc<AtomicUsize>,
+            calls: Arc<AtomicUsize>,
+        ) -> Self {
             let len = bytes.len();
             let ptr = Box::into_raw(bytes.into_boxed_slice()).cast::<u8>();
-            Self { ptr, len, drops }
+            Self {
+                ptr,
+                len,
+                claimed: None,
+                drops,
+                calls,
+            }
         }
     }
 
@@ -389,13 +550,17 @@ pub(crate) mod testing {
 
     // SAFETY: `ptr` is a live, initialized `len`-byte allocation owned by
     // this value until it drops; the pointer never changes, and moving the
-    // value does not move the allocation.
+    // value does not move the allocation. A `claimed` length breaks the
+    // contract on purpose, for tests that the crate refuses it before
+    // using the memory.
     unsafe impl ArenaMemory for HeapMemory {
         fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             self.ptr
         }
         fn len(&self) -> usize {
-            self.len
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.claimed.unwrap_or(self.len)
         }
     }
 
@@ -414,8 +579,15 @@ pub(crate) mod testing {
         Garbage,
         /// An error.
         Fail,
-        /// Memory one byte longer than asked.
-        WrongLength,
+        /// An `io::Error` of this kind.
+        #[cfg(feature = "std")]
+        Io(std::io::ErrorKind),
+        /// Garbage memory 61 bytes longer than asked.
+        Longer,
+        /// Memory one byte shorter than asked.
+        Shorter,
+        /// Memory claiming `isize::MAX + 1` bytes.
+        Huge,
     }
 
     /// An allocator that counts its allocations and their drops.
@@ -423,6 +595,8 @@ pub(crate) mod testing {
         mode: Mode,
         pub(crate) allocs: AtomicUsize,
         pub(crate) drops: Arc<AtomicUsize>,
+        /// Calls to `as_mut_ptr` and `len` on the memory it lent.
+        pub(crate) calls: Arc<AtomicUsize>,
     }
 
     impl TestAllocator {
@@ -431,6 +605,7 @@ pub(crate) mod testing {
                 mode,
                 allocs: AtomicUsize::new(0),
                 drops: Arc::new(AtomicUsize::new(0)),
+                calls: Arc::new(AtomicUsize::new(0)),
             })
         }
 
@@ -460,13 +635,19 @@ pub(crate) mod testing {
             len: usize,
         ) -> core::result::Result<Box<dyn ArenaMemory>, ArenaAllocError> {
             let n = self.allocs.fetch_add(1, Ordering::SeqCst) as u32;
-            let len = match self.mode {
+            let (len, claimed) = match self.mode {
                 Mode::Fail => return Err(Box::new(Refused)),
-                Mode::Garbage => len,
-                Mode::WrongLength => len + 1,
+                #[cfg(feature = "std")]
+                Mode::Io(kind) => return Err(std::io::Error::new(kind, "scratch").into()),
+                Mode::Garbage => (len, None),
+                Mode::Longer => (len + 61, None),
+                Mode::Shorter => (len - 1, None),
+                Mode::Huge => (len, Some(isize::MAX as usize + 1)),
             };
             let bytes = garbage(len, 0x9E37_79B9 ^ n.wrapping_mul(0x85EB_CA6B) | 1);
-            Ok(Box::new(HeapMemory::new(bytes, self.drops.clone())))
+            let mut mem = HeapMemory::new(bytes, self.drops.clone(), self.calls.clone());
+            mem.claimed = claimed;
+            Ok(Box::new(mem))
         }
     }
 }
@@ -476,6 +657,7 @@ mod caller_memory_tests {
     use super::testing::{Mode, TestAllocator};
     use super::*;
     use crate::{Params, SevenZDecoder, SevenZEncoder, SevenZStatus};
+    use core::sync::atomic::Ordering;
 
     /// Word salad over an invented vocabulary.
     fn text(len: usize) -> Vec<u8> {
@@ -608,12 +790,7 @@ mod caller_memory_tests {
         let e = SevenZDecoder::with_arena(params, None, arena)
             .err()
             .unwrap();
-        assert_eq!(
-            e.kind,
-            ErrorKind::AllocationFailed {
-                bytes: Params::MIN_MEM as u64
-            }
-        );
+        assert_eq!(e.kind, ErrorKind::allocation_failed(Params::MIN_MEM as u64));
         assert!(e.is_resource_error());
         assert_eq!(alloc.allocs(), 1);
 
@@ -632,9 +809,27 @@ mod caller_memory_tests {
     }
 
     #[test]
-    fn memory_of_the_wrong_length_is_an_error_and_is_dropped() {
+    fn longer_memory_is_used_for_its_first_len_bytes_and_shorter_is_refused() {
+        let (params, data, stream) = restarting();
+        // Longer memory decodes as exact memory does, its pointer and
+        // length read once each however many restarts follow.
+        let alloc = TestAllocator::new(Mode::Longer);
+        let arena = Arena::with_allocator(0, alloc.clone());
+        let mut dec = SevenZDecoder::with_arena(params, Some(data.len() as u64), arena).unwrap();
+        assert_eq!(decode(&mut dec, &stream, data.len()), data);
+        assert!(dec.model_restarts() > 2);
+        assert_eq!(alloc.calls.load(Ordering::SeqCst), 2);
+        // The arena is the length asked for, not the memory's.
+        let arena = dec.into_arena();
+        assert_eq!(arena.capacity(), Params::MIN_MEM as u64);
+        let mut dec = SevenZDecoder::with_arena(params, Some(data.len() as u64), arena).unwrap();
+        assert_eq!(decode(&mut dec, &stream, data.len()), data);
+        assert_eq!((alloc.allocs(), alloc.calls.load(Ordering::SeqCst)), (1, 2));
+        drop(dec);
+        assert_eq!(alloc.drops(), 1);
+
         let params = Params::new(6, Params::MIN_MEM + 1).unwrap();
-        let alloc = TestAllocator::new(Mode::WrongLength);
+        let alloc = TestAllocator::new(Mode::Shorter);
         let arena = Arena::with_allocator(0, alloc.clone());
         let e = SevenZDecoder::with_arena(params, None, arena)
             .err()
@@ -644,11 +839,123 @@ mod caller_memory_tests {
             e.kind,
             ErrorKind::ArenaMemoryLength {
                 requested: 2052,
-                provided: 2053
+                provided: 2051
             }
         );
         assert!(!e.is_resource_error() && !e.is_data_error());
         assert_eq!((alloc.allocs(), alloc.drops()), (1, 1));
+    }
+
+    #[test]
+    fn lengths_past_isize_max_are_refused_and_the_memory_released() {
+        // Returned: refused before any slice is built, and dropped.
+        let alloc = TestAllocator::new(Mode::Huge);
+        let src = Arena::with_allocator(0, alloc.clone())
+            .with_max_lent(u64::MAX)
+            .source
+            .unwrap();
+        let e = fresh_storage(4096, Some(&src)).err().unwrap();
+        assert_eq!(
+            e.kind,
+            ErrorKind::ArenaMemoryLength {
+                requested: 4096,
+                provided: isize::MAX as u64 + 1
+            }
+        );
+        assert_eq!((alloc.allocs(), alloc.drops()), (1, 1));
+
+        // Requested: refused without asking.
+        let alloc = TestAllocator::new(Mode::Garbage);
+        let src = Arena::with_allocator(0, alloc.clone())
+            .with_max_lent(u64::MAX)
+            .source
+            .unwrap();
+        let too_long = isize::MAX as usize + 1;
+        let e = fresh_storage(too_long, Some(&src)).err().unwrap();
+        assert_eq!(e.kind, ErrorKind::allocation_failed(too_long as u64));
+        assert_eq!(alloc.allocs(), 0);
+    }
+
+    #[test]
+    fn an_arena_over_the_ceiling_is_refused_without_asking() {
+        let alloc = TestAllocator::new(Mode::Garbage);
+        assert_eq!(
+            Arena::with_allocator(0, alloc.clone())
+                .source
+                .unwrap()
+                .max_lent,
+            Arena::DEFAULT_MAX_LENT
+        );
+        assert_eq!(Arena::DEFAULT_MAX_LENT, 0xFFFF_FFDC);
+        let params = Params::new(6, Params::MIN_MEM).unwrap();
+        let ceiling = |max| Arena::with_allocator(0, alloc.clone()).with_max_lent(max);
+
+        let e = SevenZDecoder::with_arena(params, None, ceiling(Params::MIN_MEM as u64 - 1))
+            .err()
+            .unwrap();
+        assert_eq!(
+            e.kind,
+            ErrorKind::memory_limit(Params::MIN_MEM as u64, Params::MIN_MEM as u64 - 1)
+        );
+        assert!(e.is_resource_error());
+        assert_eq!(alloc.allocs(), 0);
+
+        // At the ceiling: lent.
+        let dec = SevenZDecoder::with_arena(params, None, ceiling(Params::MIN_MEM as u64)).unwrap();
+        assert!(dec.into_arena().is_caller_memory());
+        assert_eq!(alloc.allocs(), 1);
+
+        // Under the in-RAM limit the ceiling does not apply.
+        let arena = Arena::with_allocator(Params::MIN_MEM as u64, alloc.clone()).with_max_lent(0);
+        let mut dec = SevenZDecoder::with_arena(params, None, arena).unwrap();
+        // A reset past both is refused, again without asking.
+        let big = Params::new(6, Params::MIN_MEM * 2).unwrap();
+        let e = dec.reset(big, None).unwrap_err();
+        assert_eq!(
+            e.kind,
+            ErrorKind::memory_limit(Params::MIN_MEM as u64 * 2, 0)
+        );
+        assert_eq!(alloc.allocs(), 1);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn an_allocators_io_error_keeps_its_kind() {
+        let params = Params::new(6, Params::MIN_MEM).unwrap();
+        let alloc = TestAllocator::new(Mode::Io(std::io::ErrorKind::StorageFull));
+        let arena = Arena::with_allocator(0, alloc.clone());
+        let e = SevenZDecoder::with_arena(params, None, arena)
+            .err()
+            .unwrap();
+        let ErrorKind::AllocationFailed { bytes, io_kind } = e.kind else {
+            panic!("{e}");
+        };
+        assert_eq!(bytes, Params::MIN_MEM as u64);
+        assert_eq!(io_kind, Some(std::io::ErrorKind::StorageFull));
+        let io = std::io::Error::from(e);
+        assert_eq!(io.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(io.downcast::<Error>().unwrap(), e);
+
+        // Any other error is plain out-of-memory.
+        let alloc = TestAllocator::new(Mode::Fail);
+        let arena = Arena::with_allocator(0, alloc);
+        let e = SevenZDecoder::with_arena(params, None, arena)
+            .err()
+            .unwrap();
+        assert_eq!(e.kind, ErrorKind::allocation_failed(Params::MIN_MEM as u64));
+        assert_eq!(
+            std::io::Error::from(e).kind(),
+            std::io::ErrorKind::OutOfMemory
+        );
+    }
+
+    #[test]
+    fn arenas_and_codecs_keep_their_auto_traits() {
+        use core::panic::{RefUnwindSafe, UnwindSafe};
+        fn all<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
+        all::<Arena>();
+        all::<SevenZDecoder>();
+        all::<crate::RarPpmd>();
     }
 
     #[test]

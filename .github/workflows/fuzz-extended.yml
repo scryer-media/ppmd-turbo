@@ -54,6 +54,7 @@ jobs:
           - checked_vs_unchecked
           - model_ops
           - chunking_invariance
+          - decode_lent
         include:
           - platform: linux-x86_64
             runner: ubuntu-26.04

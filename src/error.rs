@@ -5,6 +5,9 @@
 //! or the order of calls are wrong, because the model's memory could not be
 //! had, or because one of the codec's own invariants failed. Each is its own
 //! [`ErrorKind`], and an [`Error`] has no `source()`: it is the whole chain.
+//! (An [`ArenaAllocator`](crate::ArenaAllocator)'s `io::Error` leaves its
+//! `std::io::ErrorKind` in [`ErrorKind::AllocationFailed`], since an
+//! [`Error`] is `Copy` and cannot hold the error itself.)
 //!
 //! **Progress invariant.** Every step call returns a [`Progress`] that says
 //! how many input bytes it took and how many output bytes it wrote. A call
@@ -47,11 +50,19 @@ pub enum ErrorKind {
     /// The model order or memory size is outside what variant H accepts, or
     /// a call came in an order the codec does not allow.
     InvalidParameters,
-    /// The model's memory could not be allocated.
+    /// The model's memory could not be allocated: the crate's own
+    /// allocator refused, or an [`ArenaAllocator`](crate::ArenaAllocator)
+    /// returned an error.
     #[non_exhaustive]
     AllocationFailed {
         /// Bytes asked of the allocator.
         bytes: u64,
+        /// The [`std::io::ErrorKind`] of the error an
+        /// [`ArenaAllocator`](crate::ArenaAllocator) returned, when that
+        /// error was an [`std::io::Error`]. The error itself is not kept:
+        /// [`Error`] is `Copy` and repeats on every later call.
+        #[cfg(feature = "std")]
+        io_kind: Option<std::io::ErrorKind>,
     },
     /// The model would need more memory than the caller allowed.
     #[non_exhaustive]
@@ -81,7 +92,11 @@ impl ErrorKind {
     #[inline]
     #[must_use]
     pub const fn allocation_failed(bytes: u64) -> Self {
-        Self::AllocationFailed { bytes }
+        Self::AllocationFailed {
+            bytes,
+            #[cfg(feature = "std")]
+            io_kind: None,
+        }
     }
 
     /// [`ErrorKind::MemoryLimit`]: `required` bytes needed, `limit` allowed.
@@ -197,7 +212,7 @@ impl fmt::Display for Error {
             ErrorKind::Corrupt(detail) => write!(f, "corrupt PPMd stream: {detail}")?,
             ErrorKind::Truncated => f.write_str("truncated PPMd stream")?,
             ErrorKind::InvalidParameters => f.write_str("invalid PPMd parameters")?,
-            ErrorKind::AllocationFailed { bytes } => {
+            ErrorKind::AllocationFailed { bytes, .. } => {
                 write!(f, "could not allocate {bytes} bytes for the PPMd model")?;
             }
             ErrorKind::MemoryLimit { required, limit } => write!(
@@ -226,7 +241,9 @@ impl core::error::Error for Error {}
 /// Errors as [`std::io::Error`]s, for code that drives a codec through
 /// `Read` or `Write`: a corrupt stream is `InvalidData`, a truncated one
 /// `UnexpectedEof`, bad parameters `InvalidInput`, a memory refusal
-/// `OutOfMemory`, and an internal failure `Other`. The [`Error`] stays inside
+/// `OutOfMemory` (or, for an
+/// [`ArenaAllocator`](crate::ArenaAllocator)'s `io::Error`, that error's
+/// kind), and an internal failure `Other`. The [`Error`] stays inside
 /// and can be recovered with `downcast::<Error>()`.
 #[cfg(feature = "std")]
 impl From<Error> for std::io::Error {
@@ -236,6 +253,9 @@ impl From<Error> for std::io::Error {
             ErrorKind::Corrupt(_) => Io::InvalidData,
             ErrorKind::Truncated => Io::UnexpectedEof,
             ErrorKind::InvalidParameters => Io::InvalidInput,
+            ErrorKind::AllocationFailed {
+                io_kind: Some(io), ..
+            } => io,
             ErrorKind::AllocationFailed { .. } | ErrorKind::MemoryLimit { .. } => Io::OutOfMemory,
             ErrorKind::ArenaMemoryLength { .. } | ErrorKind::Internal(_) => Io::Other,
         };
@@ -361,7 +381,11 @@ mod tests {
     fn the_constructors_build_the_structured_variants() {
         assert_eq!(
             ErrorKind::allocation_failed(5),
-            ErrorKind::AllocationFailed { bytes: 5 }
+            ErrorKind::AllocationFailed {
+                bytes: 5,
+                #[cfg(feature = "std")]
+                io_kind: None,
+            }
         );
         assert_eq!(
             ErrorKind::memory_limit(8, 2),

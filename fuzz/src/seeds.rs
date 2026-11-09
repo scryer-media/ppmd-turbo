@@ -25,7 +25,7 @@ use crate::reference::{encode_7z, encode_carryless};
 use crate::synth;
 
 /// Every fuzz target, in the order CI lists them.
-pub const TARGETS: [&str; 9] = [
+pub const TARGETS: [&str; 10] = [
     "decode_7z",
     "decode_rar",
     "decode_differential_7z",
@@ -35,6 +35,7 @@ pub const TARGETS: [&str; 9] = [
     "range_coders",
     "checked_vs_unchecked",
     "model_ops",
+    "decode_lent",
 ];
 
 /// Every file this module writes, keyed by its path relative to the
@@ -324,6 +325,28 @@ fn checked_vs_unchecked_seeds(files: &mut Files) {
     }
 }
 
+/// `decode_lent` reuses the decode seeds behind its mode byte (bit 0: RAR)
+/// and a garbage seed byte.
+fn decode_lent_seeds(files: &mut Files) {
+    let mut seeds = Vec::new();
+    for (target, rar) in [("decode_rar", true), ("decode_7z", false)] {
+        let dir = seed_dir(target);
+        for (path, data) in files.range(dir.clone()..) {
+            if !path.starts_with(&dir) {
+                break;
+            }
+            let name = path.file_name().expect("seed file name").to_string_lossy();
+            let mut v = vec![u8::from(rar), seeds.len() as u8];
+            v.extend_from_slice(data);
+            let prefix = if rar { "rar" } else { "7z" };
+            seeds.push((format!("{prefix}-{name}"), v));
+        }
+    }
+    for (n, v) in seeds {
+        files.insert(seed_dir("decode_lent").join(n), v);
+    }
+}
+
 fn model_ops_seeds(files: &mut Files) {
     let mut rng = SplitMix64::new(0x4F50);
     let cl = encode_carryless(&generate(Kind::Records, 510, 3000), 16, 2 << 20, false);
@@ -411,6 +434,7 @@ pub fn all() -> Files {
     range_coder_seeds(&mut files);
     checked_vs_unchecked_seeds(&mut files);
     model_ops_seeds(&mut files);
+    decode_lent_seeds(&mut files);
     regressions(&mut files);
     hostile_fixtures(&mut files);
     files
