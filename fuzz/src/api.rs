@@ -12,8 +12,10 @@
 use crate::SplitMix64;
 use crate::outcome::{ErrKind, Outcome, Verdict, classify};
 use ppmd_turbo::{
-    CarrylessEncoder, Params, RarPpmd, RarStatus, SevenZDecoder, SevenZEncoder, SevenZStatus,
+    Arena, ArenaAllocator, CarrylessEncoder, Params, RarPpmd, RarStatus, SevenZDecoder,
+    SevenZEncoder, SevenZStatus,
 };
+use std::sync::Arc;
 
 /// FNV-1a over `parts`: the split seed of one call.
 pub fn seed_of(parts: &[&[u8]]) -> u64 {
@@ -66,6 +68,30 @@ pub fn decode_7z(
     };
     let mut splits = Splits::new(seed_of(&[stream, &order.to_le_bytes()]));
     Some(drive_7z(&mut dec, stream, known, cap, &mut splits))
+}
+
+/// [`decode_7z`] with the model's memory taken from `arena`, through the
+/// same split points. Returns the arena back for reuse when the decoder was
+/// built.
+pub fn decode_7z_in(
+    stream: &[u8],
+    order: u32,
+    mem: u32,
+    known: Option<usize>,
+    cap: usize,
+    arena: Arena,
+) -> (Outcome, Option<Arena>) {
+    let params = match Params::new(order, mem) {
+        Ok(p) => p,
+        Err(e) => return (Outcome::failed(classify(&e)), None),
+    };
+    let mut dec = match SevenZDecoder::with_arena(params, known.map(|n| n as u64), arena) {
+        Ok(d) => d,
+        Err(e) => return (Outcome::failed(classify(&e)), None),
+    };
+    let mut splits = Splits::new(seed_of(&[stream, &order.to_le_bytes()]));
+    let out = drive_7z(&mut dec, stream, known, cap, &mut splits);
+    (out, Some(dec.into_arena()))
 }
 
 /// Drives `dec` over `stream` through the split points.
@@ -157,6 +183,17 @@ impl RarSession {
             inner: RarPpmd::new(),
             splits: Splits::new(0x5241_5233),
         })
+    }
+
+    /// A decoder with no model yet that takes every arena over `ram_limit`
+    /// bytes from `allocator`.
+    pub fn with_allocator(ram_limit: u64, allocator: Arc<dyn ArenaAllocator>) -> Self {
+        let mut inner = RarPpmd::new();
+        inner.set_arena_allocator(ram_limit, allocator);
+        Self {
+            inner,
+            splits: Splits::new(0x5241_5233),
+        }
     }
 
     /// Decodes one block: restart the model first when `reset`, then raw

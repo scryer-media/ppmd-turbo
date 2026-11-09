@@ -28,8 +28,6 @@
 //! builds on the strength of that invariant and checked by `debug_assert!`
 //! in debug builds, Miri and the fuzz targets.
 
-use alloc_crate::vec::Vec;
-
 use crate::alloc::{Arena, UNIT_SIZE, u2i};
 use crate::error::{Error, Result};
 use crate::rc::{RangeDecoder, corrupt};
@@ -167,13 +165,13 @@ impl Model {
     /// alignment, as 7-Zip's `Ppmd7_Alloc` lays it out. A refused
     /// allocation is an error, never an abort.
     pub fn new(order: u32, mem_size: u32) -> Result<Self> {
-        Self::with_arena(order, mem_size, Vec::new())
+        Self::with_arena(order, mem_size, crate::Arena::empty())
     }
 
     /// [`new`](Self::new) in `arena` when its capacity fits the layout (at
-    /// least the arena length and at most twice it), otherwise in a fresh
-    /// allocation.
-    pub fn with_arena(order: u32, mem_size: u32, arena: Vec<u8>) -> Result<Self> {
+    /// least the arena length and at most twice it), otherwise in fresh
+    /// memory as `arena`'s allocator rule says.
+    pub fn with_arena(order: u32, mem_size: u32, arena: crate::Arena) -> Result<Self> {
         Self::check_parameters(order, mem_size)?;
         let mut model = Self {
             a: Arena::try_new(mem_size, arena)?,
@@ -199,13 +197,31 @@ impl Model {
     }
 
     /// The arena, for a later model to reuse.
-    pub fn into_arena(self) -> Vec<u8> {
-        self.a.into_vec()
+    pub fn into_arena(self) -> crate::Arena {
+        self.a.into_arena()
     }
 
-    /// Bytes the arena allocation holds.
+    /// Bytes the arena memory holds.
     pub fn arena_capacity(&self) -> usize {
         self.a.capacity()
+    }
+
+    /// Sets where a later restart's arena comes from when the current one
+    /// does not fit it.
+    pub(crate) fn set_arena_source(&mut self, source: Option<crate::arena::ArenaSource>) {
+        self.a.set_source(source);
+    }
+
+    /// Whether the arena is the caller's memory.
+    #[cfg(any(test, feature = "internals"))]
+    pub fn arena_is_caller_memory(&self) -> bool {
+        self.a.is_caller_memory()
+    }
+
+    /// Model restarts so far, including the ones a full arena forces.
+    #[cfg(test)]
+    pub(crate) fn restarts(&self) -> u32 {
+        self.restarts
     }
 
     pub(crate) fn check_parameters(order: u32, mem_size: u32) -> Result<(usize, usize)> {

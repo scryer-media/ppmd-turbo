@@ -130,6 +130,12 @@ impl SevenZDecoder {
     pub fn arena_addr(&self) -> usize {
         self.inner.arena_addr()
     }
+
+    /// Model restarts so far.
+    #[cfg(test)]
+    pub(crate) fn model_restarts(&self) -> u32 {
+        self.inner.model_restarts()
+    }
 }
 
 /// A 7z `PPMD` stream encoder.

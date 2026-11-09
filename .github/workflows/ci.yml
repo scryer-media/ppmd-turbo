@@ -435,6 +435,7 @@ jobs:
           - checked_vs_unchecked
           - model_ops
           - chunking_invariance
+          - decode_lent
         include:
           - platform: linux-x86_64
             runner: ubuntu-26.04
@@ -463,6 +464,9 @@ jobs:
           # are short; 20000 is about 8 s on an Apple M5 Max.
           - target: chunking_invariance
             runs: 20000
+          # Each input decodes two or three times, in owned and lent arenas.
+          - target: decode_lent
+            runs: 10000
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

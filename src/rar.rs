@@ -17,8 +17,9 @@
 //! Decoded output is identical to RARLAB unrar's.
 
 use alloc_crate::boxed::Box;
+use alloc_crate::sync::Arc;
 
-use crate::arena::try_box;
+use crate::arena::{Arena, ArenaAllocator, ArenaSource, try_box};
 use crate::engine::run::{self, Padding, Stop};
 use crate::error::{Error, ErrorKind, Position, Progress, Result};
 use crate::model::Model;
@@ -107,6 +108,7 @@ pub struct RarPpmd {
     padding: u32,
     allowance: u32,
     limit: u64,
+    source: Option<ArenaSource>,
     total_in: u64,
     total_out: u64,
 }
@@ -133,6 +135,7 @@ impl RarPpmd {
             padding: 0,
             allowance: DEFAULT_PADDING_ALLOWANCE,
             limit: u64::MAX,
+            source: None,
             total_in: 0,
             total_out: 0,
         }
@@ -143,6 +146,35 @@ impl RarPpmd {
     /// with [`ErrorKind::MemoryLimit`]. A block header can ask for 256 MiB.
     pub fn set_arena_limit(&mut self, bytes: u64) {
         self.limit = bytes;
+    }
+
+    /// Takes any later model's arena of `ram_limit` bytes or less from the
+    /// crate's own allocation, as before, and any larger one from
+    /// `allocator`; see [`Arena::with_allocator`]. A model in use keeps its
+    /// memory until a block needs an arena it does not fit. The arena limit
+    /// ([`set_arena_limit`](Self::set_arena_limit)) still applies to caller
+    /// memory. The ceiling on one lent arena starts at
+    /// [`Arena::DEFAULT_MAX_LENT`]; see
+    /// [`set_arena_max_lent`](Self::set_arena_max_lent).
+    pub fn set_arena_allocator(&mut self, ram_limit: u64, allocator: Arc<dyn ArenaAllocator>) {
+        self.set_source(Arena::with_allocator(ram_limit, allocator).source);
+    }
+
+    /// The largest arena the allocator set by
+    /// [`set_arena_allocator`](Self::set_arena_allocator) is asked for; see
+    /// [`Arena::with_max_lent`]. A block whose arena is over it fails
+    /// [`start_block`](Self::start_block) with [`ErrorKind::MemoryLimit`]
+    /// without asking. No effect before an allocator is set.
+    pub fn set_arena_max_lent(&mut self, max_lent: u64) {
+        let source = (Arena::with_source(self.source.take()).with_max_lent(max_lent)).source;
+        self.set_source(source);
+    }
+
+    fn set_source(&mut self, source: Option<ArenaSource>) {
+        if let Some(model) = self.model.as_mut() {
+            model.set_arena_source(source.clone());
+        }
+        self.source = source;
     }
 
     /// Zeros past the end of the last input the coder may read before the
@@ -200,7 +232,8 @@ impl RarPpmd {
         match self.model.as_mut() {
             Some(model) => model.start(params.order(), params.mem_size()),
             None => {
-                let model = Model::new(params.order(), params.mem_size())?;
+                let arena = Arena::with_source(self.source.clone());
+                let model = Model::with_arena(params.order(), params.mem_size(), arena)?;
                 self.model = Some(try_box(model)?);
                 Ok(())
             }
@@ -468,6 +501,7 @@ fn progress(consumed: usize, produced: usize, status: RarStatus) -> Progress<Rar
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::testing::{Mode, TestAllocator};
     use std::vec;
     use std::vec::Vec;
 
@@ -759,5 +793,116 @@ mod tests {
         };
         assert_eq!(result, one_shot.0);
         assert_eq!(out, one_shot.1);
+    }
+
+    /// A walk like `arena_exhaustion_and_reuse_after_errors_never_panic`'s,
+    /// but carrying one model across end markers too, so the arena fills;
+    /// logs every byte, status and error. Returns the log and the model
+    /// restarts a full arena forced (every restart but the first block's).
+    fn exhaust(ppmd: &mut RarPpmd) -> (Vec<u8>, u32) {
+        let data = noise(1 << 20, 0x9E37_79B9);
+        let mut log = Vec::new();
+        ppmd.start_block(Some(rar(64, 1))).unwrap();
+        let mut offset = 0;
+        let mut block_start = 0;
+        let mut out = vec![0u8; 4096];
+        while data.len() - offset >= 4 + 264 {
+            match ppmd.decode(&data[offset..], false, &mut out, 0) {
+                Ok(step) => {
+                    log.extend_from_slice(&out[..step.produced]);
+                    log.push(0xF0 | step.status as u8);
+                    offset += step.consumed;
+                    match step.status {
+                        RarStatus::ModelEnd => {
+                            ppmd.start_block(None).unwrap();
+                            block_start = offset;
+                        }
+                        RarStatus::NeedInput => break,
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    log.push(0xEE);
+                    log.extend_from_slice(&e.at.input.to_le_bytes());
+                    log.extend_from_slice(&e.at.output.to_le_bytes());
+                    offset = block_start + (e.at.input as usize).max(1);
+                    block_start = offset;
+                    ppmd.state = State::Ready;
+                    ppmd.start_block(None).unwrap();
+                }
+            }
+        }
+        let restarts = ppmd.model.as_ref().unwrap().restarts();
+        (log, restarts - 1)
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "needs over 250k symbols to fill the arena; the 7z caller-memory tests run under Miri"
+    )]
+    fn garbage_caller_memory_decodes_rar_as_owned_memory_does_through_restarts() {
+        let (owned, owned_full) = exhaust(&mut RarPpmd::new());
+        assert!(owned_full > 0, "the arena never filled");
+
+        let alloc = TestAllocator::new(Mode::Garbage);
+        let mut ppmd = RarPpmd::new();
+        ppmd.set_arena_allocator(0, alloc.clone());
+        let (caller, caller_full) = exhaust(&mut ppmd);
+        assert_eq!(caller_full, owned_full);
+        assert!(caller == owned, "caller memory decoded differently");
+        assert!(ppmd.model.as_ref().unwrap().arena_is_caller_memory());
+        assert_eq!((alloc.allocs(), alloc.drops()), (1, 0));
+
+        // A block that needs a larger arena replaces the memory, and
+        // `forget` drops it; the allocator rule survives both.
+        ppmd.start_block(Some(rar(6, 4))).unwrap();
+        assert_eq!((alloc.allocs(), alloc.drops()), (2, 1));
+        ppmd.forget();
+        assert_eq!(alloc.drops(), 2);
+        ppmd.start_block(Some(rar(6, 1))).unwrap();
+        assert_eq!(alloc.allocs(), 3);
+        drop(ppmd);
+        assert_eq!(alloc.drops(), 3);
+    }
+
+    #[test]
+    fn the_allocator_takes_over_at_the_next_arena_that_does_not_fit() {
+        let alloc = TestAllocator::new(Mode::Fail);
+        let mut ppmd = RarPpmd::new();
+        ppmd.start_block(Some(rar(6, 1))).unwrap();
+        ppmd.set_arena_allocator(1 << 20, alloc.clone());
+        // The model's memory fits: kept, no allocation.
+        ppmd.start_block(Some(rar(8, 1))).unwrap();
+        assert_eq!(alloc.allocs(), 0);
+        // Past the limit: the allocator refuses, the decoder is poisoned.
+        let e = ppmd.start_block(Some(rar(8, 2))).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::allocation_failed(2 << 20));
+        assert_eq!(alloc.allocs(), 1);
+        assert_eq!(ppmd.start_block(None), Err(e));
+        // Within the limit again: the crate's own memory.
+        ppmd.start_block(Some(rar(8, 1))).unwrap();
+        assert!(!ppmd.model.as_ref().unwrap().arena_is_caller_memory());
+        assert_eq!(alloc.allocs(), 1);
+    }
+
+    #[test]
+    fn a_block_over_the_lent_ceiling_is_refused_without_asking() {
+        let alloc = TestAllocator::new(Mode::Garbage);
+        let mut ppmd = RarPpmd::new();
+        ppmd.set_arena_allocator(0, alloc.clone());
+        ppmd.set_arena_max_lent(1 << 20);
+        ppmd.start_block(Some(rar(8, 1))).unwrap();
+        assert_eq!(alloc.allocs(), 1);
+        let e = ppmd.start_block(Some(rar(8, 2))).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::memory_limit(2 << 20, 1 << 20));
+        assert_eq!(alloc.allocs(), 1);
+        // A ceiling set before any allocator does nothing, and a later
+        // allocator starts at the default ceiling.
+        let mut ppmd = RarPpmd::new();
+        ppmd.set_arena_max_lent(0);
+        ppmd.set_arena_allocator(0, alloc.clone());
+        ppmd.start_block(Some(rar(8, 1))).unwrap();
+        assert_eq!(alloc.allocs(), 2);
     }
 }
