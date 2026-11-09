@@ -3,6 +3,28 @@
 All notable changes to this project are documented in this file. Each heading
 is a released version.
 
+## 0.2.2 - unreleased
+
+- A caller can supply the memory for a model's arena, so a very large model
+  can live in a memory-mapped scratch file instead of RAM.
+  `Arena::with_allocator(ram_limit, allocator)` (or
+  `RarPpmd::set_arena_allocator`) keeps every arena at or under `ram_limit`
+  in the crate's own memory, exactly as before, and asks the
+  `ArenaAllocator` for any larger one, up to a ceiling
+  (`Arena::with_max_lent`, `RarPpmd::set_arena_max_lent`, by default the
+  largest arena a model can use). The lent memory implements the unsafe
+  `ArenaMemory` trait: at least the length asked for, initialized to any
+  value (it need not be zeroed), at a stable address and exclusive to the
+  codec until dropped. Lent memory is never zeroed or advised. The default
+  decode path is unchanged.
+- An allocator's error is `ErrorKind::AllocationFailed`, which keeps an
+  `io::Error`'s kind under `std`; memory shorter than asked, longer than
+  `isize::MAX` or at a null address is the new
+  `ErrorKind::ArenaMemoryLength`; an arena over the ceiling is
+  `ErrorKind::MemoryLimit`, and the allocator is not asked.
+- New fuzz target `decode_lent`: owned against garbage-filled lent memory,
+  for 7z and RAR.
+
 ## 0.2.1 - 2026-11-07
 
 - 7z PPMd (variant H) decodes 16% faster on an x86 performance core, ahead
