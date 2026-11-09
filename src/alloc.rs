@@ -33,8 +33,10 @@
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 
+use alloc_crate::boxed::Box;
 use alloc_crate::vec::Vec;
 
+use crate::arena::{ArenaMemory, ArenaSource, Storage, fresh_storage};
 use crate::error::Result;
 
 /// Size of one allocation unit in bytes.
@@ -92,9 +94,10 @@ const EMPTY_NODE: u16 = 0;
 
 /// The model's arena and the allocator state over it.
 ///
-/// The memory is a `Vec<u8>` taken apart into its raw parts, so the hot
-/// accessors address it through one pointer and the allocation can be
-/// handed back ([`into_vec`](Self::into_vec)) for a later model to reuse.
+/// The memory is either a `Vec<u8>` taken apart into its raw parts or the
+/// caller's [`ArenaMemory`]; either way the hot accessors address it through
+/// one pointer, and the memory can be handed back
+/// ([`into_arena`](Self::into_arena)) for a later model to reuse.
 /// Allocation is fallible (`crate::arena`): a refused arena is an error,
 /// never an abort. A reused allocation is kept when its capacity is at
 /// least the length needed and at most twice it; the layout depends only on
@@ -103,7 +106,8 @@ pub(crate) struct Arena {
     base: NonNull<u8>,
     /// Bytes in use: `align_offset + size`.
     len: usize,
-    /// The allocation's capacity, for rebuilding the `Vec`.
+    /// The memory's capacity: the `Vec`'s, for rebuilding it, or the
+    /// caller memory's length.
     capacity: usize,
     /// The size requested (`p->Size`).
     size: u32,
@@ -114,20 +118,32 @@ pub(crate) struct Arena {
     pub(crate) units_start: u32,
     glue_count: u32,
     free_list: [u32; NUM_INDEXES],
+    /// The caller's memory `base` points into, or `None` when `base`,
+    /// `len` and `capacity` are the crate's own `Vec`.
+    caller: Option<Box<dyn ArenaMemory>>,
+    /// Where an arena above the in-RAM limit comes from on a rebuild.
+    source: Option<ArenaSource>,
 }
 
-// SAFETY: the arena is an owned heap allocation reached only through
-// `&self`/`&mut self`; nothing else holds the pointer, so moving the owner to
-// another thread moves sole access with it, and shared references only read.
+// SAFETY: the arena's memory is reached only through `&self`/`&mut self`;
+// nothing else holds the pointer (for caller memory, `ArenaMemory`'s
+// contract promises it, and `ArenaMemory: Send`), so moving the owner to
+// another thread moves sole access with it.
 unsafe impl Send for Arena {}
-// SAFETY: as above; `&Arena` exposes reads only.
+// SAFETY: as above; `&Arena` exposes reads of the arena only, and never
+// touches `caller` or `source` (they are read only through `&mut self` or by
+// value).
 unsafe impl Sync for Arena {}
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        // SAFETY: `base`, `len` and `capacity` are the raw parts of a
-        // `Vec<u8>` taken apart in `from_vec` and rebuilt only here or in
-        // `into_vec`, which forgets `self`.
+        if self.caller.is_some() {
+            // The caller's memory drops with the field.
+            return;
+        }
+        // SAFETY: with no caller memory, `base`, `len` and `capacity` are
+        // the raw parts of a `Vec<u8>` taken apart in `from_storage` and
+        // rebuilt only here or in `into_parts`, which forgets `self`.
         drop(unsafe { Vec::from_raw_parts(self.base.as_ptr(), self.len, self.capacity) });
     }
 }
@@ -146,78 +162,128 @@ impl Arena {
         capacity >= needed && capacity / 2 <= needed
     }
 
-    /// `Ppmd7_Alloc`: an arena of `align_offset + size` bytes, in `buf` when
-    /// it is [`reusable`](Self::reusable), otherwise in a fresh zeroed
-    /// allocation. The bytes of a fresh arena are zeroed so none is ever
-    /// read uninitialized; the model never relies on their values, so a
-    /// reused arena's old bytes change nothing.
+    /// `Ppmd7_Alloc`: an arena of `align_offset + size` bytes, in `arena`'s
+    /// memory when it is [`reusable`](Self::reusable), otherwise in fresh
+    /// memory: the caller's when `arena` carries an allocator and the arena
+    /// is above its in-RAM limit, else a zeroed allocation. The crate's own
+    /// bytes are zeroed so none is ever read uninitialized; the model never
+    /// relies on their values (every record it reads it wrote first, and
+    /// the glue pass's read past the guard stamp is discarded), so a reused
+    /// arena's old bytes, or caller memory's, change nothing.
     ///
-    /// Errors: allocation failed.
-    pub(crate) fn try_new(size: u32, buf: Vec<u8>) -> Result<Self> {
+    /// Errors: allocation failed, or caller memory of the wrong length.
+    pub(crate) fn try_new(size: u32, arena: crate::Arena) -> Result<Self> {
         debug_assert!(size >= crate::PPMD7_MIN_MEM_SIZE);
         let len = Self::arena_bytes(size);
-        let buf = Self::fit(buf, len)?;
-        Ok(Self::from_vec(buf, size))
+        let storage = Self::fit(arena.storage, len, arena.source.as_ref())?;
+        Ok(Self::from_storage(storage, size, arena.source))
     }
 
     /// An arena of `size` bytes, in test code where allocation cannot fail.
     #[cfg(test)]
     pub(crate) fn new(size: u32) -> Self {
-        match Self::try_new(size, Vec::new()) {
+        match Self::try_new(size, crate::Arena::empty()) {
             Ok(arena) => arena,
             Err(e) => panic!("test arena: {e}"),
         }
     }
 
-    /// Re-lays the arena out for `size` bytes, keeping the allocation when
-    /// it is reusable. On error the arena is unchanged: a replacement is
-    /// allocated while the old allocation is still live.
+    /// Re-lays the arena out for `size` bytes, keeping the memory when it
+    /// is reusable. On error the arena is unchanged: a replacement is
+    /// allocated while the old memory is still live.
     pub(crate) fn rebuild(&mut self, size: u32) -> Result<()> {
         let len = Self::arena_bytes(size);
         if Self::reusable(self.capacity, len) {
-            let buf = core::mem::replace(self, Self::from_vec(Vec::new(), 0)).into_vec();
-            let buf = Self::fit(buf, len)?;
-            *self = Self::from_vec(buf, size);
+            let placeholder = Self::from_storage(Storage::Owned(Vec::new()), 0, None);
+            let (storage, source) = core::mem::replace(self, placeholder).into_parts();
+            let storage = Self::fit(storage, len, source.as_ref())?;
+            *self = Self::from_storage(storage, size, source);
         } else {
-            let buf = crate::arena::try_zeroed(len as u64)?;
-            *self = Self::from_vec(buf, size);
+            let storage = fresh_storage(len, self.source.as_ref())?;
+            let source = self.source.take();
+            *self = Self::from_storage(storage, size, source);
         }
         Ok(())
     }
 
-    /// The allocation, for a later model to reuse.
-    pub(crate) fn into_vec(self) -> Vec<u8> {
-        let this = ManuallyDrop::new(self);
-        // SAFETY: the raw parts of the `Vec` taken apart in `from_vec`;
-        // `this` is never dropped, so the allocation has one owner again.
-        unsafe { Vec::from_raw_parts(this.base.as_ptr(), this.len, this.capacity) }
+    /// Sets where an arena above the in-RAM limit comes from on the next
+    /// rebuild. The memory in use stays.
+    pub(crate) fn set_source(&mut self, source: Option<ArenaSource>) {
+        self.source = source;
     }
 
-    /// Bytes the allocation holds.
+    /// The memory and its source, for a later model to reuse.
+    pub(crate) fn into_arena(self) -> crate::Arena {
+        let (storage, source) = self.into_parts();
+        crate::Arena { storage, source }
+    }
+
+    fn into_parts(self) -> (Storage, Option<ArenaSource>) {
+        let mut this = ManuallyDrop::new(self);
+        let source = this.source.take();
+        let storage = match this.caller.take() {
+            Some(mem) => Storage::Caller(mem),
+            // SAFETY: with no caller memory, the raw parts of the `Vec`
+            // taken apart in `from_storage`; `this` is never dropped, so
+            // the allocation has one owner again.
+            None => Storage::Owned(unsafe {
+                Vec::from_raw_parts(this.base.as_ptr(), this.len, this.capacity)
+            }),
+        };
+        (storage, source)
+    }
+
+    /// Bytes the memory holds.
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// `buf` resized to exactly `len` bytes, reusing its allocation when it
-    /// is reusable, otherwise a fresh zeroed allocation.
-    fn fit(mut buf: Vec<u8>, len: usize) -> Result<Vec<u8>> {
-        if !Self::reusable(buf.capacity(), len) {
-            buf = Vec::new();
-        }
-        crate::arena::fit(&mut buf, len)?;
-        Ok(buf)
+    /// Whether the memory is the caller's.
+    #[cfg(any(test, feature = "internals"))]
+    pub(crate) fn is_caller_memory(&self) -> bool {
+        self.caller.is_some()
     }
 
-    /// Takes `buf` apart and lays an arena of `size` bytes out over it.
-    /// `buf.len()` must be `arena_bytes(size)` (or 0 for the placeholder
-    /// `rebuild` swaps in).
-    fn from_vec(buf: Vec<u8>, size: u32) -> Self {
-        let mut buf = ManuallyDrop::new(buf);
-        let len = buf.len();
-        let capacity = buf.capacity();
-        // `as_mut_ptr` never returns null: an empty `Vec` holds a dangling,
-        // non-null pointer.
-        let base = NonNull::new(buf.as_mut_ptr()).unwrap_or(NonNull::dangling());
+    /// `storage` fitted to exactly `len` bytes when it is reusable,
+    /// otherwise fresh storage (the old is freed first).
+    fn fit(storage: Storage, len: usize, source: Option<&ArenaSource>) -> Result<Storage> {
+        if !Self::reusable(storage.capacity(), len) {
+            drop(storage);
+            return fresh_storage(len, source);
+        }
+        match storage {
+            Storage::Owned(mut buf) => {
+                // Within capacity: no allocation.
+                crate::arena::fit(&mut buf, len)?;
+                Ok(Storage::Owned(buf))
+            }
+            Storage::Caller(mem) => Ok(Storage::Caller(mem)),
+        }
+    }
+
+    /// Takes `storage` apart and lays an arena of `size` bytes out over it.
+    /// An owned `Vec`'s length must be `arena_bytes(size)` (or 0 for the
+    /// placeholder `rebuild` swaps in); caller memory must hold at least
+    /// `arena_bytes(size)` bytes.
+    fn from_storage(storage: Storage, size: u32, source: Option<ArenaSource>) -> Self {
+        let (base, len, capacity, caller) = match storage {
+            Storage::Owned(buf) => {
+                let mut buf = ManuallyDrop::new(buf);
+                // `as_mut_ptr` never returns null: an empty `Vec` holds a
+                // dangling, non-null pointer.
+                let base = NonNull::new(buf.as_mut_ptr()).unwrap_or(NonNull::dangling());
+                (base, buf.len(), buf.capacity(), None)
+            }
+            Storage::Caller(mut mem) => {
+                let capacity = mem.len();
+                let len = Self::arena_bytes(size);
+                assert!(len <= capacity, "caller memory shorter than its arena");
+                // Non-null: checked when the allocator returned it, and
+                // `ArenaMemory` promises the same pointer every time.
+                let base = NonNull::new(mem.as_mut_ptr()).unwrap_or(NonNull::dangling());
+                (base, len, capacity, Some(mem))
+            }
+        };
         let mut arena = Self {
             base,
             len,
@@ -230,6 +296,8 @@ impl Arena {
             units_start: 0,
             glue_count: 0,
             free_list: [0; NUM_INDEXES],
+            caller,
+            source,
         };
         if len != 0 {
             arena.reset();

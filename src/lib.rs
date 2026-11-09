@@ -94,7 +94,7 @@ mod stream;
 #[doc(hidden)]
 pub mod internals;
 
-pub use arena::Arena;
+pub use arena::{Arena, ArenaAllocError, ArenaAllocator, ArenaMemory};
 pub use carryless::{CarrylessDecoder, CarrylessEncoder};
 pub use error::{Error, ErrorKind, Position, Progress, Result};
 pub use params::{MAX_INPUT_PER_SYMBOL, Params};

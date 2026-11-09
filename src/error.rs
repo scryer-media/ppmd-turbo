@@ -61,6 +61,15 @@ pub enum ErrorKind {
         /// The caller's limit.
         limit: u64,
     },
+    /// An [`ArenaAllocator`](crate::ArenaAllocator) returned memory of the
+    /// wrong length (or a null pointer) for the arena it was asked for.
+    #[non_exhaustive]
+    ArenaMemoryLength {
+        /// Bytes the arena asked for.
+        requested: u64,
+        /// Bytes the memory said it holds.
+        provided: u64,
+    },
     /// One of the codec's own invariants failed: an encoder's range coder
     /// faulted, or a step stopped in a way its framing cannot. Input alone
     /// never causes it. The text says which, for diagnostics only.
@@ -195,6 +204,13 @@ impl fmt::Display for Error {
                 f,
                 "the PPMd model needs {required} bytes, more than the {limit}-byte limit"
             )?,
+            ErrorKind::ArenaMemoryLength {
+                requested,
+                provided,
+            } => write!(
+                f,
+                "the PPMd arena allocator gave {provided} bytes for a {requested}-byte arena"
+            )?,
             ErrorKind::Internal(detail) => write!(f, "internal PPMd codec failure: {detail}")?,
         }
         write!(
@@ -221,7 +237,7 @@ impl From<Error> for std::io::Error {
             ErrorKind::Truncated => Io::UnexpectedEof,
             ErrorKind::InvalidParameters => Io::InvalidInput,
             ErrorKind::AllocationFailed { .. } | ErrorKind::MemoryLimit { .. } => Io::OutOfMemory,
-            ErrorKind::Internal(_) => Io::Other,
+            ErrorKind::ArenaMemoryLength { .. } | ErrorKind::Internal(_) => Io::Other,
         };
         std::io::Error::new(kind, e)
     }

@@ -155,7 +155,7 @@ pub(crate) struct StreamDecoder<C: DecodeCoder> {
 
 impl<C: DecodeCoder> StreamDecoder<C> {
     pub(crate) fn with_arena(params: Params, unpacked: Option<u64>, arena: Arena) -> Result<Self> {
-        let model = Model::with_arena(params.order(), params.mem_size(), arena.buf)?;
+        let model = Model::with_arena(params.order(), params.mem_size(), arena)?;
         Ok(Self {
             model: try_box(model)?,
             params,
@@ -199,15 +199,17 @@ impl<C: DecodeCoder> StreamDecoder<C> {
     }
 
     pub(crate) fn into_arena(self) -> Arena {
-        let model = *self.model;
-        Arena {
-            buf: model.into_arena(),
-        }
+        self.model.into_arena()
     }
 
     #[cfg(any(test, feature = "internals"))]
     pub(crate) fn arena_addr(&self) -> usize {
         self.model.arena_addr()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_restarts(&self) -> u32 {
+        self.model.restarts()
     }
 
     #[cold]
@@ -480,7 +482,7 @@ pub(crate) struct StreamEncoder<C: EncodeCoder> {
 
 impl<C: EncodeCoder> StreamEncoder<C> {
     pub(crate) fn with_arena(params: Params, arena: Arena) -> Result<Self> {
-        let model = Model::with_arena(params.order(), params.mem_size(), arena.buf)?;
+        let model = Model::with_arena(params.order(), params.mem_size(), arena)?;
         Ok(Self {
             model: try_box(model)?,
             regs: C::Regs::default(),
@@ -525,10 +527,7 @@ impl<C: EncodeCoder> StreamEncoder<C> {
     }
 
     pub(crate) fn into_arena(self) -> Arena {
-        let model = *self.model;
-        Arena {
-            buf: model.into_arena(),
-        }
+        self.model.into_arena()
     }
 
     #[cfg(any(test, feature = "internals"))]
