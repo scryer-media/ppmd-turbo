@@ -334,6 +334,26 @@ jobs:
           cargo test --locked --target "$TARGET" --no-fail-fast \
             -- --exact "${skip_args[@]}"
 
+  # A browser build: wasm32-unknown-unknown has no host to run the tests on,
+  # so the crate is compile-checked there, with every feature and with none.
+  wasm-check:
+    name: wasm-check-wasm32-unknown-unknown
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown
+      - name: Check all features and no default features
+        run: |
+          set -euo pipefail
+          cargo check --locked --target wasm32-unknown-unknown --all-features
+          cargo check --locked --target wasm32-unknown-unknown --no-default-features
+
   # The unsafe-code lanes. docs/unsafe-validation.md says what each one
   # covers and what stays uninstrumented; `unsafe-complete` requires them all.
   # The instrumented native lanes run the release build: debug builds check
@@ -642,7 +662,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, fixtures, test, wasm-test, unsafe-complete, fuzz-harness, fuzz, msrv, package]
+    needs: [hygiene, fmt, clippy, docs, fixtures, test, wasm-test, wasm-check, unsafe-complete, fuzz-harness, fuzz, msrv, package]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
