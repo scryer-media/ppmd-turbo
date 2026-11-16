@@ -1,6 +1,7 @@
 name: ci
 
-# fmt, clippy, tests on every desktop platform, the unsafe-code lanes (Miri,
+# fmt, clippy, tests on every desktop platform and on WebAssembly (WASI 0.1,
+# WASI 0.2 and Emscripten), the unsafe-code lanes (Miri,
 # Memcheck and AddressSanitizer; see docs/unsafe-validation.md), a short
 # deterministic fuzz run of every target, docs, MSRV and packaging.
 # fuzz-extended.yml runs the long campaigns on demand.
@@ -232,6 +233,126 @@ jobs:
         run: cargo nextest run --locked --no-fail-fast
       - name: Doctests, default features
         run: cargo test --doc --locked --no-fail-fast
+
+  # The crate's tests compiled for WebAssembly and run there, against the same
+  # fixtures: WASI 0.1 and 0.2 under wasmtime, Emscripten under Node. Every
+  # wasm target takes the portable model code. Left out: on every target,
+  # hostile_memory's counting_allocator_counts, which spawns a thread; on
+  # WASI, where a panic aborts, hostile_decode's no_panic_reports_the_input,
+  # which catches one. The 7zz and unrar oracle tests stay ignored, as natively.
+  wasm-test:
+    name: wasm-test-${{ matrix.target }}
+    needs: fixtures
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-wasip1, wasm32-wasip2, wasm32-unknown-emscripten]
+    env:
+      TARGET: ${{ matrix.target }}
+      PPMD_TURBO_REQUIRE_FIXTURES: "1"
+      WASMTIME_VERSION: 50.0.1
+      # Bump the emsdk release and the commit its tag names together.
+      EMSDK_VERSION: 7.0.0
+      EMSDK_COMMIT: 1693ce7359fc9694f198694f902a2cc061239b86
+      # The tests read fixtures by absolute path, so the checkout is mapped at
+      # its own path, and the fixture guard is passed through.
+      CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime run --dir ${{ github.workspace }}::${{ github.workspace }} --env PPMD_TURBO_REQUIRE_FIXTURES
+      CARGO_TARGET_WASM32_WASIP2_RUNNER: wasmtime run --dir ${{ github.workspace }}::${{ github.workspace }} --env PPMD_TURBO_REQUIRE_FIXTURES
+      CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_RUNNER: node
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fixtures
+      - name: Set up wasmtime
+        if: matrix.target != 'wasm32-unknown-emscripten'
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
+        with:
+          version: ${{ env.WASMTIME_VERSION }}
+      - name: Verify the pinned wasmtime is the one on PATH
+        if: matrix.target != 'wasm32-unknown-emscripten'
+        run: |
+          set -euo pipefail
+          wasmtime --version
+          wasmtime --version | grep -qF "wasmtime $WASMTIME_VERSION"
+      - name: Set up Emscripten
+        if: matrix.target == 'wasm32-unknown-emscripten'
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/emsdk"
+          # Fetched by commit, not by tag: a tag can be moved, a commit cannot.
+          git init -q "$root"
+          git -C "$root" fetch -q --depth 1 \
+            https://github.com/emscripten-core/emsdk.git "$EMSDK_COMMIT"
+          git -C "$root" checkout -q FETCH_HEAD
+          "$root/emsdk" install "$EMSDK_VERSION"
+          "$root/emsdk" activate "$EMSDK_VERSION"
+          emsdk_version="$EMSDK_VERSION"
+          # emsdk_env.sh reads variables that may be unset.
+          set +u
+          # shellcheck disable=SC1091
+          source "$root/emsdk_env.sh"
+          set -u
+          # emsdk_env.sh clears EMSDK_VERSION, so the pin is read from the copy.
+          # Read whole before matching: a reader that closes the pipe early
+          # fails emcc under pipefail.
+          reported="$(emcc --version)"
+          grep -qF "$emsdk_version" <<<"$reported"
+          node --version
+          {
+            echo "$EMSDK/upstream/emscripten"
+            dirname "$EMSDK_NODE"
+          } >> "$GITHUB_PATH"
+          # The host filesystem through Node, a heap that grows past the fixed
+          # 16 MiB default, and a 1 MiB stack in place of the 64 KiB default,
+          # which the doctests overflow. rustdoc links the doctests with
+          # RUSTDOCFLAGS, so they get the same flags.
+          flags="-C link-arg=-sNODERAWFS=1 -C link-arg=-sALLOW_MEMORY_GROWTH=1 -C link-arg=-sSTACK_SIZE=1MB"
+          {
+            echo "EMSDK=$EMSDK"
+            echo "EM_CONFIG=$EMSDK/.emscripten"
+            echo "RUSTFLAGS=$flags"
+            echo "RUSTDOCFLAGS=$flags"
+          } >> "$GITHUB_ENV"
+      - name: Test all features and default features, doctests included
+        run: |
+          set -euo pipefail
+          skip_args=(--skip counting_allocator_counts)
+          if [ "$TARGET" != wasm32-unknown-emscripten ]; then
+            skip_args+=(--skip no_panic_reports_the_input)
+          fi
+          cargo test --locked --target "$TARGET" --all-features --no-fail-fast \
+            -- --exact "${skip_args[@]}"
+          cargo test --locked --target "$TARGET" --no-fail-fast \
+            -- --exact "${skip_args[@]}"
+
+  # A browser build: wasm32-unknown-unknown has no host to run the tests on,
+  # so the crate is compile-checked there, with every feature and with none.
+  wasm-check:
+    name: wasm-check-wasm32-unknown-unknown
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown
+      - name: Check all features and no default features
+        run: |
+          set -euo pipefail
+          cargo check --locked --target wasm32-unknown-unknown --all-features
+          cargo check --locked --target wasm32-unknown-unknown --no-default-features
 
   # The unsafe-code lanes. docs/unsafe-validation.md says what each one
   # covers and what stays uninstrumented; `unsafe-complete` requires them all.
@@ -541,7 +662,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, fixtures, test, unsafe-complete, fuzz-harness, fuzz, msrv, package]
+    needs: [hygiene, fmt, clippy, docs, fixtures, test, wasm-test, wasm-check, unsafe-complete, fuzz-harness, fuzz, msrv, package]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:

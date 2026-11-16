@@ -16,6 +16,7 @@ iteration counts, no sleeps and no clocks.
 | Miri | the library, `coder_differential` and `encode_carryless`, one job per test | the `unsafe-miri` CI lanes |
 | Memcheck | every test in the crate, release build | the `unsafe-valgrind-*` CI lanes |
 | AddressSanitizer | every test in the crate, release build, and every fuzz target | the `unsafe-asan-*` and `fuzz-*` CI lanes |
+| WebAssembly | every test in the crate and the doctests, against the CI fixtures, but for one test that spawns a thread and, on WASI, one that catches a panic | the `wasm-test-*` CI lanes: `wasm32-wasip1` and `wasm32-wasip2` under wasmtime, `wasm32-unknown-emscripten` under Node |
 
 ## Hostile-input tests
 
