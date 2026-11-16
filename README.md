@@ -75,7 +75,7 @@ Besides unit tests and comparisons with 7-Zip and unrar:
 - the same tests on WebAssembly, against the same fixtures: `wasm32-wasip1`
   and `wasm32-wasip2` under wasmtime, `wasm32-unknown-emscripten` under
   Node. One test that spawns a thread and, on WASI, one that catches a panic
-  run only natively.
+  run only natively. `wasm32-unknown-unknown` is compile-checked.
 
 ### Fixtures
 
