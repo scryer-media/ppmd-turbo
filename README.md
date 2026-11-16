@@ -71,7 +71,11 @@ Besides unit tests and comparisons with 7-Zip and unrar:
   one checking that input and output split anywhere decode and encode the
   same as in one piece;
 - Miri, Valgrind and AddressSanitizer over the `unsafe` code;
-- separate-process checks against `7zz` and `unrar` (`tools/ppmd-oracle`).
+- separate-process checks against `7zz` and `unrar` (`tools/ppmd-oracle`);
+- the same tests on WebAssembly, against the same fixtures: `wasm32-wasip1`
+  and `wasm32-wasip2` under wasmtime, `wasm32-unknown-emscripten` under
+  Node. One test that spawns a thread and, on WASI, one that catches a panic
+  run only natively.
 
 ### Fixtures
 
