@@ -8,6 +8,7 @@
 
 use std::io::{Read, Write};
 
+use crc_turbo::{CrcAlgorithm::Crc32IsoHdlc, checksum};
 use ppmd_rust::{Ppmd7Decoder, Ppmd7Encoder, Ppmd7aDecoder, Ppmd7aEncoder};
 use sha2::{Digest, Sha256};
 
@@ -19,9 +20,14 @@ pub fn sha256_hex(data: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// CRC-32/ISO-HDLC, as used in archive headers.
+pub fn crc32(data: &[u8]) -> u32 {
+    checksum(Crc32IsoHdlc, data) as u32
+}
+
 /// CRC-32 (IEEE), as lower-case hex: the digest `ppmd-bench` prints.
 pub fn crc32_hex(data: &[u8]) -> String {
-    format!("{:08x}", crc32fast::hash(data))
+    format!("{:08x}", crc32(data))
 }
 
 /// Which range coder a raw stream uses.

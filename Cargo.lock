@@ -27,12 +27,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc32fast"
-version = "1.5.2"
+name = "crc-turbo"
+version = "1.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+checksum = "fbcde4e0db1258357b16be023e12dcdf7ce42c8b7aa5d6d52134943002e0bcd1"
 dependencies = [
- "cfg-if",
+ "digest",
+ "spin",
 ]
 
 [[package]]
@@ -73,9 +74,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "memchr"
@@ -87,7 +88,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "ppmd-bench"
 version = "0.1.0"
 dependencies = [
- "crc32fast",
+ "crc-turbo",
  "libc",
  "ppmd-corpus",
  "ppmd-rust",
@@ -99,7 +100,7 @@ dependencies = [
 name = "ppmd-corpus"
 version = "0.1.0"
 dependencies = [
- "crc32fast",
+ "crc-turbo",
  "ppmd-rust",
  "serde_json",
  "sha2",
@@ -109,7 +110,6 @@ dependencies = [
 name = "ppmd-oracle"
 version = "0.1.0"
 dependencies = [
- "crc32fast",
  "ppmd-corpus",
  "ppmd-rust",
  "ppmd-turbo",
@@ -117,15 +117,14 @@ dependencies = [
 
 [[package]]
 name = "ppmd-rust"
-version = "1.5.0"
+version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "196a7c80b9a7652aba7cc070827516c2abe4ccdf53d128e1944003cf5726cff1"
+checksum = "cd4acc8d264ea385db64ccfdcdfd5909ee9eda0975666723d59f3bfec80b3611"
 
 [[package]]
 name = "ppmd-turbo"
 version = "0.2.2"
 dependencies = [
- "crc32fast",
  "ppmd-corpus",
  "ppmd-rust",
  "serde_json",
@@ -181,9 +180,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
  "itoa",
  "memchr",
@@ -202,6 +201,12 @@ dependencies = [
  "cpufeatures",
  "digest",
 ]
+
+[[package]]
+name = "spin"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
 name = "syn"

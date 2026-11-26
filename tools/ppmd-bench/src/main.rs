@@ -35,6 +35,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use crc_turbo::{CrcAlgorithm::Crc32IsoHdlc, Digest};
 use ppmd_corpus::rar::{self, Stop, Unescaper};
 use ppmd_corpus::sevenz;
 use ppmd_rust::{Ppmd7Decoder, Ppmd7Encoder, Ppmd7aDecoder};
@@ -179,7 +180,7 @@ fn parse() -> Result<Args, Failure> {
 /// to `--out` when given.
 struct Sink {
     file: Option<BufWriter<File>>,
-    crc: crc32fast::Hasher,
+    crc: Digest,
     len: u64,
 }
 
@@ -194,7 +195,7 @@ impl Sink {
         };
         Ok(Self {
             file,
-            crc: crc32fast::Hasher::new(),
+            crc: Digest::new(Crc32IsoHdlc),
             len: 0,
         })
     }
@@ -203,7 +204,7 @@ impl Sink {
         if let Some(mut f) = self.file {
             f.flush().map_err(|e| e.to_string())?;
         }
-        Ok((self.len, self.crc.finalize()))
+        Ok((self.len, self.crc.finalize() as u32))
     }
 }
 
