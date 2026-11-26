@@ -524,7 +524,7 @@ pub fn rar_members(dir: &Path, source: &Path) -> Result<Vec<Value>, String> {
     if decoded.payload != expected {
         return Err("rar4_ppm_oldmv: decoded member differs from the regenerated payload".into());
     }
-    if crc32fast::hash(&decoded.payload) != member.crc32 {
+    if oracle::crc32(&decoded.payload) != member.crc32 {
         return Err("rar4_ppm_oldmv: decoded member fails the header CRC".into());
     }
     let file = "rar/rar4-ppm-oldmv.packed";

@@ -28,7 +28,7 @@ func TestHasRARCodec(t *testing.T) {
 }
 
 func TestLockedVersion(t *testing.T) {
-	lock := "[[package]]\nname = \"crc32fast\"\nversion = \"1.5.0\"\n\n[[package]]\nname = \"ppmd-rust\"\nversion = \"1.5.0\"\nsource = \"registry\"\n"
+	lock := "[[package]]\nname = \"crc-turbo\"\nversion = \"1.11.2\"\n\n[[package]]\nname = \"ppmd-rust\"\nversion = \"1.5.0\"\nsource = \"registry\"\n"
 	if got := LockedVersion(lock, "ppmd-rust"); got != "1.5.0" {
 		t.Fatalf("got %q", got)
 	}

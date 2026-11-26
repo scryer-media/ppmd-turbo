@@ -27,12 +27,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc32fast"
-version = "1.5.6"
+name = "crc-turbo"
+version = "1.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd9ae8fcb3ea71b0b26338b4ffb13006bb175de8fd07921089a906ce7e5e6945"
+checksum = "fbcde4e0db1258357b16be023e12dcdf7ce42c8b7aa5d6d52134943002e0bcd1"
 dependencies = [
- "cfg-if",
+ "digest",
+ "spin",
 ]
 
 [[package]]
@@ -87,7 +88,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "ppmd-bench"
 version = "0.1.0"
 dependencies = [
- "crc32fast",
+ "crc-turbo",
  "libc",
  "ppmd-corpus",
  "ppmd-rust",
@@ -99,7 +100,7 @@ dependencies = [
 name = "ppmd-corpus"
 version = "0.1.0"
 dependencies = [
- "crc32fast",
+ "crc-turbo",
  "ppmd-rust",
  "serde_json",
  "sha2",
@@ -109,7 +110,6 @@ dependencies = [
 name = "ppmd-oracle"
 version = "0.1.0"
 dependencies = [
- "crc32fast",
  "ppmd-corpus",
  "ppmd-rust",
  "ppmd-turbo",
@@ -125,7 +125,6 @@ checksum = "cd4acc8d264ea385db64ccfdcdfd5909ee9eda0975666723d59f3bfec80b3611"
 name = "ppmd-turbo"
 version = "0.2.2"
 dependencies = [
- "crc32fast",
  "ppmd-corpus",
  "ppmd-rust",
  "serde_json",
@@ -202,6 +201,12 @@ dependencies = [
  "cpufeatures",
  "digest",
 ]
+
+[[package]]
+name = "spin"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
 name = "syn"

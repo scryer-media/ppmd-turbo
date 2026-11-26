@@ -85,7 +85,7 @@ fn container_round_trips_7zz_streams() {
         assert_eq!(u32::from(entry.order), order, "{name}");
         assert!(entry.mem <= mem, "{name}: 7-Zip only lowers the arena");
         assert_eq!(entry.unpack_size, data.len() as u64, "{name}");
-        assert_eq!(entry.crc, Some(crc32fast::hash(&data)), "{name}");
+        assert_eq!(entry.crc, Some(ppmd_corpus::oracle::crc32(&data)), "{name}");
         let rewrapped = write_archive(entry.order, entry.mem, &entry.stream, &data, "kith.bin")
             .expect("writes");
         let back = seven

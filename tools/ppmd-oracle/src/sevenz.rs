@@ -6,10 +6,12 @@
 //! stream, one folder with one coder (`03 04 01`, PPMd, 5 property bytes:
 //! order then the memory size as a little-endian `u32`) and one file.
 //!
-//! The only dependency is `crc32fast`, so `tests/differential_binaries.rs`
-//! includes this file directly with `#[path]`.
+//! The differential tests include this file directly and share the
+//! CRC-32 implementation in `ppmd-corpus`.
 
 use std::fmt;
+
+use ppmd_corpus::oracle::crc32;
 
 /// The 7z signature.
 pub const SIGNATURE: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
@@ -127,7 +129,7 @@ pub fn write_archive(
     write_number(&mut h, unpack.len() as u64);
     h.push(K_CRC);
     h.push(1); // all defined
-    h.extend_from_slice(&crc32fast::hash(unpack).to_le_bytes());
+    h.extend_from_slice(&crc32(unpack).to_le_bytes());
     h.push(K_END);
 
     h.push(K_SUBSTREAMS_INFO);
@@ -148,12 +150,12 @@ pub fn write_archive(
     let mut tail = Vec::with_capacity(20);
     tail.extend_from_slice(&(stream.len() as u64).to_le_bytes()); // next header offset
     tail.extend_from_slice(&(h.len() as u64).to_le_bytes());
-    tail.extend_from_slice(&crc32fast::hash(&h).to_le_bytes());
+    tail.extend_from_slice(&crc32(&h).to_le_bytes());
 
     let mut out = Vec::with_capacity(SIGNATURE_HEADER_LEN + stream.len() + h.len());
     out.extend_from_slice(&SIGNATURE);
     out.extend_from_slice(&[0, 4]);
-    out.extend_from_slice(&crc32fast::hash(&tail).to_le_bytes());
+    out.extend_from_slice(&crc32(&tail).to_le_bytes());
     out.extend_from_slice(&tail);
     out.extend_from_slice(stream);
     out.extend_from_slice(&h);
@@ -235,7 +237,7 @@ pub fn read_archive(archive: &[u8]) -> Result<PpmdEntry, FormatError> {
     }
     let tail = &archive[12..32];
     let start_crc = u32::from_le_bytes([archive[8], archive[9], archive[10], archive[11]]);
-    if crc32fast::hash(tail) != start_crc {
+    if crc32(tail) != start_crc {
         return bad("start header CRC mismatch");
     }
     let offset = u64::from_le_bytes(tail[0..8].try_into().unwrap_or_default());
@@ -253,7 +255,7 @@ pub fn read_archive(archive: &[u8]) -> Result<PpmdEntry, FormatError> {
     let Some(header) = archive.get(start..end) else {
         return bad("next header out of range");
     };
-    if crc32fast::hash(header) != header_crc {
+    if crc32(header) != header_crc {
         return bad("next header CRC mismatch");
     }
 
@@ -416,7 +418,7 @@ mod tests {
         assert_eq!(entry.mem, 1 << 20);
         assert_eq!(entry.stream, stream);
         assert_eq!(entry.unpack_size, data.len() as u64);
-        assert_eq!(entry.crc, Some(crc32fast::hash(data)));
+        assert_eq!(entry.crc, Some(crc32(data)));
     }
 
     #[test]
